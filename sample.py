@@ -1,4 +1,3 @@
-from pickle import TRUE
 from flask import Flask,render_template
 
 
@@ -9,5 +8,5 @@ def index():
     return render_template("index.html")
 
 if __name__ == "__main__":
-    app.run(debug=TRUE)
+    app.run(debug=True)
 
