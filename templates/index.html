@@ -1,6 +1,307 @@
-<!DOCTYPE html lang = "ja">
-<head></head>
-<body>
-    <h1>実験</h1>
-</body>
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Genba Visual Cloud - MVP</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+  <body class="bg-slate-100 text-slate-800">
+    <div class="h-screen flex flex-col">
+      <header class="h-14 bg-slate-900 text-white px-5 flex items-center justify-between">
+        <h1 class="font-bold">Genba Visual Cloud <span class="text-slate-400 text-xs">MVP</span></h1>
+        <div class="flex items-center gap-2">
+          <button id="add-worker" class="text-xs bg-slate-700 px-3 py-1.5 rounded">作業者追加</button>
+          <button id="add-lot" class="text-xs bg-blue-600 px-3 py-1.5 rounded">入荷登録</button>
+        </div>
+      </header>
+
+      <main class="flex-1 p-4 grid grid-cols-12 gap-4 overflow-hidden">
+        <section class="col-span-3 bg-white rounded-xl border border-slate-200 flex flex-col min-h-0">
+          <div class="p-3 border-b font-bold text-sm">入荷待ち</div>
+          <div id="arrival" class="p-2 overflow-y-auto min-h-0 lane" data-target="arrival"></div>
+        </section>
+
+        <section class="col-span-3 bg-amber-50 rounded-xl border border-amber-200 flex flex-col min-h-0">
+          <div class="p-3 border-b border-amber-200 font-bold text-sm">作業予定（担当別）</div>
+          <div id="planning" class="p-2 overflow-y-auto min-h-0 space-y-3"></div>
+        </section>
+
+        <section class="col-span-4 bg-white rounded-xl border-2 border-blue-300 flex flex-col min-h-0">
+          <div class="p-3 border-b font-bold text-sm flex items-center justify-between">
+            <span>作業エリア（マップ）</span>
+            <button id="toggle-layout" class="text-xs px-2 py-1 bg-slate-100 rounded border">レイアウト編集</button>
+          </div>
+          <div id="map" class="relative flex-1 bg-slate-50 min-h-0 overflow-hidden">
+            <div class="absolute inset-0 opacity-20" style="background-image: radial-gradient(#64748b 1px, transparent 1px); background-size: 16px 16px;"></div>
+          </div>
+        </section>
+
+        <section class="col-span-2 bg-emerald-50 rounded-xl border border-emerald-200 flex flex-col min-h-0">
+          <div class="p-3 border-b border-emerald-200 font-bold text-sm">完了</div>
+          <div id="completed" class="p-2 overflow-y-auto min-h-0 lane" data-target="completed"></div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="lot-modal" class="rounded-xl p-0 w-[460px] max-w-[95vw]">
+      <form id="lot-form" class="p-5 space-y-3">
+        <h2 class="font-bold text-lg">ロット登録</h2>
+        <div class="grid grid-cols-2 gap-3">
+          <input required name="model" placeholder="型式" class="border rounded px-2 py-2" />
+          <input required name="orderNo" placeholder="指図番号" class="border rounded px-2 py-2" />
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <input required type="number" min="1" value="1" name="quantity" placeholder="台数" class="border rounded px-2 py-2" />
+          <select name="priority" class="border rounded px-2 py-2">
+            <option value="normal">通常</option>
+            <option value="high">急ぎ</option>
+          </select>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <input name="dueDate" type="date" class="border rounded px-2 py-2" />
+          <input name="entryAt" type="datetime-local" class="border rounded px-2 py-2" />
+        </div>
+        <div class="flex justify-end gap-2 pt-2">
+          <button type="button" id="close-modal" class="px-3 py-1.5 rounded border">閉じる</button>
+          <button class="px-3 py-1.5 rounded bg-blue-600 text-white">登録</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script>
+      const state = {
+        workers: [
+          { id: crypto.randomUUID(), name: "山田" },
+          { id: crypto.randomUUID(), name: "鈴木" },
+        ],
+        lots: [],
+        mapZones: [
+          { id: "zone_inter_1", name: "中間分割1", x: 2, y: 5, w: 46, h: 40, color: "bg-blue-50 border-blue-300" },
+          { id: "zone_comp_1", name: "完品分割", x: 52, y: 5, w: 46, h: 40, color: "bg-emerald-50 border-emerald-300" },
+          { id: "zone_asm_1", name: "第一組立", x: 2, y: 52, w: 46, h: 40, color: "bg-amber-50 border-amber-300" },
+          { id: "zone_asm_3", name: "第三組立", x: 52, y: 52, w: 46, h: 40, color: "bg-orange-50 border-orange-300" },
+        ],
+        layoutMode: false,
+      };
+
+      const lotModal = document.getElementById("lot-modal");
+      const lotForm = document.getElementById("lot-form");
+
+      const fmtSec = (s) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+
+      function seed() {
+        state.lots = [
+          mkLot({ model: "A-100", orderNo: "ORD-001", quantity: 3 }),
+          mkLot({ model: "B-200", orderNo: "ORD-002", quantity: 2, priority: "high" }),
+        ];
+      }
+
+      function mkLot({ model, orderNo, quantity, priority = "normal", dueDate = "", entryAt = "" }) {
+        return {
+          id: crypto.randomUUID(),
+          model,
+          orderNo,
+          quantity: Number(quantity),
+          priority,
+          dueDate,
+          entryAt: entryAt ? Date.parse(entryAt) : Date.now(),
+          location: "arrival",
+          status: "waiting",
+          workerId: null,
+          mapZoneId: null,
+          currentStepIndex: 0,
+          totalWorkTime: 0,
+          steps: [
+            { title: "外観確認", targetTime: 30 },
+            { title: "自動加工", targetTime: 120 },
+            { title: "梱包", targetTime: 60 },
+          ],
+        };
+      }
+
+      function render() {
+        renderArrival();
+        renderPlanning();
+        renderMap();
+        renderCompleted();
+      }
+
+      function lotCard(lot) {
+        const zoneName = state.mapZones.find((z) => z.id === lot.mapZoneId)?.name;
+        const el = document.createElement("div");
+        el.className = "bg-white border rounded-lg p-2 text-xs shadow-sm cursor-grab";
+        el.draggable = true;
+        el.dataset.lotId = lot.id;
+        el.innerHTML = `
+          <div class="flex justify-between items-center">
+            <div class="font-bold text-slate-700">${lot.orderNo}</div>
+            <div class="font-bold">${lot.quantity}台</div>
+          </div>
+          <div class="text-slate-500 mt-1">${lot.model}</div>
+          <div class="mt-1 flex justify-between">
+            <span class="${lot.priority === "high" ? "text-rose-600" : "text-slate-400"}">${lot.priority === "high" ? "急ぎ" : "通常"}</span>
+            <span class="text-slate-400">${fmtSec(Math.floor(lot.totalWorkTime / 1000))}</span>
+          </div>
+          ${zoneName ? `<div class="mt-1 inline-block bg-blue-50 text-blue-700 px-1.5 py-0.5 rounded">${zoneName}</div>` : ""}
+        `;
+        el.addEventListener("dragstart", (e) => e.dataTransfer.setData("lotId", lot.id));
+        return el;
+      }
+
+      function wireLaneDrop(node, onDrop) {
+        node.addEventListener("dragover", (e) => e.preventDefault());
+        node.addEventListener("drop", (e) => {
+          e.preventDefault();
+          const id = e.dataTransfer.getData("lotId");
+          if (id) onDrop(id);
+        });
+      }
+
+      function moveLot(lotId, newLocation, workerId = null, mapZoneId = null) {
+        const lot = state.lots.find((l) => l.id === lotId);
+        if (!lot) return;
+        if (newLocation === "planned") {
+          lot.location = "planned";
+          lot.workerId = workerId;
+        } else if (newLocation === "map") {
+          lot.location = "map";
+          lot.mapZoneId = mapZoneId;
+          if (workerId) lot.workerId = workerId;
+        } else if (newLocation === "completed") {
+          lot.location = "completed";
+          lot.status = "completed";
+        } else if (newLocation === "arrival") {
+          lot.location = "arrival";
+          lot.workerId = null;
+          lot.mapZoneId = null;
+        }
+        render();
+      }
+
+      function workerLoad(workerId) {
+        const sec = state.lots
+          .filter((l) => ["planned", "map"].includes(l.location) && l.workerId === workerId)
+          .reduce((sum, lot) => sum + lot.steps.reduce((acc, s) => acc + s.targetTime, 0) * lot.quantity, 0);
+        return fmtSec(sec);
+      }
+
+      function renderArrival() {
+        const root = document.getElementById("arrival");
+        root.innerHTML = "";
+        state.lots.filter((l) => l.location === "arrival").forEach((lot) => root.append(lotCard(lot)));
+      }
+
+      function renderPlanning() {
+        const root = document.getElementById("planning");
+        root.innerHTML = "";
+
+        const unassigned = document.createElement("div");
+        unassigned.className = "border rounded-lg bg-white p-2";
+        unassigned.innerHTML = `<div class="text-[11px] font-bold text-slate-500 mb-2">未割当</div>`;
+        const box = document.createElement("div");
+        box.className = "space-y-2 min-h-10";
+        state.lots.filter((l) => ["planned", "map"].includes(l.location) && !l.workerId).forEach((lot) => box.append(lotCard(lot)));
+        unassigned.append(box);
+        wireLaneDrop(unassigned, (id) => moveLot(id, "planned", null));
+        root.append(unassigned);
+
+        state.workers.forEach((w) => {
+          const lane = document.createElement("div");
+          lane.className = "border border-blue-200 rounded-lg bg-white p-2";
+          lane.innerHTML = `<div class="text-[11px] font-bold text-blue-700 mb-2 flex justify-between"><span>${w.name}</span><span>${workerLoad(w.id)}</span></div>`;
+          const body = document.createElement("div");
+          body.className = "space-y-2 min-h-10";
+          state.lots.filter((l) => ["planned", "map"].includes(l.location) && l.workerId === w.id).forEach((lot) => body.append(lotCard(lot)));
+          lane.append(body);
+          wireLaneDrop(lane, (id) => moveLot(id, "planned", w.id));
+          root.append(lane);
+        });
+      }
+
+      function renderMap() {
+        const root = document.getElementById("map");
+        [...root.querySelectorAll(".zone")].forEach((e) => e.remove());
+
+        state.mapZones.forEach((zone) => {
+          const el = document.createElement("div");
+          el.className = `zone absolute border-2 rounded-lg ${zone.color} overflow-hidden`;
+          el.style.left = `${zone.x}%`;
+          el.style.top = `${zone.y}%`;
+          el.style.width = `${zone.w}%`;
+          el.style.height = `${zone.h}%`;
+          el.draggable = state.layoutMode;
+
+          el.innerHTML = `<div class="text-[10px] bg-black/10 px-2 py-1 font-bold flex justify-between"><span>${zone.name}</span><span>${state.lots.filter((l) => l.mapZoneId === zone.id && l.location !== "completed").length}</span></div>`;
+          const body = document.createElement("div");
+          body.className = "p-1 space-y-1 h-[calc(100%-24px)] overflow-y-auto";
+          state.lots.filter((l) => l.mapZoneId === zone.id && l.location !== "completed").forEach((lot) => body.append(lotCard(lot)));
+          el.append(body);
+
+          if (state.layoutMode) {
+            el.classList.add("cursor-move", "border-dashed", "border-blue-500");
+            el.addEventListener("dragstart", (e) => e.dataTransfer.setData("zoneId", zone.id));
+          }
+
+          wireLaneDrop(el, (lotId) => moveLot(lotId, "map", null, zone.id));
+          root.append(el);
+        });
+
+        root.ondragover = (e) => e.preventDefault();
+        root.ondrop = (e) => {
+          e.preventDefault();
+          const zoneId = e.dataTransfer.getData("zoneId");
+          if (!zoneId || !state.layoutMode) return;
+          const zone = state.mapZones.find((z) => z.id === zoneId);
+          if (!zone) return;
+          const rect = root.getBoundingClientRect();
+          zone.x = Math.max(0, Math.min(100 - zone.w, ((e.clientX - rect.left) / rect.width) * 100));
+          zone.y = Math.max(0, Math.min(100 - zone.h, ((e.clientY - rect.top) / rect.height) * 100));
+          renderMap();
+        };
+      }
+
+      function renderCompleted() {
+        const root = document.getElementById("completed");
+        root.innerHTML = "";
+        state.lots.filter((l) => l.location === "completed").forEach((lot) => root.append(lotCard(lot)));
+      }
+
+      wireLaneDrop(document.getElementById("arrival"), (id) => moveLot(id, "arrival"));
+      wireLaneDrop(document.getElementById("completed"), (id) => moveLot(id, "completed"));
+
+      document.getElementById("add-worker").addEventListener("click", () => {
+        const name = prompt("作業者名");
+        if (!name) return;
+        state.workers.push({ id: crypto.randomUUID(), name });
+        renderPlanning();
+      });
+
+      document.getElementById("add-lot").addEventListener("click", () => {
+        lotForm.entryAt.value = new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+        lotModal.showModal();
+      });
+      document.getElementById("close-modal").addEventListener("click", () => lotModal.close());
+
+      lotForm.addEventListener("submit", (e) => {
+        e.preventDefault();
+        const fd = new FormData(lotForm);
+        const lot = mkLot(Object.fromEntries(fd.entries()));
+        state.lots.unshift(lot);
+        lotModal.close();
+        lotForm.reset();
+        render();
+      });
+
+      document.getElementById("toggle-layout").addEventListener("click", (e) => {
+        state.layoutMode = !state.layoutMode;
+        e.target.textContent = state.layoutMode ? "レイアウト保存" : "レイアウト編集";
+        e.target.className = `text-xs px-2 py-1 rounded border ${state.layoutMode ? "bg-green-600 text-white border-green-700" : "bg-slate-100"}`;
+        renderMap();
+      });
+
+      seed();
+      render();
+    </script>
+  </body>
 </html>
