@@ -16,13 +16,16 @@ from typing import Any
 
 import anthropic
 
+from .calendar import Event
+from .correlation import CorrelationSnapshot
 from .news import Headline
 
 ANALYST_SYSTEM_PROMPT = """You are a disciplined FX and crypto trading analyst.
 
 Your job: given a numeric snapshot of a financial instrument's recent price
-action, technical indicators, and (optionally) recent headlines, decide
-whether to BUY, SELL, or HOLD.
+action, technical indicators, related-pair correlations, upcoming scheduled
+events, and (optionally) recent headlines, decide whether to BUY, SELL, or
+HOLD.
 
 Technical guidelines:
 - Prefer HOLD when signals conflict. A wrong trade is worse than no trade.
@@ -42,13 +45,28 @@ Fundamental guidelines (when headlines are provided):
 - Weight recent headlines (< 6 hours old) more than older ones.
 - If the technical setup contradicts a clear fundamental catalyst,
   trust the catalyst and HOLD — technicals lag news.
-- If headlines are absent, empty, or unrelated to the instrument,
-  base the decision on technicals alone.
+
+Correlation guidelines:
+- If the primary pair's move is confirmed by strongly correlated pairs
+  (|corr| > 0.7) moving the same way, confidence rises.
+- If correlated pairs DIVERGE from the primary pair (correlation is
+  historically high but today's 24h move opposes the primary's move),
+  that's a red flag — the primary's move may be noise or idiosyncratic.
+- DXY strength typically pushes USD pairs one way and non-USD pairs the
+  other; confirm via correlation_snapshot when available.
+
+Event-calendar guidelines:
+- If a HIGH impact event for either currency is within the next 4 hours,
+  prefer HOLD unless the setup is extraordinarily strong — volatility
+  spikes at release can stop out reasonable trades.
+- Medium-impact events within 2 hours: reduce confidence one notch.
+- After an event has fired, wait for the immediate reaction to settle
+  (one bar) before entering.
 
 Confidence calibration:
 - 0.0-0.3: very weak / conflicting / noisy / fresh-news uncertainty
 - 0.4-0.6: moderate, one-sided but not strong
-- 0.7-0.9: strong confluence across indicators (and headlines agree)
+- 0.7-0.9: strong confluence across indicators, correlations, and news
 - 0.95+: exceptionally clear setup (rare)
 
 Output JSON only, matching the provided schema.
@@ -93,11 +111,33 @@ class Analyst:
         self,
         snapshot: dict,
         headlines: list[Headline] | None = None,
+        correlation: CorrelationSnapshot | None = None,
+        upcoming_events: list[Event] | None = None,
     ) -> TradeSignal:
         sections = [
             "Market snapshot:",
             f"```json\n{json.dumps(snapshot, indent=2)}\n```",
         ]
+
+        if correlation:
+            sections.append("Related-pair correlations & 24h changes:")
+            sections.append(
+                f"```json\n{json.dumps(correlation.to_dict(), indent=2)}\n```"
+            )
+
+        if upcoming_events:
+            ev_lines = []
+            for e in upcoming_events:
+                ts = e.when.strftime("%Y-%m-%d %H:%M UTC")
+                bits = [f"[{ts}]", f"({e.impact})", e.currency, e.title]
+                if e.forecast:
+                    bits.append(f"forecast={e.forecast}")
+                if e.previous:
+                    bits.append(f"previous={e.previous}")
+                ev_lines.append(" ".join(bits))
+            sections.append("Upcoming scheduled events:")
+            sections.append("\n".join(f"- {line}" for line in ev_lines))
+
         if headlines:
             lines = []
             for h in headlines:
@@ -110,11 +150,13 @@ class Analyst:
             sections.append("\n".join(lines))
         else:
             sections.append(
-                "Recent headlines: none available. Decide from technicals only."
+                "Recent headlines: none available. Decide from technicals, "
+                "correlations, and events only."
             )
+
         sections.append(
-            "Return a trade signal weighing technical confluence and any "
-            "fundamental catalysts in the headlines."
+            "Return a trade signal weighing technical confluence, "
+            "correlations, upcoming events, and any fundamental catalysts."
         )
         user_prompt = "\n\n".join(sections)
 

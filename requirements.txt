@@ -20,3 +20,6 @@ pandas>=2.0.0
 numpy>=1.24.0
 yfinance>=0.2.40
 pytest>=7.0.0
+
+# Optional — only needed if you actually use --broker oanda (practice only)
+# oandapyV20>=0.7.0

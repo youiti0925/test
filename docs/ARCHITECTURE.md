@@ -9,29 +9,49 @@ FX(および暗号資産)の自動売買を、Claude APIで市場分析・戦略
 ## システム構成
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                      CLI (src/fx/cli.py)                     │
-│  analyze    │    backtest    │    review    │    watch       │
-└──────┬───────────┬───────────────┬───────────────┬───────────┘
-       │           │               │               │
-       ▼           ▼               ▼               ▼
-┌──────────┐ ┌───────────┐ ┌─────────────┐ ┌──────────────┐
-│ Live     │ │ Backtest  │ │ Weekly      │ │ Scheduled    │
-│ Analysis │ │ Engine    │ │ Self-review │ │ Loop         │
-└────┬─────┘ └─────┬─────┘ └──────┬──────┘ └──────┬───────┘
-     │             │              │                │
-     └─────────────┴──────────────┴────────────────┘
-                         │
-          ┌──────────────┼──────────────┐
-          ▼              ▼              ▼
-    ┌──────────┐   ┌──────────┐   ┌──────────┐
-    │  Data    │   │ Analyst  │   │ Storage  │
-    │ Fetcher  │   │ (Claude) │   │ (SQLite) │
-    └────┬─────┘   └────┬─────┘   └──────────┘
-         │              │
-         ▼              ▼
-    yfinance       Claude API
-    (OHLCV)       (Opus 4.7)
+┌──────────────────────────────────────────────────────────────────────────┐
+│                           CLI (src/fx/cli.py)                            │
+│  analyze │ trade │ backtest │ review │ watch │ calendar-seed             │
+└──────┬──────┬────────┬─────────┬────────┬─────────┬──────────────────────┘
+       │      │        │         │        │         │
+       ▼      ▼        ▼         ▼        ▼         ▼
+                        _gather_inputs()
+                               │
+    ┌──────────┬───────────────┼───────────────┬──────────┐
+    ▼          ▼               ▼               ▼          ▼
+┌────────┐ ┌──────────┐ ┌────────────┐ ┌──────────┐ ┌──────────┐
+│ Data   │ │Indicators│ │Correlation │ │ Calendar │ │   News   │
+│yfinance│ │SMA/RSI/+ │ │ multi-pair │ │ events   │ │headlines │
+└────────┘ └────┬─────┘ └─────┬──────┘ └────┬─────┘ └────┬─────┘
+                └────────┬────┴─────────────┴────────────┘
+                         ▼
+                  ┌──────────────┐
+                  │   Analyst    │  Opus 4.7 + adaptive thinking
+                  │  (Claude)    │  + prompt caching
+                  └──────┬───────┘
+                         │ TradeSignal (action, confidence, reason)
+                         ▼
+                 ┌───────────────┐
+                 │   Strategy    │  Consensus rule
+                 │   combine()   │
+                 └──────┬────────┘
+                        ▼
+                 ┌──────────────┐
+                 │     Risk     │  ATR stops, Kelly sizing, RiskPlan
+                 │  plan_trade  │
+                 └──────┬───────┘
+                        ▼
+              ┌─────────────────────┐
+              │       Broker        │
+              ├─────────────────────┤
+              │  PaperBroker (test) │
+              │  OANDABroker (demo) │
+              └──────────┬──────────┘
+                         ▼
+                 ┌──────────────┐
+                 │   Storage    │  SQLite
+                 │              │  analyses / trades / backtests
+                 └──────────────┘
 ```
 
 ## コンポーネント
@@ -67,11 +87,51 @@ FX(および暗号資産)の自動売買を、Claude APIで市場分析・戦略
 - イベント駆動型(1バーずつ前進、未来情報を見ない)
 - 出力: 勝率、PF(プロフィットファクター)、最大ドローダウン、累積PnL
 
-### 7. CLI層 (`src/fx/cli.py`)
-- `fx analyze USDJPY=X` — 1回ライブ分析
-- `fx backtest USDJPY=X --from 2023-01-01` — バックテスト実行
+### 7. News層 (`src/fx/news.py`)
+- **責務**: ヘッドライン取得(ファンダメンタル情報)
+- yfinanceの新旧両方のレスポンス形式に対応
+- 取得失敗時は空リスト(「ニュースなし」は正常状態)
+- 本格運用時はReuters/Bloomberg/中央銀行RSSに差し替え可能
+
+### 8. Correlation層 (`src/fx/correlation.py`)
+- **責務**: 関連通貨ペア・指数との相関を計算
+- USDJPY=X なら EURJPY=X / GBPJPY=X / DXYと比較
+- 相関が高い他ペアとの24h変動方向が**確認 or 乖離**かLLMに伝える
+- 乖離は「このペアの動きは他と違う → 確度を下げる」判断材料
+
+### 9. Calendar層 (`src/fx/calendar.py`)
+- **責務**: 経済指標スケジュール(FOMC/日銀/ECB等)
+- `data/events.json` にJSONで保持(自分でseed/scrape)
+- `upcoming_for_symbol()` でシンボルに関係する通貨の今後N時間のイベントを抽出
+- LLMに「あと4時間でFOMC → HOLD推奨」のような判断材料として渡す
+
+### 10. Risk層 (`src/fx/risk.py`)
+- **責務**: 純粋な数学(外部依存なし、テスト容易)
+- **ATR (Average True Range)** — Wilder's EWM版
+- **ATRベースのストップロス/テイクプロフィット** — エントリーから `N*ATR` 離したところ
+- **Kelly基準** — 勝率と損益比から最適ベットサイズを計算
+- **Fractional Kelly** — フル Kellyはボラが高すぎるので 1/4 Kelly + 20% cap
+- **Position sizing** — リスク許容額(資金の1%等)をストップ距離で割ってユニット数を決める
+- `plan_trade()` が全部合わせて `RiskPlan` を返す
+
+### 11. Broker層 (`src/fx/broker.py`, `src/fx/oanda.py`)
+- **責務**: 発注の抽象化
+- `Broker` ABC — place_order / close_position / balance / mark_to_market
+- `PaperBroker` — メモリ内シミュレータ。ストップ/TPを自動判定して close
+- `OANDABroker` — OANDA v20 APIラッパー、**practice口座限定**
+  - `OANDA_ENV=practice` 強制(liveは弾く)
+  - `OANDA_ALLOW_LIVE_ORDERS=yes` が必要(セッションごとのopt-in)
+  - `confirm_demo=True` が必要(明示的コンストラクタ引数)
+  - 3条件全部満たさないと `LiveTradingBlocked` 例外
+  - `oandapyV20` は**遅延import**(未インストールでもテストは通る)
+
+### 12. CLI層 (`src/fx/cli.py`)
+- `fx analyze USDJPY=X` — 1回ライブ分析(全入力を合成)
+- `fx trade USDJPY=X --dry-run` — 分析→リスクプラン作成→(任意で)発注
+- `fx backtest USDJPY=X --period 180d` — バックテスト実行
 - `fx review` — 過去トレードをClaudeにレビューさせる(学習ループ)
 - `fx watch USDJPY=X --interval 15m` — 定期分析ループ
+- `fx calendar-seed` — `data/events.json` のひな形を作る
 
 ## Claude API の使い分け
 
@@ -107,11 +167,13 @@ FX(および暗号資産)の自動売買を、Claude APIで市場分析・戦略
 
 | Phase | 内容 | 実装状況 |
 |-------|-----|---------|
-| 1 | データ取得・テクニカル・分析ログ(発注なし) | ✅ 本リポジトリ |
-| 2 | バックテスト基盤 | ✅ 本リポジトリ |
-| 3 | セルフレビュー(週次学習) | ✅ 本リポジトリ |
-| 4 | デモ口座で発注(OANDA demo等) | 未 |
-| 5 | リアルマネー(小額から) | 未 |
+| 1 | データ取得・テクニカル・分析ログ(発注なし) | ✅ |
+| 2 | バックテスト基盤 | ✅ |
+| 3 | セルフレビュー(週次学習) | ✅ |
+| 3.5 | ニュース / 相関 / 経済カレンダー / リスク管理 | ✅ |
+| 4 | PaperBroker + OANDA demoスキャフォールド | ✅ (安全装置付き) |
+| 4.5 | OANDA demo口座で実発注 | 手動実行 |
+| 5 | リアルマネー(小額から) | 未(自己責任) |
 
 **Phase 4以降に進む前の検証基準(目安):**
 - 6ヶ月以上のバックテストで PF > 1.3

@@ -36,6 +36,19 @@ python -m src.fx.cli watch --symbol USDJPY=X --interval 15m --every 900
 
 # 週次セルフレビュー (過去のトレードをClaudeに分析させる)
 python -m src.fx.cli review --limit 50
+
+# 経済カレンダーのひな形を作る (data/events.json)
+python -m src.fx.cli calendar-seed
+
+# 分析 + リスクプラン + PaperBrokerに発注 (dry-run)
+python -m src.fx.cli trade --symbol USDJPY=X --dry-run
+
+# PaperBrokerに実発注 (メモリ内)
+python -m src.fx.cli trade --symbol USDJPY=X --capital 10000 --risk-pct 0.01
+
+# OANDA demo発注 (3重の安全装置をクリアする必要あり、本体コード参照)
+export OANDA_API_KEY=... OANDA_ACCOUNT_ID=... OANDA_ENV=practice OANDA_ALLOW_LIVE_ORDERS=yes
+python -m src.fx.cli trade --broker oanda --confirm-demo --symbol USDJPY=X
 ```
 
 ## テスト
@@ -51,8 +64,13 @@ pytest tests/ -v
 | `src/fx/data.py` | OHLCV取得 (yfinance) |
 | `src/fx/indicators.py` | テクニカル指標 (SMA/EMA/RSI/MACD/BB) |
 | `src/fx/news.py` | ヘッドライン取得 (yfinance、FX用は差し替え推奨) |
-| `src/fx/analyst.py` | Claude API分析 (Opus 4.7 + adaptive thinking + prompt caching、テクニカル+ファンダメンタル) |
+| `src/fx/correlation.py` | 関連通貨ペア/指数との相関分析 |
+| `src/fx/calendar.py` | 経済指標カレンダー (data/events.json) |
+| `src/fx/risk.py` | ATR/Kelly/ポジションサイジング |
+| `src/fx/analyst.py` | Claude API分析 (Opus 4.7 + adaptive thinking + prompt caching、テクニカル+ファンダメンタル+相関+イベント) |
 | `src/fx/strategy.py` | テクニカル×LLMの合意ルール |
+| `src/fx/broker.py` | ブローカー抽象 + PaperBroker (メモリ内発注) |
+| `src/fx/oanda.py` | OANDA demo口座スキャフォールド (3重の安全装置付き) |
 | `src/fx/backtest.py` | イベント駆動型バックテスト |
 | `src/fx/storage.py` | SQLite履歴管理 |
 | `src/fx/cli.py` | CLIエントリポイント |
