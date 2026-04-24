@@ -7,6 +7,9 @@ Usage examples:
   python -m src.fx.cli watch --symbol USDJPY=X --interval 15m --every 900
   python -m src.fx.cli trade --symbol USDJPY=X --dry-run
   python -m src.fx.cli calendar-seed        # create a placeholder events.json
+  python -m src.fx.cli evaluate             # score pending predictions
+  python -m src.fx.cli postmortem           # learn from wrong predictions
+  python -m src.fx.cli lessons --symbol USDJPY=X
 """
 from __future__ import annotations
 
@@ -25,6 +28,8 @@ from .correlation import build_correlation_snapshot, related_for
 from .data import fetch_ohlcv
 from .indicators import build_snapshot, technical_signal
 from .news import fetch_headlines
+from .postmortem import Postmortem
+from .prediction import evaluate_prediction, slice_bars_after
 from .risk import atr, plan_trade
 from .storage import Storage
 from .strategy import combine
@@ -36,7 +41,7 @@ def _print(obj) -> None:
     print(json.dumps(obj, indent=2, default=str, ensure_ascii=False))
 
 
-def _gather_inputs(args, cfg: Config):
+def _gather_inputs(args, cfg: Config, storage: Storage):
     """Common input fetch for analyze / trade / watch."""
     df = fetch_ohlcv(args.symbol, interval=args.interval, period=args.period)
     snap = build_snapshot(args.symbol, df)
@@ -64,6 +69,12 @@ def _gather_inputs(args, cfg: Config):
             all_events, args.symbol, within_hours=args.event_window_hours
         )
 
+    past_lessons = []
+    if not args.no_lessons:
+        past_lessons = storage.relevant_postmortems(
+            args.symbol, limit=args.lesson_limit
+        )
+
     llm_signal = None
     if cfg.anthropic_api_key and not args.no_llm:
         analyst = Analyst(model=cfg.model, effort=cfg.effort)
@@ -72,6 +83,7 @@ def _gather_inputs(args, cfg: Config):
             headlines=headlines,
             correlation=correlation,
             upcoming_events=events,
+            past_postmortems=past_lessons,
         )
 
     decision = combine(tech, llm_signal)
@@ -83,6 +95,7 @@ def _gather_inputs(args, cfg: Config):
         "headlines": headlines,
         "correlation": correlation,
         "events": events,
+        "past_lessons": past_lessons,
         "llm": llm_signal,
         "decision": decision,
         "atr": atr_value,
@@ -90,7 +103,7 @@ def _gather_inputs(args, cfg: Config):
 
 
 def cmd_analyze(args, cfg: Config, storage: Storage) -> int:
-    ctx = _gather_inputs(args, cfg)
+    ctx = _gather_inputs(args, cfg, storage)
     snap, tech, llm, decision = (
         ctx["snapshot"],
         ctx["technical"],
@@ -107,9 +120,26 @@ def cmd_analyze(args, cfg: Config, storage: Storage) -> int:
         llm_reason=llm.reason if llm else None,
     )
 
+    prediction_id = None
+    if llm is not None:
+        prediction_id = storage.save_prediction(
+            analysis_id=analysis_id,
+            symbol=args.symbol,
+            interval=args.interval,
+            entry_price=snap.last_close,
+            action=llm.action,
+            confidence=llm.confidence,
+            reason=llm.reason,
+            expected_direction=llm.expected_direction,
+            expected_magnitude_pct=llm.expected_magnitude_pct,
+            horizon_bars=llm.horizon_bars,
+            invalidation_price=llm.invalidation_price,
+        )
+
     _print(
         {
             "analysis_id": analysis_id,
+            "prediction_id": prediction_id,
             "snapshot": snap.to_dict(),
             "technical_signal": tech,
             "atr_14": round(ctx["atr"], 6),
@@ -118,12 +148,17 @@ def cmd_analyze(args, cfg: Config, storage: Storage) -> int:
             ),
             "upcoming_events": [e.to_dict() for e in ctx["events"]],
             "headlines": [h.to_dict() for h in ctx["headlines"]],
+            "past_lessons_used": len(ctx["past_lessons"]),
             "llm": (
                 {
                     "action": llm.action,
                     "confidence": llm.confidence,
                     "reason": llm.reason,
                     "key_risks": llm.key_risks,
+                    "expected_direction": llm.expected_direction,
+                    "expected_magnitude_pct": llm.expected_magnitude_pct,
+                    "horizon_bars": llm.horizon_bars,
+                    "invalidation_price": llm.invalidation_price,
                 }
                 if llm
                 else None
@@ -144,7 +179,7 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
     Default broker is PaperBroker. Real-broker support is explicitly opt-in
     via --broker oanda (requires environment guards, see src/fx/oanda.py).
     """
-    ctx = _gather_inputs(args, cfg)
+    ctx = _gather_inputs(args, cfg, storage)
     snap, decision, atr_value = ctx["snapshot"], ctx["decision"], ctx["atr"]
 
     if decision.action == "HOLD":
@@ -284,6 +319,120 @@ def cmd_watch(args, cfg: Config, storage: Storage) -> int:
         time.sleep(args.every)
 
 
+def cmd_evaluate(args, cfg: Config, storage: Storage) -> int:
+    """Score every PENDING prediction whose horizon has elapsed."""
+    pending = storage.pending_predictions()
+    if not pending:
+        _print({"evaluated": 0, "note": "No pending predictions."})
+        return 0
+
+    summary = {"CORRECT": 0, "PARTIAL": 0, "WRONG": 0,
+               "INCONCLUSIVE": 0, "INSUFFICIENT_DATA": 0}
+    details = []
+
+    by_symbol: dict[tuple[str, str], list[dict]] = {}
+    for p in pending:
+        by_symbol.setdefault((p["symbol"], p["interval"]), []).append(p)
+
+    for (symbol, interval), preds in by_symbol.items():
+        try:
+            df = fetch_ohlcv(symbol, interval=interval, period=args.period)
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] could not fetch {symbol} {interval}: {e}", file=sys.stderr)
+            continue
+        for p in preds:
+            after = slice_bars_after(df, p["ts"])
+            verdict = evaluate_prediction(p, after)
+            if verdict.status == "INSUFFICIENT_DATA":
+                summary["INSUFFICIENT_DATA"] += 1
+                continue
+            storage.update_prediction_evaluation(
+                prediction_id=p["id"],
+                status=verdict.status,
+                actual_direction=verdict.actual_direction,
+                actual_magnitude_pct=verdict.actual_magnitude_pct,
+                max_favorable_pct=verdict.max_favorable_pct,
+                max_adverse_pct=verdict.max_adverse_pct,
+                invalidation_hit=verdict.invalidation_hit,
+                note=verdict.note,
+            )
+            summary[verdict.status] = summary.get(verdict.status, 0) + 1
+            details.append(
+                {
+                    "prediction_id": p["id"],
+                    "symbol": p["symbol"],
+                    "action": p["action"],
+                    "verdict": verdict.to_dict(),
+                }
+            )
+
+    _print({"summary": summary, "details": details})
+    return 0
+
+
+def cmd_postmortem(args, cfg: Config, storage: Storage) -> int:
+    """Run Claude post-mortems on WRONG predictions that don't have one yet."""
+    if not cfg.anthropic_api_key:
+        print("ANTHROPIC_API_KEY not set; cannot run post-mortems.", file=sys.stderr)
+        return 1
+
+    wrongs = storage.wrong_predictions_without_postmortem(limit=args.limit)
+    if not wrongs:
+        _print({"analyzed": 0, "note": "No wrong predictions awaiting post-mortem."})
+        return 0
+
+    pm = Postmortem(model=cfg.model, effort="high")
+    written = []
+    for p in wrongs:
+        verdict_view = {
+            "status": p["status"],
+            "actual_direction": p["actual_direction"],
+            "actual_magnitude_pct": p["actual_magnitude_pct"],
+            "max_favorable_pct": p["max_favorable_pct"],
+            "max_adverse_pct": p["max_adverse_pct"],
+            "invalidation_hit": bool(p["invalidation_hit"]),
+            "note": p["evaluation_note"],
+        }
+        try:
+            result = pm.analyze(p, verdict_view)
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] post-mortem failed for prediction {p['id']}: {e}",
+                  file=sys.stderr)
+            continue
+        pm_id = storage.save_postmortem(
+            prediction_id=p["id"],
+            root_cause=result.root_cause,
+            narrative=result.narrative,
+            proposed_rule=result.proposed_rule,
+            tags=",".join(result.tags),
+        )
+        written.append(
+            {
+                "postmortem_id": pm_id,
+                "prediction_id": p["id"],
+                "root_cause": result.root_cause,
+                "proposed_rule": result.proposed_rule,
+            }
+        )
+
+    _print({"written": written, "count": len(written)})
+    return 0
+
+
+def cmd_lessons(args, cfg: Config, storage: Storage) -> int:
+    """Show what we've learned so far."""
+    summary = storage.lesson_summary()
+    recent = storage.relevant_postmortems(args.symbol, limit=args.limit) if args.symbol else []
+    _print(
+        {
+            "root_cause_counts": summary,
+            "recent_for_symbol": recent,
+            "symbol": args.symbol,
+        }
+    )
+    return 0
+
+
 def cmd_calendar_seed(args, cfg: Config, storage: Storage) -> int:
     events = seed_defaults(EVENTS_PATH)
     _print(
@@ -305,6 +454,9 @@ def _add_context_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-news", action="store_true")
     parser.add_argument("--no-correlation", action="store_true")
     parser.add_argument("--no-events", action="store_true")
+    parser.add_argument("--no-lessons", action="store_true",
+                        help="Skip injecting past post-mortems")
+    parser.add_argument("--lesson-limit", type=int, default=5)
     parser.add_argument("--news-limit", type=int, default=5)
     parser.add_argument("--event-window-hours", type=int, default=24)
 
@@ -351,6 +503,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     c = sub.add_parser("calendar-seed", help="Write a placeholder events.json")
     c.set_defaults(func=cmd_calendar_seed)
+
+    e = sub.add_parser(
+        "evaluate", help="Score pending predictions against actual price action"
+    )
+    e.add_argument(
+        "--period", default="60d",
+        help="Lookback window for price fetch (must cover the prediction's horizon)",
+    )
+    e.set_defaults(func=cmd_evaluate)
+
+    pm = sub.add_parser(
+        "postmortem", help="Run Claude post-mortems on WRONG predictions"
+    )
+    pm.add_argument("--limit", type=int, default=10)
+    pm.set_defaults(func=cmd_postmortem)
+
+    ls = sub.add_parser("lessons", help="Show accumulated post-mortem lessons")
+    ls.add_argument("--symbol", default=None,
+                    help="If set, also list recent lessons for this symbol")
+    ls.add_argument("--limit", type=int, default=10)
+    ls.set_defaults(func=cmd_lessons)
 
     return p
 

@@ -69,6 +69,29 @@ Confidence calibration:
 - 0.7-0.9: strong confluence across indicators, correlations, and news
 - 0.95+: exceptionally clear setup (rare)
 
+Falsifiable prediction (REQUIRED for every signal):
+You must commit to a concrete, checkable claim about the next few bars so
+that a later evaluator can score whether you were right or wrong:
+- expected_direction: UP / DOWN / FLAT (FLAT for HOLD signals)
+- expected_magnitude_pct: how far you expect price to move (absolute %)
+  within the horizon — for FLAT, this is the maximum tolerated move.
+- horizon_bars: how many bars ahead this prediction applies to
+  (typical: 4-12 for hourly, 2-5 for daily). Match it to the timeframe
+  of the indicators you used.
+- invalidation_price: a specific price level that, if hit before the
+  horizon expires, proves the setup wrong. For HOLD signals this MAY be
+  null. For BUY: well below the entry. For SELL: well above the entry.
+
+Vague predictions are unscoreable and worthless. Be specific even when
+uncertain — low confidence + concrete prediction is fine.
+
+Past mistakes (when provided):
+You may receive a list of recent post-mortems describing setups where
+you were wrong before, with root causes. Before finalizing this signal,
+check whether the current setup matches any of those failure patterns.
+If it does, adjust your action or confidence accordingly and mention
+the matching past lesson in your reason.
+
 Output JSON only, matching the provided schema.
 """
 
@@ -79,8 +102,21 @@ SIGNAL_SCHEMA = {
         "confidence": {"type": "number"},
         "reason": {"type": "string"},
         "key_risks": {"type": "array", "items": {"type": "string"}},
+        "expected_direction": {"type": "string", "enum": ["UP", "DOWN", "FLAT"]},
+        "expected_magnitude_pct": {"type": "number"},
+        "horizon_bars": {"type": "integer"},
+        "invalidation_price": {"type": ["number", "null"]},
     },
-    "required": ["action", "confidence", "reason", "key_risks"],
+    "required": [
+        "action",
+        "confidence",
+        "reason",
+        "key_risks",
+        "expected_direction",
+        "expected_magnitude_pct",
+        "horizon_bars",
+        "invalidation_price",
+    ],
     "additionalProperties": False,
 }
 
@@ -91,6 +127,10 @@ class TradeSignal:
     confidence: float
     reason: str
     key_risks: list[str]
+    expected_direction: str        # UP | DOWN | FLAT
+    expected_magnitude_pct: float  # absolute percent move expected within horizon
+    horizon_bars: int              # how many bars ahead this prediction applies to
+    invalidation_price: float | None  # price level that would falsify the setup
     raw_response: dict[str, Any]
 
 
@@ -113,11 +153,20 @@ class Analyst:
         headlines: list[Headline] | None = None,
         correlation: CorrelationSnapshot | None = None,
         upcoming_events: list[Event] | None = None,
+        past_postmortems: list[dict] | None = None,
     ) -> TradeSignal:
         sections = [
             "Market snapshot:",
             f"```json\n{json.dumps(snapshot, indent=2)}\n```",
         ]
+
+        if past_postmortems:
+            sections.append(
+                "Past mistakes on this symbol — check whether any apply now:"
+            )
+            sections.append(
+                f"```json\n{json.dumps(past_postmortems, indent=2, default=str)}\n```"
+            )
 
         if correlation:
             sections.append("Related-pair correlations & 24h changes:")
@@ -180,11 +229,18 @@ class Analyst:
 
         text = next(b.text for b in response.content if b.type == "text")
         data = json.loads(text)
+        invalidation = data.get("invalidation_price")
         return TradeSignal(
             action=data["action"],
             confidence=float(data["confidence"]),
             reason=data["reason"],
             key_risks=data["key_risks"],
+            expected_direction=data["expected_direction"],
+            expected_magnitude_pct=float(data["expected_magnitude_pct"]),
+            horizon_bars=int(data["horizon_bars"]),
+            invalidation_price=(
+                float(invalidation) if invalidation is not None else None
+            ),
             raw_response=data,
         )
 

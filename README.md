@@ -51,6 +51,27 @@ export OANDA_API_KEY=... OANDA_ACCOUNT_ID=... OANDA_ENV=practice OANDA_ALLOW_LIV
 python -m src.fx.cli trade --broker oanda --confirm-demo --symbol USDJPY=X
 ```
 
+## 学習ループの回し方
+
+```bash
+# 1. 普段のanalyzeでClaudeに反証可能な予測を保存(自動)
+python -m src.fx.cli analyze --symbol USDJPY=X
+
+# 2. 数時間/数日後、期日経過した予測を実価格と照合
+python -m src.fx.cli evaluate
+
+# 3. WRONGになった予測にClaudeを通して根本原因分析 + 改善ルール提案
+python -m src.fx.cli postmortem
+
+# 4. 蓄積した教訓を確認(カテゴリ別集計 + 該当シンボルの最近のレッスン)
+python -m src.fx.cli lessons --symbol USDJPY=X
+
+# 次回 analyze からは過去のWRONGケースが自動的にプロンプトに注入される
+# → Claudeが「以前同じ状況でXが原因で間違えた」を読んで判断に反映
+```
+
+cronで `evaluate` と `postmortem` を1日1回回せば、放置していても学習データが蓄積されていく。
+
 ## テスト
 
 ```bash
@@ -67,12 +88,14 @@ pytest tests/ -v
 | `src/fx/correlation.py` | 関連通貨ペア/指数との相関分析 |
 | `src/fx/calendar.py` | 経済指標カレンダー (data/events.json) |
 | `src/fx/risk.py` | ATR/Kelly/ポジションサイジング |
-| `src/fx/analyst.py` | Claude API分析 (Opus 4.7 + adaptive thinking + prompt caching、テクニカル+ファンダメンタル+相関+イベント) |
+| `src/fx/analyst.py` | Claude API分析 (Opus 4.7 + adaptive thinking + prompt caching、テクニカル+ファンダメンタル+相関+イベント+過去レッスン注入) |
 | `src/fx/strategy.py` | テクニカル×LLMの合意ルール |
+| `src/fx/prediction.py` | 予測の評価ロジック(CORRECT/PARTIAL/WRONG/INCONCLUSIVE) |
+| `src/fx/postmortem.py` | WRONG予測の根本原因分析 + 改善ルール提案(Claude) |
 | `src/fx/broker.py` | ブローカー抽象 + PaperBroker (メモリ内発注) |
 | `src/fx/oanda.py` | OANDA demo口座スキャフォールド (3重の安全装置付き) |
 | `src/fx/backtest.py` | イベント駆動型バックテスト |
-| `src/fx/storage.py` | SQLite履歴管理 |
+| `src/fx/storage.py` | SQLite履歴管理 (analyses/trades/predictions/postmortems/backtest_runs) |
 | `src/fx/cli.py` | CLIエントリポイント |
 
 ## リスクに関する注意

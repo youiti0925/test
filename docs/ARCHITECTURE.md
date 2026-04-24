@@ -125,11 +125,28 @@ FX(および暗号資産)の自動売買を、Claude APIで市場分析・戦略
   - 3条件全部満たさないと `LiveTradingBlocked` 例外
   - `oandapyV20` は**遅延import**(未インストールでもテストは通る)
 
-### 12. CLI層 (`src/fx/cli.py`)
-- `fx analyze USDJPY=X` — 1回ライブ分析(全入力を合成)
+### 12. Prediction層 (`src/fx/prediction.py`)
+- **責務**: 「Claudeの予測 vs 実際の価格動向」の照合
+- 各analyze時、Claudeに`expected_direction`, `expected_magnitude_pct`, `horizon_bars`, `invalidation_price`を強制(反証可能性)
+- `evaluate_prediction()`が後続バーを見て5カテゴリに分類
+- `max_favorable_pct` / `max_adverse_pct` も記録 → 「方向は当たったが我慢が足りなかった」も検出可能
+- 自動的にinvalidation_priceにヒットしたかも判定
+
+### 13. Postmortem層 (`src/fx/postmortem.py`)
+- **責務**: WRONG判定だけClaudeに失敗の根本原因分析させる
+- 11カテゴリの閉じたタクソノミ(集計のため)
+- 改善ルール提案も構造化出力
+- 結果は`postmortems`テーブルへ
+- 次回`analyze`で同一シンボルの過去失敗を取り出してプロンプトに自動注入(`Storage.relevant_postmortems()`)
+
+### 14. CLI層 (`src/fx/cli.py`)
+- `fx analyze USDJPY=X` — 1回ライブ分析(過去レッスン自動注入)
 - `fx trade USDJPY=X --dry-run` — 分析→リスクプラン作成→(任意で)発注
 - `fx backtest USDJPY=X --period 180d` — バックテスト実行
-- `fx review` — 過去トレードをClaudeにレビューさせる(学習ループ)
+- `fx evaluate` — 期日経過した予測を全部実価格と照合
+- `fx postmortem` — WRONG予測にClaudeを通して原因分析
+- `fx lessons --symbol USDJPY=X` — 蓄積した教訓を確認
+- `fx review` — 過去トレードをClaudeにレビューさせる(週次まとめ)
 - `fx watch USDJPY=X --interval 15m` — 定期分析ループ
 - `fx calendar-seed` — `data/events.json` のひな形を作る
 
@@ -143,25 +160,55 @@ FX(および暗号資産)の自動売買を、Claude APIで市場分析・戦略
 
 ## 学習ループ(Claudeとの連携)
 
-機械学習ではなく「**言語化ループ**」で改善する:
+「予測 → 検証 → 失敗の根本原因分析 → 次回プロンプトに注入」の閉ループ:
 
 ```
-  ┌────────────────────────────────┐
-  │ 1. 日々のトレードをDBに蓄積     │
-  └───────────────┬────────────────┘
-                  ▼
-  ┌────────────────────────────────┐
-  │ 2. 週1でトレード履歴をClaudeへ  │
-  │    - 勝ちトレードの共通点       │
-  │    - 負けトレードの失敗パターン │
-  │    - プロンプト/閾値改善案      │
-  └───────────────┬────────────────┘
-                  ▼
-  ┌────────────────────────────────┐
-  │ 3. 人間が改善案を確認し         │
-  │    system promptや閾値を更新    │
-  └────────────────────────────────┘
+  ┌──────────────────────────────────────────┐
+  │ 1. analyze: Claudeが反証可能な予測を生成   │
+  │    expected_direction / magnitude /       │
+  │    horizon_bars / invalidation_price      │
+  │    → predictions テーブルに PENDING       │
+  └─────────────────┬────────────────────────┘
+                    ▼
+  ┌──────────────────────────────────────────┐
+  │ 2. evaluate: horizon経過後に実価格と照合   │
+  │    → CORRECT / PARTIAL / WRONG /          │
+  │       INCONCLUSIVE / INSUFFICIENT_DATA    │
+  └─────────────────┬────────────────────────┘
+                    ▼
+  ┌──────────────────────────────────────────┐
+  │ 3. postmortem: WRONGだけClaudeが原因分析   │
+  │    11カテゴリの根本原因 + 改善ルール提案  │
+  │    → postmortems テーブル                 │
+  └─────────────────┬────────────────────────┘
+                    ▼
+  ┌──────────────────────────────────────────┐
+  │ 4. 次回 analyze: 同じシンボルの過去失敗を │
+  │    プロンプトに注入。Claudeが「以前同じ   │
+  │    パターンで X が原因で間違えた」を読み、 │
+  │    今回もそれが当てはまるか検証する       │
+  └──────────────────────────────────────────┘
 ```
+
+### 根本原因の閉じたタクソノミ
+
+集計と検索のため、Claudeは以下11カテゴリのいずれかに必ず分類:
+
+| カテゴリ | 意味 |
+|---------|------|
+| `TREND_MISREAD` | トレンド継続を反転と読んだ(逆も) |
+| `NEWS_SHOCK` | フィードに無いニュースで動いた |
+| `LIQUIDITY_WHIPSAW` | 薄商いのノイズで損切りされた |
+| `CORRELATION_BREAKDOWN` | 関連ペアが想定外に乖離した |
+| `INDICATOR_LAG` | テクニカルが動きの後追いだった |
+| `FALSE_SIGNAL` | 指標が空売りで点灯した |
+| `EVENT_VOLATILITY` | スケジュールイベントで吹き飛んだ |
+| `REGIME_CHANGE` | レンジ→トレンド等の地合い変化 |
+| `OVER_CONFIDENCE` | シグナル弱いのに張った |
+| `UNDER_HORIZON` | 方向は正しいが時間軸違い |
+| `OTHER` | 上記に当てはまらない |
+
+`fx lessons` でカテゴリ別集計を確認 → 多発カテゴリがプロンプト改善の優先順位になる。
 
 ## 段階的ロードマップ
 

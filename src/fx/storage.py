@@ -49,6 +49,47 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
 
 CREATE INDEX IF NOT EXISTS idx_analyses_symbol_ts ON analyses(symbol, ts);
 CREATE INDEX IF NOT EXISTS idx_trades_closed_at ON trades(closed_at);
+
+CREATE TABLE IF NOT EXISTS predictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    analysis_id INTEGER NOT NULL,
+    ts TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    interval TEXT NOT NULL,
+    entry_price REAL NOT NULL,
+    action TEXT NOT NULL,
+    confidence REAL,
+    reason TEXT,
+    expected_direction TEXT NOT NULL,
+    expected_magnitude_pct REAL NOT NULL,
+    horizon_bars INTEGER NOT NULL,
+    invalidation_price REAL,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    actual_direction TEXT,
+    actual_magnitude_pct REAL,
+    max_favorable_pct REAL,
+    max_adverse_pct REAL,
+    invalidation_hit INTEGER,
+    evaluated_at TEXT,
+    evaluation_note TEXT,
+    FOREIGN KEY (analysis_id) REFERENCES analyses(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_predictions_status ON predictions(status);
+CREATE INDEX IF NOT EXISTS idx_predictions_symbol_ts ON predictions(symbol, ts);
+
+CREATE TABLE IF NOT EXISTS postmortems (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prediction_id INTEGER NOT NULL UNIQUE,
+    ts TEXT NOT NULL,
+    root_cause TEXT NOT NULL,
+    narrative TEXT NOT NULL,
+    proposed_rule TEXT,
+    tags TEXT,
+    FOREIGN KEY (prediction_id) REFERENCES predictions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_postmortems_root_cause ON postmortems(root_cause);
 """
 
 
@@ -168,6 +209,146 @@ class Storage:
                    WHERE t.closed_at IS NOT NULL
                    ORDER BY t.closed_at DESC LIMIT ?""",
                 (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def save_prediction(
+        self,
+        analysis_id: int,
+        symbol: str,
+        interval: str,
+        entry_price: float,
+        action: str,
+        confidence: float | None,
+        reason: str | None,
+        expected_direction: str,
+        expected_magnitude_pct: float,
+        horizon_bars: int,
+        invalidation_price: float | None,
+    ) -> int:
+        with self._conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO predictions
+                   (analysis_id, ts, symbol, interval, entry_price, action,
+                    confidence, reason, expected_direction,
+                    expected_magnitude_pct, horizon_bars, invalidation_price)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    analysis_id,
+                    datetime.utcnow().isoformat(),
+                    symbol,
+                    interval,
+                    entry_price,
+                    action,
+                    confidence,
+                    reason,
+                    expected_direction,
+                    expected_magnitude_pct,
+                    horizon_bars,
+                    invalidation_price,
+                ),
+            )
+            return cur.lastrowid
+
+    def pending_predictions(self) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM predictions WHERE status = 'PENDING' ORDER BY ts ASC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def update_prediction_evaluation(
+        self,
+        prediction_id: int,
+        status: str,
+        actual_direction: str | None,
+        actual_magnitude_pct: float | None,
+        max_favorable_pct: float | None,
+        max_adverse_pct: float | None,
+        invalidation_hit: bool,
+        note: str | None = None,
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """UPDATE predictions
+                   SET status = ?, actual_direction = ?, actual_magnitude_pct = ?,
+                       max_favorable_pct = ?, max_adverse_pct = ?,
+                       invalidation_hit = ?, evaluated_at = ?, evaluation_note = ?
+                   WHERE id = ?""",
+                (
+                    status,
+                    actual_direction,
+                    actual_magnitude_pct,
+                    max_favorable_pct,
+                    max_adverse_pct,
+                    1 if invalidation_hit else 0,
+                    datetime.utcnow().isoformat(),
+                    note,
+                    prediction_id,
+                ),
+            )
+
+    def wrong_predictions_without_postmortem(self, limit: int = 20) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT p.*, a.snapshot_json
+                   FROM predictions p
+                   LEFT JOIN analyses a ON p.analysis_id = a.id
+                   LEFT JOIN postmortems pm ON pm.prediction_id = p.id
+                   WHERE p.status = 'WRONG' AND pm.id IS NULL
+                   ORDER BY p.evaluated_at DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def save_postmortem(
+        self,
+        prediction_id: int,
+        root_cause: str,
+        narrative: str,
+        proposed_rule: str | None,
+        tags: str | None,
+    ) -> int:
+        with self._conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO postmortems
+                   (prediction_id, ts, root_cause, narrative, proposed_rule, tags)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    prediction_id,
+                    datetime.utcnow().isoformat(),
+                    root_cause,
+                    narrative,
+                    proposed_rule,
+                    tags,
+                ),
+            )
+            return cur.lastrowid
+
+    def relevant_postmortems(self, symbol: str, limit: int = 5) -> list[dict]:
+        """Most recent post-mortems for this symbol — injected into the next
+        analysis prompt so Claude sees its own past failures."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT pm.root_cause, pm.narrative, pm.proposed_rule, pm.tags,
+                          p.symbol, p.action, p.expected_direction,
+                          p.expected_magnitude_pct, p.actual_direction,
+                          p.actual_magnitude_pct, p.ts AS predicted_at
+                   FROM postmortems pm
+                   JOIN predictions p ON pm.prediction_id = p.id
+                   WHERE p.symbol = ?
+                   ORDER BY pm.ts DESC LIMIT ?""",
+                (symbol, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def lesson_summary(self) -> list[dict]:
+        """Aggregate counts by root cause — quick view of where we go wrong."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT root_cause, COUNT(*) AS n
+                   FROM postmortems
+                   GROUP BY root_cause ORDER BY n DESC"""
             ).fetchall()
             return [dict(r) for r in rows]
 
