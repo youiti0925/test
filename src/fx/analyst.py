@@ -1,0 +1,134 @@
+"""Claude-powered market analyst.
+
+Exposes two entry points:
+- analyze(): single-tick market analysis returning a structured TradeSignal.
+- review(): weekly self-review over a batch of past trades.
+
+Both use `claude-opus-4-7` with adaptive thinking. The single-tick path uses
+prompt caching on the large, static system prompt so that per-tick cost is
+dominated by the cache-read price (~0.1x) rather than full input tokens.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import Any
+
+import anthropic
+
+ANALYST_SYSTEM_PROMPT = """You are a disciplined FX and crypto trading analyst.
+
+Your job: given a numeric snapshot of a financial instrument's recent price
+action and technical indicators, decide whether to BUY, SELL, or HOLD.
+
+Guidelines:
+- Prefer HOLD when signals conflict. A wrong trade is worse than no trade.
+- Consider confluence: multiple indicators pointing the same direction >> a
+  single strong signal.
+- RSI extremes (< 30, > 70) are MEAN-REVERSION signals, not momentum.
+- MACD histogram crossings above/below zero indicate momentum shifts.
+- Bollinger band position close to 0 or 1 suggests potential reversal.
+- Do not chase: if the market just moved >2% in one bar, wait.
+- Confidence must reflect signal quality:
+  * 0.0-0.3: very weak / conflicting / noisy
+  * 0.4-0.6: moderate, one-sided but not strong
+  * 0.7-0.9: strong confluence across indicators
+  * 0.95+: exceptionally clear setup (rare)
+
+Output JSON only, matching the provided schema.
+"""
+
+SIGNAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": ["BUY", "SELL", "HOLD"]},
+        "confidence": {"type": "number"},
+        "reason": {"type": "string"},
+        "key_risks": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["action", "confidence", "reason", "key_risks"],
+    "additionalProperties": False,
+}
+
+
+@dataclass(frozen=True)
+class TradeSignal:
+    action: str
+    confidence: float
+    reason: str
+    key_risks: list[str]
+    raw_response: dict[str, Any]
+
+
+class Analyst:
+    """Wraps the Anthropic client with caching and structured output."""
+
+    def __init__(
+        self,
+        client: anthropic.Anthropic | None = None,
+        model: str = "claude-opus-4-7",
+        effort: str = "medium",
+    ) -> None:
+        self.client = client or anthropic.Anthropic()
+        self.model = model
+        self.effort = effort
+
+    def analyze(self, snapshot: dict) -> TradeSignal:
+        user_prompt = (
+            "Analyze this market snapshot and return a trade signal.\n\n"
+            f"```json\n{json.dumps(snapshot, indent=2)}\n```"
+        )
+
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=2048,
+            thinking={"type": "adaptive"},
+            output_config={
+                "effort": self.effort,
+                "format": {"type": "json_schema", "schema": SIGNAL_SCHEMA},
+            },
+            system=[
+                {
+                    "type": "text",
+                    "text": ANALYST_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+
+        text = next(b.text for b in response.content if b.type == "text")
+        data = json.loads(text)
+        return TradeSignal(
+            action=data["action"],
+            confidence=float(data["confidence"]),
+            reason=data["reason"],
+            key_risks=data["key_risks"],
+            raw_response=data,
+        )
+
+    def review(self, trades: list[dict]) -> str:
+        """Weekly self-review: find patterns in past trades."""
+        if not trades:
+            return "No trades to review."
+
+        prompt = (
+            "You are reviewing this trading bot's recent decisions to find "
+            "patterns and suggest prompt/threshold improvements.\n\n"
+            "Analyze these trades and produce:\n"
+            "1. Common traits of profitable trades\n"
+            "2. Common failure modes\n"
+            "3. Concrete changes to system prompt or indicator thresholds\n"
+            "4. Any signals that seem unreliable\n\n"
+            f"```json\n{json.dumps(trades, indent=2, default=str)}\n```"
+        )
+
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=8192,
+            thinking={"type": "adaptive"},
+            output_config={"effort": "high"},
+            system="You are a trading strategy auditor. Be blunt and specific.",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return next(b.text for b in response.content if b.type == "text")

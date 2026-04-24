@@ -13,3 +13,10 @@ requests==2.27.1
 urllib3==1.26.9
 Werkzeug==2.1.2
 zipp==3.8.0
+
+# FX trading toolkit
+anthropic>=0.40.0
+pandas>=2.0.0
+numpy>=1.24.0
+yfinance>=0.2.40
+pytest>=7.0.0
