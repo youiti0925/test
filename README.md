@@ -16,11 +16,14 @@ cp .env.example .env
 ## 使い方
 
 ```bash
-# 1回だけ分析 (Claudeが呼ばれる)
+# 1回だけ分析 (Claudeが呼ばれる、ヘッドラインも自動取得)
 python -m src.fx.cli analyze --symbol USDJPY=X --interval 1h
 
 # Claudeなしで分析 (テクニカルのみ)
 python -m src.fx.cli analyze --symbol USDJPY=X --no-llm
+
+# ニュースだけ無効化
+python -m src.fx.cli analyze --symbol USDJPY=X --no-news
 
 # バックテスト (テクニカルのみ、180日分)
 python -m src.fx.cli backtest --symbol USDJPY=X --interval 1h --period 180d
@@ -47,7 +50,8 @@ pytest tests/ -v
 |-----------|------|
 | `src/fx/data.py` | OHLCV取得 (yfinance) |
 | `src/fx/indicators.py` | テクニカル指標 (SMA/EMA/RSI/MACD/BB) |
-| `src/fx/analyst.py` | Claude API分析 (Opus 4.7 + adaptive thinking + prompt caching) |
+| `src/fx/news.py` | ヘッドライン取得 (yfinance、FX用は差し替え推奨) |
+| `src/fx/analyst.py` | Claude API分析 (Opus 4.7 + adaptive thinking + prompt caching、テクニカル+ファンダメンタル) |
 | `src/fx/strategy.py` | テクニカル×LLMの合意ルール |
 | `src/fx/backtest.py` | イベント駆動型バックテスト |
 | `src/fx/storage.py` | SQLite履歴管理 |

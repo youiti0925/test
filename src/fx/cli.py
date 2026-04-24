@@ -18,6 +18,7 @@ from .backtest import run_backtest
 from .config import Config
 from .data import fetch_ohlcv
 from .indicators import build_snapshot, technical_signal
+from .news import fetch_headlines
 from .storage import Storage
 from .strategy import combine
 
@@ -31,10 +32,14 @@ def cmd_analyze(args, cfg: Config, storage: Storage) -> int:
     snap = build_snapshot(args.symbol, df)
     tech = technical_signal(snap)
 
+    headlines = []
+    if not args.no_news:
+        headlines = fetch_headlines(args.symbol, limit=args.news_limit)
+
     llm_signal = None
     if cfg.anthropic_api_key and not args.no_llm:
         analyst = Analyst(model=cfg.model, effort=cfg.effort)
-        llm_signal = analyst.analyze(snap.to_dict())
+        llm_signal = analyst.analyze(snap.to_dict(), headlines=headlines)
 
     decision = combine(tech, llm_signal)
     analysis_id = storage.save_analysis(
@@ -52,6 +57,7 @@ def cmd_analyze(args, cfg: Config, storage: Storage) -> int:
             "analysis_id": analysis_id,
             "snapshot": snap.to_dict(),
             "technical_signal": tech,
+            "headlines": [h.to_dict() for h in headlines],
             "llm": (
                 {
                     "action": llm_signal.action,
@@ -145,6 +151,8 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--interval", default="1h")
     a.add_argument("--period", default="60d")
     a.add_argument("--no-llm", action="store_true", help="Skip Claude call")
+    a.add_argument("--no-news", action="store_true", help="Skip headline fetch")
+    a.add_argument("--news-limit", type=int, default=5)
     a.set_defaults(func=cmd_analyze)
 
     b = sub.add_parser("backtest", help="Backtest technical strategy")
@@ -166,6 +174,8 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--period", default="5d")
     w.add_argument("--every", type=int, default=900, help="Seconds between analyses")
     w.add_argument("--no-llm", action="store_true")
+    w.add_argument("--no-news", action="store_true")
+    w.add_argument("--news-limit", type=int, default=5)
     w.set_defaults(func=cmd_watch)
 
     return p

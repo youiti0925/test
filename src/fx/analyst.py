@@ -16,12 +16,15 @@ from typing import Any
 
 import anthropic
 
+from .news import Headline
+
 ANALYST_SYSTEM_PROMPT = """You are a disciplined FX and crypto trading analyst.
 
 Your job: given a numeric snapshot of a financial instrument's recent price
-action and technical indicators, decide whether to BUY, SELL, or HOLD.
+action, technical indicators, and (optionally) recent headlines, decide
+whether to BUY, SELL, or HOLD.
 
-Guidelines:
+Technical guidelines:
 - Prefer HOLD when signals conflict. A wrong trade is worse than no trade.
 - Consider confluence: multiple indicators pointing the same direction >> a
   single strong signal.
@@ -29,11 +32,24 @@ Guidelines:
 - MACD histogram crossings above/below zero indicate momentum shifts.
 - Bollinger band position close to 0 or 1 suggests potential reversal.
 - Do not chase: if the market just moved >2% in one bar, wait.
-- Confidence must reflect signal quality:
-  * 0.0-0.3: very weak / conflicting / noisy
-  * 0.4-0.6: moderate, one-sided but not strong
-  * 0.7-0.9: strong confluence across indicators
-  * 0.95+: exceptionally clear setup (rare)
+
+Fundamental guidelines (when headlines are provided):
+- Major central bank decisions, rate changes, or surprise economic data
+  tend to move FX pairs sharply — if such news just broke, prefer HOLD
+  or reduce confidence until the dust settles.
+- Risk-on / risk-off sentiment shifts (geopolitics, equity selloffs)
+  move JPY, CHF, and gold differently from USD, EUR, GBP.
+- Weight recent headlines (< 6 hours old) more than older ones.
+- If the technical setup contradicts a clear fundamental catalyst,
+  trust the catalyst and HOLD — technicals lag news.
+- If headlines are absent, empty, or unrelated to the instrument,
+  base the decision on technicals alone.
+
+Confidence calibration:
+- 0.0-0.3: very weak / conflicting / noisy / fresh-news uncertainty
+- 0.4-0.6: moderate, one-sided but not strong
+- 0.7-0.9: strong confluence across indicators (and headlines agree)
+- 0.95+: exceptionally clear setup (rare)
 
 Output JSON only, matching the provided schema.
 """
@@ -73,11 +89,34 @@ class Analyst:
         self.model = model
         self.effort = effort
 
-    def analyze(self, snapshot: dict) -> TradeSignal:
-        user_prompt = (
-            "Analyze this market snapshot and return a trade signal.\n\n"
-            f"```json\n{json.dumps(snapshot, indent=2)}\n```"
+    def analyze(
+        self,
+        snapshot: dict,
+        headlines: list[Headline] | None = None,
+    ) -> TradeSignal:
+        sections = [
+            "Market snapshot:",
+            f"```json\n{json.dumps(snapshot, indent=2)}\n```",
+        ]
+        if headlines:
+            lines = []
+            for h in headlines:
+                ts = h.published_at.strftime("%Y-%m-%d %H:%M UTC")
+                line = f"- [{ts}] ({h.publisher}) {h.title}"
+                if h.summary:
+                    line += f"\n  {h.summary[:240]}"
+                lines.append(line)
+            sections.append("Recent headlines (newest first):")
+            sections.append("\n".join(lines))
+        else:
+            sections.append(
+                "Recent headlines: none available. Decide from technicals only."
+            )
+        sections.append(
+            "Return a trade signal weighing technical confluence and any "
+            "fundamental catalysts in the headlines."
         )
+        user_prompt = "\n\n".join(sections)
 
         response = self.client.messages.create(
             model=self.model,
