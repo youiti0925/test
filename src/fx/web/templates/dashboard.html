@@ -1,0 +1,136 @@
+{% extends "base.html" %}
+{% block title %}Dashboard · fx/bot{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-between mb-6">
+  <h1 class="text-2xl font-bold">Dashboard</h1>
+  <div class="text-xs text-slate-400">
+    model: <span class="font-mono text-emerald-300">{{ config.model }}</span>
+    · effort: <span class="font-mono text-emerald-300">{{ config.effort }}</span>
+    {% if not config.api_key_set %}
+      <span class="ml-3 px-2 py-0.5 rounded bg-rose-900/60 text-rose-200">
+        ANTHROPIC_API_KEY not set
+      </span>
+    {% endif %}
+  </div>
+</div>
+
+<!-- Summary tiles -->
+<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+  <div class="card p-4">
+    <div class="text-xs uppercase text-slate-400 tracking-wide">Total analyses</div>
+    <div class="text-3xl font-bold mt-1">{{ stats.total_analyses }}</div>
+  </div>
+  <div class="card p-4">
+    <div class="text-xs uppercase text-slate-400 tracking-wide">Pending predictions</div>
+    <div class="text-3xl font-bold mt-1 text-sky-300">
+      {{ stats.predictions_by_status.get("PENDING", 0) }}
+    </div>
+  </div>
+  <div class="card p-4">
+    <div class="text-xs uppercase text-slate-400 tracking-wide">Weighted win rate</div>
+    <div class="text-3xl font-bold mt-1 text-emerald-400">
+      {{ "%.1f"|format(stats.weighted_win_rate * 100) }}%
+    </div>
+    <div class="text-xs text-slate-500">correct=1 · partial=½ · wrong=0</div>
+  </div>
+  <div class="card p-4">
+    <div class="text-xs uppercase text-slate-400 tracking-wide">Post-mortems</div>
+    <div class="text-3xl font-bold mt-1 text-amber-300">{{ stats.postmortems }}</div>
+  </div>
+</div>
+
+<div class="grid md:grid-cols-3 gap-4 mb-8">
+  {% for status, color in [("CORRECT","emerald"),("PARTIAL","amber"),("WRONG","rose")] %}
+    <div class="card p-4">
+      <div class="text-xs uppercase text-slate-400 tracking-wide">{{ status }}</div>
+      <div class="text-2xl font-semibold mt-1 text-{{ color }}-400">
+        {{ stats.predictions_by_status.get(status, 0) }}
+      </div>
+    </div>
+  {% endfor %}
+</div>
+
+<!-- Call to action -->
+<div class="card p-5 mb-8">
+  <div class="flex items-center justify-between">
+    <div>
+      <div class="font-semibold text-lg">Run a new analysis</div>
+      <div class="text-sm text-slate-400 mt-1">
+        Watch the pipeline step-by-step: data → indicators → news → correlation →
+        events → past lessons → Claude → decision → risk plan.
+      </div>
+    </div>
+    <a href="/analyze"
+       class="px-5 py-2.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold">
+      Analyze now →
+    </a>
+  </div>
+</div>
+
+<!-- Lesson distribution -->
+{% if lessons %}
+<div class="card p-5 mb-8">
+  <div class="font-semibold mb-3">Post-mortem root causes</div>
+  {% set max_n = lessons | map(attribute="n") | max %}
+  <div class="space-y-1.5">
+    {% for row in lessons %}
+      <div class="flex items-center gap-3">
+        <div class="text-xs font-mono w-48 text-slate-300">{{ row.root_cause }}</div>
+        <div class="flex-1 h-2 bg-slate-800 rounded">
+          <div class="h-2 bg-amber-400 rounded"
+               style="width: {{ (row.n / max_n * 100) | round(1) }}%"></div>
+        </div>
+        <div class="text-xs font-mono w-8 text-right text-slate-400">{{ row.n }}</div>
+      </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+<!-- Recent analyses -->
+<div class="card p-5">
+  <div class="flex items-center justify-between mb-3">
+    <div class="font-semibold">Recent analyses</div>
+    <a href="/predictions" class="text-xs text-emerald-400 hover:underline">all predictions →</a>
+  </div>
+  {% if recent %}
+    <div class="divide-y divide-slate-800">
+      {% for a in recent %}
+        <a href="/analysis/{{ a.id }}" class="block py-3 hover:bg-slate-900/50 px-2 -mx-2 rounded">
+          <div class="flex items-center justify-between">
+            <div>
+              <span class="font-mono text-sm text-slate-200">{{ a.symbol }}</span>
+              <span class="ml-3 text-xs text-slate-500">{{ a.ts }}</span>
+            </div>
+            <div class="flex items-center gap-3 text-xs">
+              <span class="px-2 py-0.5 rounded bg-slate-800 font-mono">
+                tech: {{ a.technical_signal }}
+              </span>
+              {% if a.llm_action %}
+                <span class="px-2 py-0.5 rounded bg-slate-800 font-mono">
+                  llm: {{ a.llm_action }} ({{ "%.2f"|format(a.llm_confidence or 0) }})
+                </span>
+              {% endif %}
+              <span class="px-2 py-0.5 rounded
+                           {% if a.final_action == 'BUY' %}bg-emerald-900/60 text-emerald-300
+                           {% elif a.final_action == 'SELL' %}bg-rose-900/60 text-rose-300
+                           {% else %}bg-slate-800 text-slate-400{% endif %}
+                           font-mono font-semibold">
+                → {{ a.final_action }}
+              </span>
+            </div>
+          </div>
+          {% if a.llm_reason %}
+            <div class="text-xs text-slate-500 mt-1 truncate">{{ a.llm_reason }}</div>
+          {% endif %}
+        </a>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="text-sm text-slate-500 text-center py-8">
+      No analyses yet. <a href="/analyze" class="text-emerald-400 hover:underline">Run one →</a>
+    </div>
+  {% endif %}
+</div>
+{% endblock %}

@@ -72,6 +72,25 @@ python -m src.fx.cli lessons --symbol USDJPY=X
 
 cronで `evaluate` と `postmortem` を1日1回回せば、放置していても学習データが蓄積されていく。
 
+## Webダッシュボード
+
+ブラウザでBotの状態と判断プロセスを見える化:
+
+```bash
+python sample.py     # http://localhost:5000
+# 本番: gunicorn sample:app
+```
+
+ページ:
+- `/` — Dashboard: 累計分析数、予測の正解率、根本原因の分布、最近の判断履歴
+- `/analyze` — Analyze: フォームから実行ボタンを押すと、SSE で**パイプラインを1ステップずつ実況**:
+  データ取得 → テクニカル → ATR → ニュース → 相関 → イベント → 過去レッスン → Claude → 合意ルール → リスクプラン → 保存
+- `/analysis/<id>` — 各分析の詳細(スナップショット、Claudeの理由、反証可能予測、評価結果)
+- `/predictions` — 予測一覧、ステータスでフィルタ
+- `/lessons` — 蓄積した教訓(根本原因の棒グラフ + 改善ルール)
+
+Webサーバから叩く analyze は `predictions` テーブルにも保存されるので、CLIの `fx evaluate` / `fx postmortem` の対象になります。
+
 ## テスト
 
 ```bash
@@ -97,6 +116,8 @@ pytest tests/ -v
 | `src/fx/backtest.py` | イベント駆動型バックテスト |
 | `src/fx/storage.py` | SQLite履歴管理 (analyses/trades/predictions/postmortems/backtest_runs) |
 | `src/fx/cli.py` | CLIエントリポイント |
+| `src/fx/web/` | Flaskダッシュボード(SSEで判断プロセスを実況) |
+| `sample.py` | gunicornエントリ(`gunicorn sample:app`) |
 
 ## リスクに関する注意
 

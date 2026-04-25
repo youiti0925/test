@@ -139,7 +139,15 @@ FX(および暗号資産)の自動売買を、Claude APIで市場分析・戦略
 - 結果は`postmortems`テーブルへ
 - 次回`analyze`で同一シンボルの過去失敗を取り出してプロンプトに自動注入(`Storage.relevant_postmortems()`)
 
-### 14. CLI層 (`src/fx/cli.py`)
+### 14. Web層 (`src/fx/web/`)
+- **責務**: Botの「**何を見て、どう考え、どう判断したか**」をブラウザで可視化
+- Flask + Jinja2 + Tailwind CDN(ビルド不要)
+- `/analyze` は **Server-Sent Events** でパイプラインを1ステップずつ実況
+  (データ取得 → テクニカル → ATR → ニュース → 相関 → イベント → 過去レッスン → Claude → 合意 → リスクプラン → 保存)
+- `pipeline_stream.run_pipeline()` がジェネレータで各ステップ完了時にイベントをyield
+- 既存の `sample.py` を `gunicorn sample:app` の入口として保持し、新Flaskアプリへ繋ぐ
+
+### 15. CLI層 (`src/fx/cli.py`)
 - `fx analyze USDJPY=X` — 1回ライブ分析(過去レッスン自動注入)
 - `fx trade USDJPY=X --dry-run` — 分析→リスクプラン作成→(任意で)発注
 - `fx backtest USDJPY=X --period 180d` — バックテスト実行

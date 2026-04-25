@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}Lessons · fx/bot{% endblock %}
+
+{% block content %}
+<h1 class="text-2xl font-bold mb-2">Lessons</h1>
+<p class="text-sm text-slate-400 mb-6">
+  Aggregated post-mortems by root cause. Categories with the most entries are
+  prime targets for prompt or threshold tuning.
+</p>
+
+{% if summary %}
+<div class="card p-5 mb-6">
+  <div class="font-semibold mb-3">Root cause distribution</div>
+  {% set max_n = summary | map(attribute="n") | max %}
+  <div class="space-y-1.5">
+    {% for row in summary %}
+      <div class="flex items-center gap-3">
+        <div class="text-xs font-mono w-52 text-slate-300">{{ row.root_cause }}</div>
+        <div class="flex-1 h-2.5 bg-slate-800 rounded">
+          <div class="h-2.5 bg-amber-400 rounded"
+               style="width: {{ (row.n / max_n * 100) | round(1) }}%"></div>
+        </div>
+        <div class="text-xs font-mono w-10 text-right text-slate-400">{{ row.n }}</div>
+      </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+<div class="space-y-3">
+  {% for pm in recent %}
+    <div class="card p-4">
+      <div class="flex items-center justify-between mb-2">
+        <div class="flex items-center gap-3">
+          <span class="px-2 py-0.5 rounded text-xs font-mono bg-amber-900/60 text-amber-200">
+            {{ pm.root_cause }}
+          </span>
+          <span class="font-mono text-emerald-300 text-sm">{{ pm.symbol }}</span>
+          <span class="text-xs text-slate-500">{{ pm.predicted_at }}</span>
+        </div>
+        <a href="/analysis/{{ pm.prediction_id }}" class="text-xs text-emerald-400 hover:underline">view →</a>
+      </div>
+      <div class="text-xs text-slate-400 mb-2">
+        predicted {{ pm.expected_direction }} {{ pm.expected_magnitude_pct }}% ·
+        actual {{ pm.actual_direction }} ({{ pm.actual_magnitude_pct | fmtpct }})
+      </div>
+      <p class="text-sm text-slate-200">{{ pm.narrative }}</p>
+      {% if pm.proposed_rule %}
+        <div class="mt-2 p-2 rounded bg-slate-900/60 border border-slate-800">
+          <div class="text-xs text-slate-400 mb-1">Proposed rule</div>
+          <p class="text-sm text-emerald-200">{{ pm.proposed_rule }}</p>
+        </div>
+      {% endif %}
+      {% if pm.tags %}
+        <div class="mt-2 flex flex-wrap gap-1">
+          {% for tag in pm.tags.split(",") %}
+            <span class="px-2 py-0.5 rounded bg-slate-800 text-xs text-slate-400">#{{ tag.strip() }}</span>
+          {% endfor %}
+        </div>
+      {% endif %}
+    </div>
+  {% else %}
+    <div class="card p-8 text-center text-sm text-slate-500">
+      No post-mortems yet. Run <code class="text-emerald-400">fx evaluate</code> then
+      <code class="text-emerald-400">fx postmortem</code> after some predictions have settled.
+    </div>
+  {% endfor %}
+</div>
+{% endblock %}

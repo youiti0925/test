@@ -1,0 +1,254 @@
+{% extends "base.html" %}
+{% block title %}Analyze · fx/bot{% endblock %}
+
+{% block content %}
+<h1 class="text-2xl font-bold mb-6">Analyze</h1>
+
+<!-- Form -->
+<form id="analyze-form" class="card p-5 mb-6">
+  <div class="grid md:grid-cols-4 gap-3">
+    <div>
+      <label class="block text-xs text-slate-400 mb-1">Symbol</label>
+      <select name="symbol" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm font-mono">
+        {% for s in symbol_options %}<option value="{{ s }}">{{ s }}</option>{% endfor %}
+      </select>
+    </div>
+    <div>
+      <label class="block text-xs text-slate-400 mb-1">Interval</label>
+      <select name="interval" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm font-mono">
+        {% for i in interval_options %}<option value="{{ i }}" {% if i == "1h" %}selected{% endif %}>{{ i }}</option>{% endfor %}
+      </select>
+    </div>
+    <div>
+      <label class="block text-xs text-slate-400 mb-1">Period</label>
+      <input type="text" name="period" value="60d" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm font-mono">
+    </div>
+    <div class="flex items-end">
+      <button type="submit" id="run-btn"
+              class="w-full px-4 py-2 rounded bg-emerald-500 hover:bg-emerald-400 disabled:bg-slate-700 disabled:cursor-not-allowed text-slate-950 font-semibold">
+        ▶ Run pipeline
+      </button>
+    </div>
+  </div>
+  <div class="flex flex-wrap gap-4 mt-4 text-xs text-slate-300">
+    <label class="flex items-center gap-2"><input type="checkbox" name="llm" checked {% if not api_key_set %}disabled title="ANTHROPIC_API_KEY not set"{% endif %}> Claude</label>
+    <label class="flex items-center gap-2"><input type="checkbox" name="news" checked> Headlines</label>
+    <label class="flex items-center gap-2"><input type="checkbox" name="correlation" checked> Correlations</label>
+    <label class="flex items-center gap-2"><input type="checkbox" name="events" checked {% if not events_configured %}disabled title="data/events.json not present"{% endif %}> Events</label>
+    <label class="flex items-center gap-2"><input type="checkbox" name="lessons" checked> Past lessons</label>
+  </div>
+</form>
+
+<!-- Pipeline timeline -->
+<div class="card p-5 mb-6">
+  <div class="flex items-center justify-between mb-4">
+    <div class="font-semibold">Pipeline</div>
+    <div id="elapsed" class="text-xs text-slate-500 font-mono">idle</div>
+  </div>
+  <ol id="pipeline" class="space-y-2 text-sm">
+    {% for step, label in [
+      ("fetch_ohlcv", "1. Fetch OHLCV"),
+      ("snapshot", "2. Build technical snapshot"),
+      ("atr", "3. Compute ATR"),
+      ("headlines", "4. Fetch headlines"),
+      ("correlation", "5. Compute correlations"),
+      ("upcoming_events", "6. Load upcoming events"),
+      ("past_lessons", "7. Retrieve past lessons"),
+      ("claude", "8. Ask Claude"),
+      ("decision", "9. Apply consensus rule"),
+      ("risk_plan", "10. Build risk plan"),
+      ("persist", "11. Persist to DB"),
+    ] %}
+      <li id="step-{{ step }}" class="flex items-start gap-3 p-3 rounded border border-slate-800 bg-slate-950/40">
+        <div class="step-icon w-5 h-5 mt-0.5 text-slate-600">○</div>
+        <div class="flex-1">
+          <div class="flex items-center justify-between">
+            <div class="step-label text-slate-300">{{ label }}</div>
+            <div class="step-elapsed text-xs text-slate-500 font-mono"></div>
+          </div>
+          <div class="step-data text-xs text-slate-400 mt-1 font-mono whitespace-pre-wrap"></div>
+        </div>
+      </li>
+    {% endfor %}
+  </ol>
+</div>
+
+<!-- Final decision card -->
+<div id="final-card" class="card p-5 hidden">
+  <div class="font-semibold mb-3">Final decision</div>
+  <div id="final-content"></div>
+</div>
+
+<script>
+const form = document.getElementById('analyze-form');
+const runBtn = document.getElementById('run-btn');
+const elapsedEl = document.getElementById('elapsed');
+const finalCard = document.getElementById('final-card');
+const finalContent = document.getElementById('final-content');
+
+let source = null;
+let started = 0;
+let elapsedTimer = null;
+
+const STATUS_ICON = {
+  ok: '<span class="text-emerald-400">●</span>',
+  skip: '<span class="text-slate-500">○</span>',
+  error: '<span class="text-rose-400">✕</span>',
+  pending: '<span class="text-amber-400 inline-block animate-pulse">●</span>',
+};
+
+function resetUI() {
+  document.querySelectorAll('#pipeline li').forEach(li => {
+    li.classList.remove('border-emerald-700', 'border-rose-700', 'border-slate-700');
+    li.classList.add('border-slate-800');
+    li.querySelector('.step-icon').innerHTML = '○';
+    li.querySelector('.step-icon').className = 'step-icon w-5 h-5 mt-0.5 text-slate-600';
+    li.querySelector('.step-elapsed').textContent = '';
+    li.querySelector('.step-data').innerHTML = '';
+  });
+  finalCard.classList.add('hidden');
+  finalContent.innerHTML = '';
+}
+
+function fmtPipelineData(step, data) {
+  if (data === null || data === undefined) return '';
+  if (typeof data === 'string') return data;
+  // Compact custom rendering per step
+  if (step === 'fetch_ohlcv') {
+    return `${data.bars} bars · last ${data.last_close} (@ ${data.last_ts})`;
+  }
+  if (step === 'snapshot') {
+    const s = data.snapshot;
+    return `tech: ${data.technical_signal} · RSI=${s.rsi_14} · MACD hist=${s.macd_hist} · BB pos=${s.bb_position}`;
+  }
+  if (step === 'atr') {
+    return `ATR(14) = ${data.atr_14.toFixed(6)}`;
+  }
+  if (step === 'headlines') {
+    if (data.count === 0) return 'no headlines';
+    return data.items.slice(0, 3).map(h =>
+      `• [${h.publisher}] ${h.title}`
+    ).join('\n');
+  }
+  if (step === 'correlation') {
+    if (!data.correlations) return JSON.stringify(data);
+    const lines = Object.entries(data.correlations).map(([k, v]) =>
+      `${k}: corr=${v.toFixed(2)} (24h ${data.last_change_pct_24h[k]?.toFixed(2) || '?'}%)`
+    );
+    return lines.join('\n');
+  }
+  if (step === 'upcoming_events') {
+    if (data.count === 0) return data.note || 'no upcoming events';
+    return data.items.map(e =>
+      `[${e.impact}] ${e.currency} ${e.title} @ ${e.when}`
+    ).join('\n');
+  }
+  if (step === 'past_lessons') {
+    if (data.count === 0) return 'no relevant past lessons';
+    return data.items.map(l =>
+      `• ${l.root_cause}: ${l.proposed_rule || l.narrative.slice(0, 100)}`
+    ).join('\n');
+  }
+  if (step === 'claude') {
+    return `${data.action} (conf ${data.confidence.toFixed(2)}) · expects ${data.expected_direction} ${data.expected_magnitude_pct}% in ${data.horizon_bars} bars\nreason: ${data.reason}\nrisks: ${(data.key_risks || []).join(', ')}`;
+  }
+  if (step === 'decision') {
+    return `${data.action}: ${data.reason}`;
+  }
+  if (step === 'risk_plan') {
+    if (data.note) return data.note;
+    return `entry ${data.entry} · stop ${data.stop} · TP ${data.take_profit} · size ${data.size} · risk $${data.risk_dollars} · R:R ${data.reward_to_risk}`;
+  }
+  if (step === 'persist') {
+    return `analysis_id=${data.analysis_id} · prediction_id=${data.prediction_id ?? '—'}`;
+  }
+  return JSON.stringify(data);
+}
+
+function applyEvent(ev) {
+  if (ev.step === 'done') {
+    const aid = ev.data.analysis_id;
+    finalContent.innerHTML = `
+      <div class="text-sm text-slate-300">
+        Pipeline complete — saved as analysis #${aid}.
+      </div>
+      <div class="mt-3 flex gap-3">
+        <a href="/analysis/${aid}" class="px-4 py-2 rounded bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-sm">
+          View detail →
+        </a>
+        <button onclick="location.reload()" class="px-4 py-2 rounded border border-slate-700 hover:bg-slate-800 text-sm">
+          Run another
+        </button>
+      </div>
+    `;
+    finalCard.classList.remove('hidden');
+    return;
+  }
+  if (ev.step === 'fatal') {
+    finalContent.innerHTML = `<div class="text-rose-400 text-sm">Pipeline failed: ${ev.data}</div>`;
+    finalCard.classList.remove('hidden');
+    return;
+  }
+  const li = document.getElementById(`step-${ev.step}`);
+  if (!li) return;
+  const icon = li.querySelector('.step-icon');
+  const elapsed = li.querySelector('.step-elapsed');
+  const dataEl = li.querySelector('.step-data');
+
+  icon.innerHTML = STATUS_ICON[ev.status] || STATUS_ICON.skip;
+  if (ev.elapsed_s != null) {
+    elapsed.textContent = `${ev.elapsed_s}s`;
+  }
+  dataEl.textContent = fmtPipelineData(ev.step, ev.data);
+
+  li.classList.remove('border-slate-800');
+  if (ev.status === 'ok') li.classList.add('border-emerald-700');
+  else if (ev.status === 'error') li.classList.add('border-rose-700');
+  else li.classList.add('border-slate-700');
+}
+
+form.addEventListener('submit', (e) => {
+  e.preventDefault();
+  resetUI();
+  if (source) { source.close(); }
+
+  const fd = new FormData(form);
+  const params = new URLSearchParams();
+  ['symbol', 'interval', 'period'].forEach(k => params.set(k, fd.get(k) || ''));
+  ['llm', 'news', 'correlation', 'events', 'lessons'].forEach(k => {
+    params.set(k, fd.get(k) ? '1' : '0');
+  });
+
+  // Mark Claude step as pending immediately so the user sees something
+  document.querySelectorAll('#pipeline li').forEach(li => {
+    const step = li.id.replace('step-', '');
+    li.querySelector('.step-icon').innerHTML = STATUS_ICON.pending;
+  });
+
+  runBtn.disabled = true;
+  runBtn.textContent = '… running';
+  started = Date.now();
+  elapsedTimer = setInterval(() => {
+    elapsedEl.textContent = `${((Date.now() - started) / 1000).toFixed(1)}s`;
+  }, 100);
+
+  source = new EventSource(`/analyze/stream?${params.toString()}`);
+  source.onmessage = (e) => {
+    const ev = JSON.parse(e.data);
+    applyEvent(ev);
+    if (ev.step === 'done' || ev.step === 'fatal') {
+      source.close();
+      runBtn.disabled = false;
+      runBtn.textContent = '▶ Run pipeline';
+      clearInterval(elapsedTimer);
+    }
+  };
+  source.onerror = () => {
+    source.close();
+    runBtn.disabled = false;
+    runBtn.textContent = '▶ Run pipeline';
+    clearInterval(elapsedTimer);
+  };
+});
+</script>
+{% endblock %}

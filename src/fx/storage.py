@@ -352,6 +352,89 @@ class Storage:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def dashboard_stats(self) -> dict:
+        """Aggregate counters for the web dashboard."""
+        with self._conn() as conn:
+            total_analyses = conn.execute(
+                "SELECT COUNT(*) AS n FROM analyses"
+            ).fetchone()["n"]
+            status_rows = conn.execute(
+                "SELECT status, COUNT(*) AS n FROM predictions GROUP BY status"
+            ).fetchall()
+            by_status = {r["status"]: r["n"] for r in status_rows}
+            settled = (
+                by_status.get("CORRECT", 0)
+                + by_status.get("PARTIAL", 0)
+                + by_status.get("WRONG", 0)
+            )
+            wins = by_status.get("CORRECT", 0) + 0.5 * by_status.get("PARTIAL", 0)
+            win_rate = (wins / settled) if settled else 0.0
+            backtests = conn.execute(
+                "SELECT COUNT(*) AS n FROM backtest_runs"
+            ).fetchone()["n"]
+            postmortems = conn.execute(
+                "SELECT COUNT(*) AS n FROM postmortems"
+            ).fetchone()["n"]
+        return {
+            "total_analyses": total_analyses,
+            "predictions_by_status": by_status,
+            "weighted_win_rate": win_rate,
+            "backtests": backtests,
+            "postmortems": postmortems,
+        }
+
+    def get_analysis(self, analysis_id: int) -> dict | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM analyses WHERE id = ?", (analysis_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            prediction = conn.execute(
+                "SELECT * FROM predictions WHERE analysis_id = ?",
+                (analysis_id,),
+            ).fetchone()
+            return {
+                "analysis": dict(row),
+                "prediction": dict(prediction) if prediction else None,
+            }
+
+    def list_predictions(
+        self,
+        status: str | None = None,
+        symbol: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        sql = "SELECT * FROM predictions"
+        clauses: list[str] = []
+        args: list = []
+        if status:
+            clauses.append("status = ?")
+            args.append(status)
+        if symbol:
+            clauses.append("symbol = ?")
+            args.append(symbol)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY ts DESC LIMIT ?"
+        args.append(limit)
+        with self._conn() as conn:
+            rows = conn.execute(sql, args).fetchall()
+            return [dict(r) for r in rows]
+
+    def list_postmortems(self, limit: int = 50) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT pm.*, p.symbol, p.action, p.expected_direction,
+                          p.expected_magnitude_pct, p.actual_direction,
+                          p.actual_magnitude_pct, p.ts AS predicted_at
+                   FROM postmortems pm
+                   JOIN predictions p ON pm.prediction_id = p.id
+                   ORDER BY pm.ts DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def recent_analyses(self, symbol: str | None = None, limit: int = 20) -> list[dict]:
         with self._conn() as conn:
             if symbol:

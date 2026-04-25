@@ -23,3 +23,6 @@ pytest>=7.0.0
 
 # Optional — only needed if you actually use --broker oanda (practice only)
 # oandapyV20>=0.7.0
+
+# Flask dashboard (already pinned above as Flask==2.1.2; kept for clarity)
+# Templates use Tailwind CSS via CDN — no build step needed.
