@@ -76,9 +76,27 @@ cronで `evaluate` と `postmortem` を1日1回回せば、放置していても
 
 ブラウザでBotの状態と判断プロセスを見える化:
 
+### 一番簡単な起動方法 (ダブルクリック)
+
+| OS | ファイル | 初回だけ必要な手順 |
+|----|---------|--------------------|
+| macOS | `start.command` | ターミナルで `chmod +x start.command` 一度だけ |
+| Linux | `start.sh` | `chmod +x start.sh` 一度だけ |
+| Windows | `start.bat` | なし |
+
+ダブルクリックで:
+1. 必要パッケージを自動インストール (初回だけ時間かかる)
+2. 空きポート (5000〜5010 のうち最初に空いてるもの) で起動
+3. ブラウザを自動オープン
+
+`ANTHROPIC_API_KEY` が無くてもテクニカル分析だけは動きます。
+
+### コマンドラインから
+
 ```bash
-python sample.py     # http://localhost:5000
-# 本番: gunicorn sample:app
+python launch.py     # 上と同じ動作
+python sample.py     # Flask標準のdebugモード
+gunicorn sample:app  # 本番デプロイ向け
 ```
 
 ページ:
