@@ -22,6 +22,9 @@ from pathlib import Path
 from .analyst import Analyst
 from .backtest import run_backtest
 from .backtest_engine import run_engine_backtest
+from .event_overlay import KEYWORD_MAP, overlay_events
+from .macro import MACRO_SYMBOLS, fetch_macro_snapshot
+from .market_timeline import build_timeline
 from .broker import Broker, PaperBroker
 from .calendar import (
     calendar_freshness,
@@ -587,6 +590,139 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
     return 0
 
 
+def cmd_build_timeline(args, cfg: Config, storage: Storage) -> int:
+    """Build a point-in-time market timeline (spec §5)."""
+    df = fetch_ohlcv(
+        args.symbol,
+        interval=args.interval,
+        period=args.period,
+        start=args.start,
+        end=args.end,
+    )
+
+    events: tuple = ()
+    if not args.no_events:
+        cal_health = calendar_freshness(EVENTS_PATH)
+        if cal_health.is_fresh:
+            events = tuple(load_events(EVENTS_PATH))
+        else:
+            print(
+                f"[warn] calendar {cal_health.status}: "
+                f"{cal_health.detail or 'unhealthy'} — "
+                "timeline will have no event columns",
+                file=sys.stderr,
+            )
+
+    macro = None
+    if not args.no_macro:
+        try:
+            macro = fetch_macro_snapshot(
+                df.index,
+                interval="1d",
+                period=args.macro_period,
+                slots=args.macro_slots if args.macro_slots else None,
+            )
+            if macro.fetch_errors:
+                print(
+                    f"[warn] macro fetch errors: {macro.fetch_errors}",
+                    file=sys.stderr,
+                )
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] macro fetch failed entirely: {e}", file=sys.stderr)
+
+    timeline = build_timeline(
+        df,
+        symbol=args.symbol,
+        interval=args.interval,
+        warmup=args.warmup,
+        events=events,
+        macro=macro,
+        use_higher_tf=not args.no_higher_tf,
+    )
+
+    if args.output:
+        out_path = Path(args.output)
+        frame = timeline.to_frame()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        if out_path.suffix == ".parquet":
+            frame.to_parquet(out_path)
+        else:
+            # Default to CSV; nested cols get JSON-stringified for safety
+            for col in frame.columns:
+                if frame[col].dtype == object:
+                    frame[col] = frame[col].apply(
+                        lambda x: json.dumps(x, default=str)
+                        if isinstance(x, (list, dict)) else x
+                    )
+            frame.to_csv(out_path)
+
+    summary = {
+        "symbol": args.symbol,
+        "interval": args.interval,
+        "rows": len(timeline),
+        "first_ts": (
+            str(timeline.rows[0].timestamp) if timeline.rows else None
+        ),
+        "last_ts": (
+            str(timeline.rows[-1].timestamp) if timeline.rows else None
+        ),
+        "macro_slots": (
+            list(macro.series.keys()) if macro else []
+        ),
+        "macro_errors": (
+            macro.fetch_errors if macro else {}
+        ),
+        "events_used": len(events),
+        "output": args.output,
+        "preview": [
+            timeline.rows[i].to_dict()
+            for i in (0, len(timeline) // 2, len(timeline) - 1)
+            if 0 <= i < len(timeline)
+        ],
+    }
+    _print(summary)
+    return 0
+
+
+def cmd_event_overlay(args, cfg: Config, storage: Storage) -> int:
+    """Aggregate pre/post-event price action (spec §6)."""
+    df = fetch_ohlcv(
+        args.symbol,
+        interval=args.interval,
+        period=args.period,
+        start=args.start,
+        end=args.end,
+    )
+
+    cal_health = calendar_freshness(EVENTS_PATH)
+    if not cal_health.is_fresh:
+        print(
+            f"[warn] calendar {cal_health.status}: "
+            f"{cal_health.detail or 'unhealthy'}",
+            file=sys.stderr,
+        )
+    events = load_events(EVENTS_PATH) if EVENTS_PATH.exists() else []
+    if not events:
+        _print({"error": "no events available", "calendar": cal_health.to_dict()})
+        return 1
+
+    result = overlay_events(
+        df, events,
+        keyword=args.event,
+        impact=args.impact,
+    )
+    _print({
+        "symbol": args.symbol,
+        "interval": args.interval,
+        "filter_keyword": args.event,
+        "filter_impact": args.impact,
+        "n_events_matched": len(result.rows),
+        "aggregate": result.aggregate(),
+        "events": [r.to_dict() for r in result.rows[: args.limit]],
+    })
+    return 0
+
+
 def cmd_review(args, cfg: Config, storage: Storage) -> int:
     if not cfg.anthropic_api_key:
         print("ANTHROPIC_API_KEY not set; cannot run review.", file=sys.stderr)
@@ -889,6 +1025,55 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--end", default=None)
     b.add_argument("--warmup", type=int, default=50)
     b.set_defaults(func=cmd_backtest)
+
+    bt = sub.add_parser(
+        "build-timeline",
+        help="Build a point-in-time market timeline (spec §5)",
+    )
+    bt.add_argument("--symbol", default="USDJPY=X")
+    bt.add_argument("--interval", default="1h")
+    bt.add_argument("--period", default="180d")
+    bt.add_argument("--start", default=None)
+    bt.add_argument("--end", default=None)
+    bt.add_argument("--warmup", type=int, default=50)
+    bt.add_argument("--no-events", action="store_true")
+    bt.add_argument("--no-macro", action="store_true",
+                    help="Skip yields/DXY/VIX/equities fetch")
+    bt.add_argument(
+        "--macro-slots", nargs="*", default=None,
+        help=f"Subset of {sorted(MACRO_SYMBOLS.keys())}; default = all",
+    )
+    bt.add_argument("--macro-period", default="2y",
+                    help="yfinance period for macro fetch")
+    bt.add_argument("--no-higher-tf", action="store_true")
+    bt.add_argument(
+        "--output", default=None,
+        help="Optional path; .csv or .parquet — written if set",
+    )
+    bt.set_defaults(func=cmd_build_timeline)
+
+    eo = sub.add_parser(
+        "event-overlay",
+        help="Aggregate pre/post-event price action (spec §6)",
+    )
+    eo.add_argument("--symbol", default="USDJPY=X")
+    eo.add_argument("--interval", default="1h")
+    eo.add_argument("--period", default="2y")
+    eo.add_argument("--start", default=None)
+    eo.add_argument("--end", default=None)
+    eo.add_argument(
+        "--event", default=None,
+        choices=[k for k, _ in KEYWORD_MAP],
+        help="Restrict to events matching this keyword",
+    )
+    eo.add_argument(
+        "--impact", default="high",
+        choices=["high", "medium", "low"],
+        help="Restrict to events of this impact (None to include all)",
+    )
+    eo.add_argument("--limit", type=int, default=20,
+                    help="Max per-event rows to print (aggregate is full)")
+    eo.set_defaults(func=cmd_event_overlay)
 
     be = sub.add_parser(
         "backtest-engine",
