@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import json
 
+import json
+import os
+
 from flask import (
     Blueprint,
     Response,
     abort,
     current_app,
+    jsonify,
     render_template,
     request,
     stream_with_context,
@@ -144,6 +148,52 @@ def predictions_list():
         symbol_filter=symbol,
         statuses=statuses,
     )
+
+
+@bp.route("/webhook/line", methods=["POST"])
+def line_webhook():
+    """Receive LINE messaging events.
+
+    Verifies the X-Line-Signature header against LINE_CHANNEL_SECRET,
+    then dispatches each message event to the command parser. Replies
+    via the LINE reply API using the event's reply_token.
+    """
+    from src.fx.web.webhook import handle_command
+    from src.notify.line import LineNotifier, verify_signature
+
+    body = request.get_data() or b""
+    signature = request.headers.get("X-Line-Signature", "")
+    secret = os.environ.get("LINE_CHANNEL_SECRET", "")
+
+    # In dev (no secret set) we skip verification but still parse commands.
+    if secret and not verify_signature(secret, body, signature):
+        return jsonify({"error": "invalid signature"}), 403
+
+    try:
+        payload = json.loads(body.decode("utf-8") or "{}")
+    except json.JSONDecodeError:
+        return jsonify({"error": "bad json"}), 400
+
+    storage = current_app.config["FX_STORAGE"]
+    notifier = LineNotifier()
+
+    for ev in (payload.get("events") or []):
+        if ev.get("type") != "message":
+            continue
+        msg = ev.get("message") or {}
+        if msg.get("type") != "text":
+            continue
+        user_id = (ev.get("source") or {}).get("userId") or ""
+        reply_token = ev.get("replyToken") or ""
+        text = msg.get("text") or ""
+        try:
+            response = handle_command(text, storage=storage, user_id=user_id)
+        except Exception as e:  # noqa: BLE001
+            response = f"Error: {e}"
+        if reply_token and notifier.configured:
+            notifier.reply(reply_token, response)
+
+    return jsonify({"status": "ok"}), 200
 
 
 @bp.route("/sentiment")

@@ -24,22 +24,66 @@ from .backtest import run_backtest
 from .broker import Broker, PaperBroker
 from .calendar import load_events, seed_defaults, upcoming_for_symbol
 from .config import Config
+from .context import (
+    MarketContext,
+    detect_volume_spike,
+    event_risk_level_from,
+    keywords_from_sentiment,
+)
 from .correlation import build_correlation_snapshot, related_for
 from .data import fetch_ohlcv
+from .decision_engine import decide as decide_action
+from .higher_timeframe import fetch_and_classify as fetch_higher_tf
 from .indicators import build_snapshot, technical_signal
 from .news import fetch_headlines
+from .patterns import analyse as analyse_patterns
 from .postmortem import Postmortem
 from .prediction import evaluate_prediction, slice_bars_after
 from .risk import atr, plan_trade
+from .risk_gate import RiskState
 from .sentiment import DEFAULT_PATH as SENTIMENT_PATH
 from .sentiment import read_for as read_sentiment
 from .storage import Storage
-from .strategy import combine
-
 from src.sentiment.refresh import refresh as refresh_sentiment_snapshot
 from src.sentiment.snapshot import load_snapshot as load_sentiment_snapshot
 
+from src.notify import (
+    Notification,
+    build_notifier,
+    format_lesson,
+    format_signal,
+    format_summary,
+    format_verdict,
+)
+
 EVENTS_PATH = Path("data/events.json")
+
+
+def _notify(storage: Storage, kind: str, text: str, min_confidence: float = 0.0) -> None:
+    """Send `text` to every active subscriber that opted into `kind`.
+
+    Failures are silent — the analysis path must never crash because
+    LINE is down.
+    """
+    try:
+        notifier = build_notifier()
+        if notifier.name == "null":
+            return
+        subs = storage.active_subscribers(kind=kind)
+        recipients = [
+            s["user_id"]
+            for s in subs
+            if (s.get("min_confidence") or 0.0) <= min_confidence
+        ]
+        if not recipients and notifier.name == "log":
+            recipients = ["broadcast"]
+        if not recipients:
+            return
+        notifier.push(
+            Notification(text=text, kind=kind, recipients=tuple(recipients))
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _print(obj) -> None:
@@ -47,10 +91,17 @@ def _print(obj) -> None:
 
 
 def _gather_inputs(args, cfg: Config, storage: Storage):
-    """Common input fetch for analyze / trade / watch."""
+    """Common input fetch for analyze / trade / watch.
+
+    Builds a MarketContext, runs the fixed-rule Decision Engine, and
+    returns everything the callers and notifications need. The LLM is
+    consulted but cannot override the engine.
+    """
     df = fetch_ohlcv(args.symbol, interval=args.interval, period=args.period)
     snap = build_snapshot(args.symbol, df)
     tech = technical_signal(snap)
+    pattern = analyse_patterns(df)
+    atr_value = float(atr(df).iloc[-1])
 
     headlines = []
     if not args.no_news:
@@ -84,11 +135,41 @@ def _gather_inputs(args, cfg: Config, storage: Storage):
     if not args.no_sentiment:
         sentiment = read_sentiment(args.symbol, max_age_s=12 * 3600)
 
+    higher_tf = "UNKNOWN"
+    if not getattr(args, "no_higher_tf", False):
+        try:
+            higher_tf = fetch_higher_tf(args.symbol, args.interval)
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] higher-timeframe fetch failed: {e}", file=sys.stderr)
+
+    # Estimate risk-reward from ATR (stop=2*ATR, TP=3*ATR → 1.5 floor)
+    risk_reward = 1.5 if atr_value > 0 else None
+    atr_stop_distance = 2.0 * atr_value if atr_value > 0 else None
+
+    context = MarketContext(
+        symbol=args.symbol,
+        interval=args.interval,
+        snapshot=snap,
+        pattern=pattern,
+        higher_timeframe_trend=higher_tf,
+        spread_state="UNKNOWN",  # yfinance has no bid/ask; left UNKNOWN
+        spread_pct=None,
+        event_risk_level=event_risk_level_from([e.to_dict() for e in events]),
+        economic_events_nearby=[e.to_dict() for e in events],
+        sentiment_score=(sentiment or {}).get("sentiment_score"),
+        sentiment_velocity=(sentiment or {}).get("sentiment_velocity"),
+        sentiment_volume_spike=detect_volume_spike(sentiment),
+        top_sentiment_keywords=keywords_from_sentiment(sentiment),
+        risk_reward=risk_reward,
+        atr_stop_distance=atr_stop_distance,
+        technical_signal=tech,
+    )
+
     llm_signal = None
     if cfg.anthropic_api_key and not args.no_llm:
         analyst = Analyst(model=cfg.model, effort=cfg.effort)
         llm_signal = analyst.analyze(
-            snap.to_dict(),
+            context.to_dict(),
             headlines=headlines,
             correlation=correlation,
             upcoming_events=events,
@@ -96,17 +177,34 @@ def _gather_inputs(args, cfg: Config, storage: Storage):
             sentiment_snapshot=sentiment,
         )
 
-    decision = combine(tech, llm_signal)
-    atr_value = float(atr(df).iloc[-1])
+    risk_state = RiskState(
+        df=df,
+        events=tuple(events),
+        spread_pct=None,
+        sentiment_snapshot=sentiment,
+    )
+
+    decision = decide_action(
+        technical_signal=tech,
+        pattern=pattern,
+        higher_timeframe_trend=higher_tf,
+        risk_reward=risk_reward,
+        risk_state=risk_state,
+        llm_signal=llm_signal,
+    )
+
     return {
         "df": df,
         "snapshot": snap,
+        "context": context,
+        "pattern": pattern,
         "technical": tech,
         "headlines": headlines,
         "correlation": correlation,
         "events": events,
         "past_lessons": past_lessons,
         "sentiment": sentiment,
+        "higher_tf": higher_tf,
         "llm": llm_signal,
         "decision": decision,
         "atr": atr_value,
@@ -145,6 +243,25 @@ def cmd_analyze(args, cfg: Config, storage: Storage) -> int:
             expected_magnitude_pct=llm.expected_magnitude_pct,
             horizon_bars=llm.horizon_bars,
             invalidation_price=llm.invalidation_price,
+        )
+
+    # Push notification when LLM produced a directional, confident signal.
+    if llm and decision.action in ("BUY", "SELL"):
+        _notify(
+            storage,
+            kind="signal",
+            min_confidence=llm.confidence,
+            text=format_signal(
+                symbol=args.symbol,
+                action=llm.action,
+                confidence=llm.confidence,
+                expected_direction=llm.expected_direction,
+                expected_magnitude_pct=llm.expected_magnitude_pct,
+                horizon_bars=llm.horizon_bars,
+                invalidation_price=llm.invalidation_price,
+                reason=llm.reason,
+                analysis_id=analysis_id,
+            ),
         )
 
     _print(
@@ -376,7 +493,28 @@ def cmd_evaluate(args, cfg: Config, storage: Storage) -> int:
                     "verdict": verdict.to_dict(),
                 }
             )
+            # Push verdict for terminal outcomes only (not INSUFFICIENT_DATA).
+            if verdict.status in ("CORRECT", "PARTIAL", "WRONG"):
+                _notify(
+                    storage,
+                    kind="verdict",
+                    text=format_verdict(
+                        symbol=p["symbol"],
+                        action=p["action"],
+                        status=verdict.status,
+                        actual_direction=verdict.actual_direction,
+                        actual_magnitude_pct=verdict.actual_magnitude_pct,
+                        note=verdict.note,
+                        analysis_id=p.get("analysis_id"),
+                    ),
+                )
 
+    if any(summary.values()):
+        _notify(
+            storage,
+            kind="summary",
+            text=format_summary(period="evaluate", counts=summary),
+        )
     _print({"summary": summary, "details": details})
     return 0
 
@@ -424,6 +562,17 @@ def cmd_postmortem(args, cfg: Config, storage: Storage) -> int:
                 "root_cause": result.root_cause,
                 "proposed_rule": result.proposed_rule,
             }
+        )
+        _notify(
+            storage,
+            kind="lesson",
+            text=format_lesson(
+                symbol=p["symbol"],
+                root_cause=result.root_cause,
+                proposed_rule=result.proposed_rule,
+                narrative=result.narrative,
+                analysis_id=p.get("analysis_id"),
+            ),
         )
 
     _print({"written": written, "count": len(written)})
@@ -522,6 +671,8 @@ def _add_context_flags(parser: argparse.ArgumentParser) -> None:
                         help="Skip injecting past post-mortems")
     parser.add_argument("--no-sentiment", action="store_true",
                         help="Skip the cached crowd-sentiment snapshot")
+    parser.add_argument("--no-higher-tf", action="store_true",
+                        help="Skip higher-timeframe fetch (faster, less safe)")
     parser.add_argument("--lesson-limit", type=int, default=5)
     parser.add_argument("--news-limit", type=int, default=5)
     parser.add_argument("--event-window-hours", type=int, default=24)

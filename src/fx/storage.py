@@ -72,6 +72,20 @@ CREATE TABLE IF NOT EXISTS predictions (
     invalidation_hit INTEGER,
     evaluated_at TEXT,
     evaluation_note TEXT,
+    -- spec §13 postmortem-friendly fields (nullable; back-filled when known)
+    spread_at_entry REAL,
+    spread_at_exit REAL,
+    slippage REAL,
+    rule_version TEXT,
+    detected_pattern TEXT,
+    trend_state TEXT,
+    higher_timeframe_trend TEXT,
+    event_risk_level TEXT,
+    economic_events_nearby TEXT,
+    sentiment_score REAL,
+    sentiment_volume_spike INTEGER,
+    blocked_by TEXT,
+    final_reason TEXT,
     FOREIGN KEY (analysis_id) REFERENCES analyses(id)
 );
 
@@ -86,10 +100,39 @@ CREATE TABLE IF NOT EXISTS postmortems (
     narrative TEXT NOT NULL,
     proposed_rule TEXT,
     tags TEXT,
+    -- spec §12 loss classification: A=正しい負け, B=入ってはいけない負け,
+    -- C=利確/損切り設計ミス, D=波形認識ミス, E=指標依存ミス, F=実行系問題
+    loss_category TEXT,
+    -- Whether this postmortem is being treated as a system-accident (immediate
+    -- fix) or a regular loss that must repeat ≥5 times before any rule edit.
+    is_system_accident INTEGER NOT NULL DEFAULT 0,
+    -- Free-form structured snapshot of the moment it was wrong:
+    --   spread_at_entry, slippage, mfe/mae, rule_version, etc. (spec §13).
+    context_json TEXT,
+    -- Whether the proposed_rule has been promoted into a rule update.
+    rule_applied INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (prediction_id) REFERENCES predictions(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_postmortems_root_cause ON postmortems(root_cause);
+CREATE INDEX IF NOT EXISTS idx_postmortems_loss_category ON postmortems(loss_category);
+
+CREATE TABLE IF NOT EXISTS subscribers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    backend TEXT NOT NULL,            -- "line" | "email" | ...
+    user_id TEXT NOT NULL,            -- backend-specific recipient ID
+    display_name TEXT,
+    subscribed_at TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    notify_signal INTEGER NOT NULL DEFAULT 1,
+    notify_verdict INTEGER NOT NULL DEFAULT 1,
+    notify_lesson INTEGER NOT NULL DEFAULT 1,
+    notify_summary INTEGER NOT NULL DEFAULT 1,
+    min_confidence REAL NOT NULL DEFAULT 0.6,
+    UNIQUE(backend, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_subscribers_active ON subscribers(active);
 """
 
 
@@ -99,6 +142,46 @@ class Storage:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn) -> None:
+        """Idempotent ALTER TABLE migrations for installs that pre-date a column.
+
+        SQLite's CREATE TABLE IF NOT EXISTS only fires when the table is
+        absent — it never adds new columns to a table created earlier.
+        We list the columns each table should have and add anything missing.
+        """
+        targets = {
+            "predictions": [
+                ("spread_at_entry", "REAL"),
+                ("spread_at_exit", "REAL"),
+                ("slippage", "REAL"),
+                ("rule_version", "TEXT"),
+                ("detected_pattern", "TEXT"),
+                ("trend_state", "TEXT"),
+                ("higher_timeframe_trend", "TEXT"),
+                ("event_risk_level", "TEXT"),
+                ("economic_events_nearby", "TEXT"),
+                ("sentiment_score", "REAL"),
+                ("sentiment_volume_spike", "INTEGER"),
+                ("blocked_by", "TEXT"),
+                ("final_reason", "TEXT"),
+            ],
+            "postmortems": [
+                ("loss_category", "TEXT"),
+                ("is_system_accident", "INTEGER NOT NULL DEFAULT 0"),
+                ("context_json", "TEXT"),
+                ("rule_applied", "INTEGER NOT NULL DEFAULT 0"),
+            ],
+        }
+        for table, cols in targets.items():
+            existing = {r["name"] for r in conn.execute(
+                f"PRAGMA table_info({table})"
+            ).fetchall()}
+            for name, sql_type in cols:
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
 
     @contextmanager
     def _conn(self):
@@ -340,6 +423,52 @@ class Storage:
                    ORDER BY pm.ts DESC LIMIT ?""",
                 (symbol, limit),
             ).fetchall()
+            return [dict(r) for r in rows]
+
+    # --- Subscribers (notification recipients) ---
+
+    def add_subscriber(
+        self, backend: str, user_id: str, display_name: str | None = None
+    ) -> int:
+        with self._conn() as conn:
+            existing = conn.execute(
+                "SELECT id FROM subscribers WHERE backend = ? AND user_id = ?",
+                (backend, user_id),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE subscribers SET active = 1, display_name = COALESCE(?, display_name) WHERE id = ?",
+                    (display_name, existing["id"]),
+                )
+                return existing["id"]
+            cur = conn.execute(
+                """INSERT INTO subscribers
+                   (backend, user_id, display_name, subscribed_at, active)
+                   VALUES (?, ?, ?, ?, 1)""",
+                (backend, user_id, display_name, datetime.utcnow().isoformat()),
+            )
+            return cur.lastrowid
+
+    def deactivate_subscriber(self, backend: str, user_id: str) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE subscribers SET active = 0 WHERE backend = ? AND user_id = ?",
+                (backend, user_id),
+            )
+            return cur.rowcount > 0
+
+    def active_subscribers(
+        self, backend: str | None = None, kind: str | None = None
+    ) -> list[dict]:
+        sql = "SELECT * FROM subscribers WHERE active = 1"
+        args: list = []
+        if backend:
+            sql += " AND backend = ?"
+            args.append(backend)
+        if kind:
+            sql += f" AND notify_{kind} = 1"
+        with self._conn() as conn:
+            rows = conn.execute(sql, args).fetchall()
             return [dict(r) for r in rows]
 
     def lesson_summary(self) -> list[dict]:

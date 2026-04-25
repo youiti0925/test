@@ -18,14 +18,23 @@ from typing import Any, Generator
 from ..analyst import Analyst
 from ..calendar import load_events, upcoming_for_symbol
 from ..config import Config
+from ..context import (
+    MarketContext,
+    detect_volume_spike,
+    event_risk_level_from,
+    keywords_from_sentiment,
+)
 from ..correlation import build_correlation_snapshot, related_for
 from ..data import fetch_ohlcv
+from ..decision_engine import decide as decide_action
+from ..higher_timeframe import fetch_and_classify as fetch_higher_tf
 from ..indicators import build_snapshot, technical_signal
 from ..news import fetch_headlines
+from ..patterns import analyse as analyse_patterns
 from ..risk import atr, plan_trade
+from ..risk_gate import RiskState
 from ..sentiment import read_for as read_sentiment
 from ..storage import Storage
-from ..strategy import combine
 
 
 def _event(step: str, status: str, elapsed_s: float, data: Any = None) -> dict:
@@ -82,6 +91,28 @@ def run_pipeline(
         time.perf_counter() - t0,
         {"snapshot": snap.to_dict(), "technical_signal": tech},
     )
+
+    # Step 2.5: pattern / market structure recognition
+    t0 = time.perf_counter()
+    pattern = analyse_patterns(df)
+    yield _event(
+        "patterns", "ok", time.perf_counter() - t0, pattern.to_dict()
+    )
+
+    # Step 2.6: higher-timeframe trend
+    t0 = time.perf_counter()
+    try:
+        higher_tf = fetch_higher_tf(symbol, interval)
+    except Exception as e:  # noqa: BLE001
+        higher_tf = "UNKNOWN"
+        yield _event("higher_timeframe", "error", time.perf_counter() - t0, str(e))
+    else:
+        yield _event(
+            "higher_timeframe",
+            "ok",
+            time.perf_counter() - t0,
+            {"trend": higher_tf},
+        )
 
     # Step 3: ATR
     t0 = time.perf_counter()
@@ -174,14 +205,36 @@ def run_pipeline(
     else:
         yield _event("sentiment", "skip", 0.0)
 
-    # Step 8: Claude
+    # Build MarketContext for the LLM and the decision engine
+    context = MarketContext(
+        symbol=symbol,
+        interval=interval,
+        snapshot=snap,
+        pattern=pattern,
+        higher_timeframe_trend=higher_tf,
+        spread_state="UNKNOWN",
+        spread_pct=None,
+        event_risk_level=event_risk_level_from(
+            [e.to_dict() for e in events]
+        ),
+        economic_events_nearby=[e.to_dict() for e in events],
+        sentiment_score=(sentiment or {}).get("sentiment_score"),
+        sentiment_velocity=(sentiment or {}).get("sentiment_velocity"),
+        sentiment_volume_spike=detect_volume_spike(sentiment),
+        top_sentiment_keywords=keywords_from_sentiment(sentiment),
+        risk_reward=1.5 if atr_value > 0 else None,
+        atr_stop_distance=2.0 * atr_value if atr_value > 0 else None,
+        technical_signal=tech,
+    )
+
+    # Step 8: Claude (advisory only)
     llm_signal = None
     t0 = time.perf_counter()
     if want_llm and cfg.anthropic_api_key:
         try:
             analyst = Analyst(model=cfg.model, effort=cfg.effort)
             llm_signal = analyst.analyze(
-                snap.to_dict(),
+                context.to_dict(),
                 headlines=headlines,
                 correlation=correlation,
                 upcoming_events=events,
@@ -217,17 +270,26 @@ def run_pipeline(
     else:
         yield _event("claude", "skip", 0.0, {"note": "LLM disabled by flag"})
 
-    # Step 9: consensus decision
-    decision = combine(tech, llm_signal)
+    # Step 9: fixed-rule Decision Engine (LLM is advisory only)
+    risk_state = RiskState(
+        df=df,
+        events=tuple(events),
+        spread_pct=None,
+        sentiment_snapshot=sentiment,
+    )
+    decision = decide_action(
+        technical_signal=tech,
+        pattern=pattern,
+        higher_timeframe_trend=higher_tf,
+        risk_reward=context.risk_reward,
+        risk_state=risk_state,
+        llm_signal=llm_signal,
+    )
     yield _event(
         "decision",
         "ok",
         0.0,
-        {
-            "action": decision.action,
-            "confidence": decision.confidence,
-            "reason": decision.reason,
-        },
+        decision.to_dict(),
     )
 
     # Step 10: risk plan (only if directional)

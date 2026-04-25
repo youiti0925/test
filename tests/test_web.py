@@ -173,6 +173,37 @@ def test_dashboard_stats_are_zero_initially(app):
     assert stats["postmortems"] == 0
 
 
+def test_line_webhook_subscribes_via_text_message(client, app):
+    """Posting a 'subscribe' message should add the sender as a subscriber.
+
+    No LINE_CHANNEL_SECRET → signature check is skipped (dev mode).
+    """
+    payload = {
+        "events": [
+            {
+                "type": "message",
+                "replyToken": "rt-1",
+                "source": {"userId": "U-test", "type": "user"},
+                "message": {"type": "text", "text": "subscribe"},
+            }
+        ]
+    }
+    r = client.post("/webhook/line", json=payload)
+    assert r.status_code == 200
+    storage = app.config["FX_STORAGE"]
+    assert len(storage.active_subscribers(backend="line")) == 1
+
+
+def test_line_webhook_rejects_bad_signature(client, monkeypatch):
+    monkeypatch.setenv("LINE_CHANNEL_SECRET", "shh")
+    r = client.post(
+        "/webhook/line",
+        data=b'{"events":[]}',
+        headers={"X-Line-Signature": "wrong"},
+    )
+    assert r.status_code == 403
+
+
 def test_dashboard_stats_aggregate_correctly(app):
     storage = app.config["FX_STORAGE"]
     aid = storage.save_analysis(
