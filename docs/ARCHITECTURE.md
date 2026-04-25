@@ -139,7 +139,24 @@ FX(および暗号資産)の自動売買を、Claude APIで市場分析・戦略
 - 結果は`postmortems`テーブルへ
 - 次回`analyze`で同一シンボルの過去失敗を取り出してプロンプトに自動注入(`Storage.relevant_postmortems()`)
 
-### 14. Web層 (`src/fx/web/`)
+### 14. Sentiment 収集サブシステム (`src/sentiment/`)
+- **責務**: Web群衆の声を集めて数値化、JSONで保存
+- **完全に独立した別モジュール** — `src/fx/` には依存しない
+- 連携は `data/sentiment.json` 経由 (`src/fx/sentiment.py` が薄いリーダー)
+- ソース:
+  | ソース | 認証 | 安定性 | 備考 |
+  |--------|-----|--------|------|
+  | Reddit | なし | ◎ | `.json` エンドポイント |
+  | Stocktwits | なし | ◎ | 公式REST、無料 |
+  | TradingView ideas | なし | △ | HTMLスクレイプ |
+  | Twitter/X (curated) | option | △ | snscrape→Nitter→API v2 の3段フォールバック |
+  | RSS | なし | ◎ | キーワードフィルタ |
+- スコアリング: Claude **Haiku 4.5** で1記事ずつ `bullish/bearish/neutral` + 信頼度
+- 集計: 24h集計 + 24h-48hとの差分でvelocity算出
+- 翻訳: 非英語ソース混入時は Haiku で英訳してからスコア
+- リフレッシュは `fx sentiment-refresh` CLI で(cronで1時間ごと推奨)
+
+### 15. Web層 (`src/fx/web/`)
 - **責務**: Botの「**何を見て、どう考え、どう判断したか**」をブラウザで可視化
 - Flask + Jinja2 + Tailwind CDN(ビルド不要)
 - `/analyze` は **Server-Sent Events** でパイプラインを1ステップずつ実況

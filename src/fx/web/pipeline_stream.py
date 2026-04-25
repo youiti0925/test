@@ -23,6 +23,7 @@ from ..data import fetch_ohlcv
 from ..indicators import build_snapshot, technical_signal
 from ..news import fetch_headlines
 from ..risk import atr, plan_trade
+from ..sentiment import read_for as read_sentiment
 from ..storage import Storage
 from ..strategy import combine
 
@@ -43,11 +44,13 @@ def run_pipeline(
     want_correlation: bool = True,
     want_events: bool = True,
     want_lessons: bool = True,
+    want_sentiment: bool = True,
     want_llm: bool = True,
     capital: float = 10_000.0,
     risk_pct: float = 0.01,
     stop_atr: float = 2.0,
     tp_atr: float = 3.0,
+    sentiment_max_age_s: int = 12 * 3600,
 ) -> Generator[dict, None, None]:
     """Yield one event per pipeline step. Final event has step='done'."""
     # Step 1: fetch OHLCV
@@ -156,6 +159,21 @@ def run_pipeline(
         {"count": len(past_lessons), "items": past_lessons},
     )
 
+    # Step 7.5: crowd sentiment snapshot (lazy read of data/sentiment.json)
+    sentiment = None
+    t0 = time.perf_counter()
+    if want_sentiment:
+        sentiment = read_sentiment(symbol, max_age_s=sentiment_max_age_s)
+        if sentiment:
+            yield _event("sentiment", "ok", time.perf_counter() - t0, sentiment)
+        else:
+            yield _event(
+                "sentiment", "skip", 0.0,
+                {"note": "no recent snapshot — run `fx sentiment refresh`"},
+            )
+    else:
+        yield _event("sentiment", "skip", 0.0)
+
     # Step 8: Claude
     llm_signal = None
     t0 = time.perf_counter()
@@ -168,6 +186,7 @@ def run_pipeline(
                 correlation=correlation,
                 upcoming_events=events,
                 past_postmortems=past_lessons,
+                sentiment_snapshot=sentiment,
             )
             yield _event(
                 "claude",

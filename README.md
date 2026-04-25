@@ -72,6 +72,34 @@ python -m src.fx.cli lessons --symbol USDJPY=X
 
 cronで `evaluate` と `postmortem` を1日1回回せば、放置していても学習データが蓄積されていく。
 
+## センチメント収集 (Reddit / Stocktwits / TradingView / Twitter / RSS)
+
+群衆の動きをClaudeに判断材料として渡すパイプライン。本体FXアプリとは独立した
+`src/sentiment/` モジュールで、JSONスナップショットを介して連携する。
+
+```bash
+# 数分で全シンボルを収集 → Claude Haikuでスコア付け → data/sentiment.json に保存
+python -m src.fx.cli sentiment-refresh \
+    --symbols USDJPY=X EURUSD=X BTC-USD
+
+# 個別シンボルだけ確認
+python -m src.fx.cli sentiment-show --symbol USDJPY=X
+
+# Webダッシュボードの /sentiment ページでもグラフ表示
+
+# 1時間ごとに自動更新する場合のcron
+0 * * * * cd /path/to/test && python -m src.fx.cli sentiment-refresh
+```
+
+ソース別の状況:
+- **Reddit** (`r/forex`, `r/CryptoCurrency` 等): 公式 .json で無料・無認証
+- **Stocktwits**: 公式REST API、無料・無認証
+- **TradingView ideas**: HTMLスクレイプ、レイアウト変更で 0 件になる可能性あり (graceful)
+- **Twitter/X (curated)**: 有名アカウント (`config.py:TWITTER_INFLUENCERS` で編集) のみ。3段フォールバック (snscrape → Nitter → API v2)、全部失敗したら 0 件で続行
+- **RSS**: CNBC・Investing.com・Cointelegraph 等、キーワードでフィルタ
+
+非英語ソースを混ぜたいときは `--translate` で Claude Haiku が英語化してからスコアリング。
+
 ## Webダッシュボード
 
 ブラウザでBotの状態と判断プロセスを見える化:
@@ -134,8 +162,11 @@ pytest tests/ -v
 | `src/fx/backtest.py` | イベント駆動型バックテスト |
 | `src/fx/storage.py` | SQLite履歴管理 (analyses/trades/predictions/postmortems/backtest_runs) |
 | `src/fx/cli.py` | CLIエントリポイント |
+| `src/fx/sentiment.py` | センチメントスナップショットの薄いリーダー |
 | `src/fx/web/` | Flaskダッシュボード(SSEで判断プロセスを実況) |
+| `src/sentiment/` | 群衆センチメント収集・採点・集計(Reddit/Stocktwits/TV/Twitter/RSS) |
 | `sample.py` | gunicornエントリ(`gunicorn sample:app`) |
+| `launch.py` / `start.*` | ダブルクリック起動 |
 
 ## リスクに関する注意
 

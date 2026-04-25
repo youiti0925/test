@@ -13,8 +13,14 @@ from flask import (
     stream_with_context,
 )
 
+from pathlib import Path
+
 from ..correlation import RELATED_SYMBOLS
+from ..sentiment import DEFAULT_PATH as SENTIMENT_PATH
 from .pipeline_stream import run_pipeline
+
+from src.sentiment.snapshot import load_snapshot as load_sentiment_snapshot
+from src.sentiment.snapshot import snapshot_age_seconds
 
 bp = Blueprint("fx", __name__)
 
@@ -137,6 +143,18 @@ def predictions_list():
         status_filter=status,
         symbol_filter=symbol,
         statuses=statuses,
+    )
+
+
+@bp.route("/sentiment")
+def sentiment_page():
+    snaps = load_sentiment_snapshot(SENTIMENT_PATH)
+    age_s = snapshot_age_seconds(SENTIMENT_PATH)
+    return render_template(
+        "sentiment.html",
+        snapshots=snaps,
+        age_s=age_s,
+        path=str(SENTIMENT_PATH),
     )
 
 

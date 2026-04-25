@@ -63,6 +63,25 @@ Event-calendar guidelines:
 - After an event has fired, wait for the immediate reaction to settle
   (one bar) before entering.
 
+Crowd-sentiment guidelines (when sentiment_snapshot is provided):
+- The snapshot aggregates Reddit / Stocktwits / TradingView / Twitter /
+  RSS over the last 24h. `sentiment_score` is in -1.0..+1.0 weighted
+  by per-post Claude-Haiku confidence.
+- A clearly one-sided crowd (`|sentiment_score| > 0.4`) on HIGH mention
+  volume often precedes a CONTRARIAN move once positioning gets
+  one-sided. Treat extreme readings with skepticism, especially on
+  retail-heavy sources (Stocktwits, r/wallstreetbets).
+- Strong POSITIVE sentiment_velocity (>+0.3) with rising mention
+  volume is genuine momentum confirmation IF the move has only just
+  started. If price already moved >2% in the same direction, the
+  retail crowd is probably late.
+- Famous-account (curated Twitter) views carry more weight than
+  anonymous retail chatter — when notable_posts include high-confidence
+  bearish/bullish from named macro accounts, weight them.
+- Empty / very low mention_count_24h means the crowd has no opinion;
+  base the decision on technicals, news, and correlations alone.
+- A stale snapshot (no update in >12h) should be ignored.
+
 Confidence calibration:
 - 0.0-0.3: very weak / conflicting / noisy / fresh-news uncertainty
 - 0.4-0.6: moderate, one-sided but not strong
@@ -154,11 +173,18 @@ class Analyst:
         correlation: CorrelationSnapshot | None = None,
         upcoming_events: list[Event] | None = None,
         past_postmortems: list[dict] | None = None,
+        sentiment_snapshot: dict | None = None,
     ) -> TradeSignal:
         sections = [
             "Market snapshot:",
             f"```json\n{json.dumps(snapshot, indent=2)}\n```",
         ]
+
+        if sentiment_snapshot:
+            sections.append("Crowd sentiment snapshot (Reddit/Stocktwits/TV/Twitter/RSS):")
+            sections.append(
+                f"```json\n{json.dumps(sentiment_snapshot, indent=2, default=str)}\n```"
+            )
 
         if past_postmortems:
             sections.append(

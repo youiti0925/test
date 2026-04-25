@@ -31,8 +31,13 @@ from .news import fetch_headlines
 from .postmortem import Postmortem
 from .prediction import evaluate_prediction, slice_bars_after
 from .risk import atr, plan_trade
+from .sentiment import DEFAULT_PATH as SENTIMENT_PATH
+from .sentiment import read_for as read_sentiment
 from .storage import Storage
 from .strategy import combine
+
+from src.sentiment.refresh import refresh as refresh_sentiment_snapshot
+from src.sentiment.snapshot import load_snapshot as load_sentiment_snapshot
 
 EVENTS_PATH = Path("data/events.json")
 
@@ -75,6 +80,10 @@ def _gather_inputs(args, cfg: Config, storage: Storage):
             args.symbol, limit=args.lesson_limit
         )
 
+    sentiment = None
+    if not args.no_sentiment:
+        sentiment = read_sentiment(args.symbol, max_age_s=12 * 3600)
+
     llm_signal = None
     if cfg.anthropic_api_key and not args.no_llm:
         analyst = Analyst(model=cfg.model, effort=cfg.effort)
@@ -84,6 +93,7 @@ def _gather_inputs(args, cfg: Config, storage: Storage):
             correlation=correlation,
             upcoming_events=events,
             past_postmortems=past_lessons,
+            sentiment_snapshot=sentiment,
         )
 
     decision = combine(tech, llm_signal)
@@ -96,6 +106,7 @@ def _gather_inputs(args, cfg: Config, storage: Storage):
         "correlation": correlation,
         "events": events,
         "past_lessons": past_lessons,
+        "sentiment": sentiment,
         "llm": llm_signal,
         "decision": decision,
         "atr": atr_value,
@@ -433,6 +444,59 @@ def cmd_lessons(args, cfg: Config, storage: Storage) -> int:
     return 0
 
 
+def cmd_sentiment_refresh(args, cfg: Config, storage: Storage) -> int:
+    if not cfg.anthropic_api_key:
+        print("ANTHROPIC_API_KEY not set; cannot score sentiment.", file=sys.stderr)
+        return 1
+    enable = {
+        "reddit": not args.no_reddit,
+        "stocktwits": not args.no_stocktwits,
+        "tradingview": not args.no_tradingview,
+        "twitter": not args.no_twitter,
+        "rss": not args.no_rss,
+    }
+    result = refresh_sentiment_snapshot(
+        symbols=args.symbols,
+        output_path=SENTIMENT_PATH,
+        enable=enable,
+        translate=args.translate,
+    )
+    _print(
+        {
+            "elapsed_s": result.elapsed_s,
+            "twitter_backend": result.twitter_backend,
+            "counts_by_source": result.counts_by_source,
+            "errors_by_source": result.errors_by_source,
+            "snapshots": {
+                sym: {
+                    "mention_count_24h": s.mention_count_24h,
+                    "sentiment_score": s.sentiment_score,
+                    "sentiment_velocity": s.sentiment_velocity,
+                }
+                for sym, s in result.snapshots.items()
+            },
+        }
+    )
+    return 0
+
+
+def cmd_sentiment_show(args, cfg: Config, storage: Storage) -> int:
+    snaps = load_sentiment_snapshot(SENTIMENT_PATH)
+    if args.symbol:
+        snap = snaps.get(args.symbol)
+        if snap is None:
+            _print({"error": f"no snapshot for {args.symbol}"})
+            return 1
+        _print(snap.to_dict())
+    else:
+        _print(
+            {
+                "symbols": {sym: s.to_dict() for sym, s in snaps.items()},
+            }
+        )
+    return 0
+
+
 def cmd_calendar_seed(args, cfg: Config, storage: Storage) -> int:
     events = seed_defaults(EVENTS_PATH)
     _print(
@@ -456,6 +520,8 @@ def _add_context_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-events", action="store_true")
     parser.add_argument("--no-lessons", action="store_true",
                         help="Skip injecting past post-mortems")
+    parser.add_argument("--no-sentiment", action="store_true",
+                        help="Skip the cached crowd-sentiment snapshot")
     parser.add_argument("--lesson-limit", type=int, default=5)
     parser.add_argument("--news-limit", type=int, default=5)
     parser.add_argument("--event-window-hours", type=int, default=24)
@@ -524,6 +590,22 @@ def build_parser() -> argparse.ArgumentParser:
                     help="If set, also list recent lessons for this symbol")
     ls.add_argument("--limit", type=int, default=10)
     ls.set_defaults(func=cmd_lessons)
+
+    sr = sub.add_parser("sentiment-refresh",
+                        help="Collect + score crowd sentiment for the listed symbols")
+    sr.add_argument("--symbols", nargs="+", default=["USDJPY=X", "EURUSD=X", "BTC-USD"])
+    sr.add_argument("--no-reddit", action="store_true")
+    sr.add_argument("--no-stocktwits", action="store_true")
+    sr.add_argument("--no-tradingview", action="store_true")
+    sr.add_argument("--no-twitter", action="store_true")
+    sr.add_argument("--no-rss", action="store_true")
+    sr.add_argument("--translate", action="store_true",
+                    help="Translate non-English posts to English before scoring")
+    sr.set_defaults(func=cmd_sentiment_refresh)
+
+    ss = sub.add_parser("sentiment-show", help="Print the cached sentiment snapshot")
+    ss.add_argument("--symbol", default=None)
+    ss.set_defaults(func=cmd_sentiment_show)
 
     return p
 
