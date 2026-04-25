@@ -21,7 +21,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from .broker import Broker, ClosedPosition, OpenPosition
+from .broker import Broker, ClosedPosition, OpenPosition, Quote
 
 
 class LiveTradingBlocked(RuntimeError):
@@ -103,6 +103,43 @@ class OANDABroker(Broker):
     def open_positions(self) -> list[OpenPosition]:
         return list(self._positions.values())
 
+    def quote(self, symbol: str) -> Quote | None:  # pragma: no cover - network call
+        """Fetch the latest Bid/Ask for `symbol` from OANDA.
+
+        Returns None if the API call fails or the response is missing a
+        bid/ask. The Decision Engine's spread gate treats None as a hard
+        refusal when `require_spread=True` (live broker).
+        """
+        from oandapyV20.endpoints.pricing import PricingInfo  # type: ignore
+
+        instrument = _to_oanda_instrument(symbol)
+        try:
+            r = PricingInfo(
+                accountID=self.config.account_id,
+                params={"instruments": instrument},
+            )
+            response = self._api.request(r)
+        except Exception:  # noqa: BLE001
+            return None
+        prices = response.get("prices") or []
+        if not prices:
+            return None
+        p = prices[0]
+        bids = p.get("bids") or []
+        asks = p.get("asks") or []
+        if not bids or not asks:
+            return None
+        try:
+            bid = float(bids[0]["price"])
+            ask = float(asks[0]["price"])
+        except (KeyError, ValueError, TypeError):
+            return None
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return None
+        return Quote(
+            symbol=symbol, bid=bid, ask=ask, ts=datetime.now(timezone.utc)
+        )
+
     def place_order(  # pragma: no cover - network call
         self,
         symbol: str,
@@ -113,6 +150,15 @@ class OANDABroker(Broker):
         take_profit: float | None = None,
     ) -> OpenPosition:
         from oandapyV20.endpoints.orders import OrderCreate  # type: ignore
+
+        # Spec §12: live brokers must observe Bid/Ask before placing an
+        # order — if we cannot read the spread we refuse to fire blindly.
+        q = self.quote(symbol)
+        if q is None:
+            raise LiveTradingBlocked(
+                f"No Bid/Ask quote available for {symbol}; "
+                "refusing to place a live order without observed spread."
+            )
 
         units = int(size) if side == "BUY" else -int(size)
         order_body: dict = {
@@ -131,11 +177,13 @@ class OANDABroker(Broker):
         r = OrderCreate(accountID=self.config.account_id, data=order_body)
         self._api.request(r)
 
+        # Record the actual fill side of the quote (BUY pays ask, SELL hits bid)
+        actual_entry = q.ask if side == "BUY" else q.bid
         pos = OpenPosition(
             id=self._next_id,
             symbol=symbol,
             side=side,
-            entry=price,
+            entry=actual_entry,
             size=abs(size),
             opened_at=datetime.now(timezone.utc),
             stop=stop,

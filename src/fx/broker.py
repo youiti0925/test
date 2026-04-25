@@ -11,6 +11,37 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 
+@dataclass(frozen=True)
+class Quote:
+    """Current Bid/Ask snapshot from a real broker.
+
+    Used by the Risk Gate: a missing or stale quote means we can't verify
+    the spread, and the gate refuses the live trade. PaperBroker may
+    return a synthetic Quote with zero spread for offline tests.
+    """
+
+    symbol: str
+    bid: float
+    ask: float
+    ts: datetime
+
+    @property
+    def mid(self) -> float:
+        return 0.5 * (self.bid + self.ask)
+
+    @property
+    def spread(self) -> float:
+        return self.ask - self.bid
+
+    @property
+    def spread_pct(self) -> float:
+        """Spread as a percent of mid price (0.01 = 1%)."""
+        m = self.mid
+        if m <= 0:
+            return float("inf")
+        return 100.0 * self.spread / m
+
+
 @dataclass
 class OpenPosition:
     id: int
@@ -64,6 +95,15 @@ class Broker(ABC):
     @abstractmethod
     def mark_to_market(self, price_by_symbol: dict[str, float]) -> None:
         """Check stops/TPs against current prices and close any that trigger."""
+
+    def quote(self, symbol: str) -> Quote | None:
+        """Return current Bid/Ask for `symbol`, or None if unavailable.
+
+        Default implementation: not supported (returns None). Real brokers
+        override this. Callers that need spread enforcement (live entry)
+        must treat None as a hard refusal.
+        """
+        return None
 
 
 @dataclass
@@ -141,6 +181,19 @@ class PaperBroker(Broker):
         self._closed.append(closed)
         self._cash += pnl
         return closed
+
+    def quote(self, symbol: str) -> Quote | None:
+        """Synthetic zero-spread quote based on the last submitted price.
+
+        Returned only so backtests / dry-runs can pass *something* through
+        the Risk Gate uniformly. Production callers must NOT use a paper
+        quote to satisfy `require_spread`.
+        """
+        for pos in self._positions.values():
+            if pos.symbol == symbol:
+                return Quote(symbol=symbol, bid=pos.entry, ask=pos.entry,
+                             ts=datetime.now(timezone.utc))
+        return None
 
     def mark_to_market(self, price_by_symbol: dict[str, float]) -> None:
         for pos_id, pos in list(self._positions.items()):

@@ -21,8 +21,14 @@ from pathlib import Path
 
 from .analyst import Analyst
 from .backtest import run_backtest
+from .backtest_engine import run_engine_backtest
 from .broker import Broker, PaperBroker
-from .calendar import load_events, seed_defaults, upcoming_for_symbol
+from .calendar import (
+    calendar_freshness,
+    load_events,
+    seed_defaults,
+    upcoming_for_symbol,
+)
 from .config import Config
 from .context import (
     MarketContext,
@@ -119,11 +125,20 @@ def _gather_inputs(args, cfg: Config, storage: Storage):
                 print(f"[warn] correlation fetch failed: {e}", file=sys.stderr)
 
     events = []
-    if not args.no_events and EVENTS_PATH.exists():
-        all_events = load_events(EVENTS_PATH)
-        events = upcoming_for_symbol(
-            all_events, args.symbol, within_hours=args.event_window_hours
-        )
+    cal_health = None
+    if not args.no_events:
+        cal_health = calendar_freshness(EVENTS_PATH)
+        if cal_health.is_fresh:
+            all_events = load_events(EVENTS_PATH)
+            events = upcoming_for_symbol(
+                all_events, args.symbol, within_hours=args.event_window_hours
+            )
+        else:
+            print(
+                f"[warn] calendar {cal_health.status}: "
+                f"{cal_health.detail or 'unhealthy'}",
+                file=sys.stderr,
+            )
 
     past_lessons = []
     if not args.no_lessons:
@@ -177,11 +192,20 @@ def _gather_inputs(args, cfg: Config, storage: Storage):
             sentiment_snapshot=sentiment,
         )
 
+    # `require_calendar_fresh` / `require_spread` are flipped on by trade callers
+    # at decision time (see cmd_trade); analyze() leaves them False so research
+    # workflows still produce useful output when feeds are stale.
+    require_calendar_fresh = bool(getattr(args, "require_fresh_calendar", False))
+    require_spread = bool(getattr(args, "require_spread", False))
+
     risk_state = RiskState(
         df=df,
         events=tuple(events),
-        spread_pct=None,
+        spread_pct=getattr(args, "_spread_pct_override", None),
         sentiment_snapshot=sentiment,
+        calendar_freshness=cal_health,
+        require_calendar_fresh=require_calendar_fresh,
+        require_spread=require_spread,
     )
 
     decision = decide_action(
@@ -202,6 +226,7 @@ def _gather_inputs(args, cfg: Config, storage: Storage):
         "headlines": headlines,
         "correlation": correlation,
         "events": events,
+        "calendar_freshness": cal_health,
         "past_lessons": past_lessons,
         "sentiment": sentiment,
         "higher_tf": higher_tf,
@@ -231,6 +256,13 @@ def cmd_analyze(args, cfg: Config, storage: Storage) -> int:
 
     prediction_id = None
     if llm is not None:
+        # Spec §13: distinguish what the LLM advised, what the engine
+        # decided, and what was actually executed. analyze() doesn't place
+        # orders, so executed_action mirrors the engine's final action.
+        ctx_obj = ctx["context"]
+        events_json = json.dumps(
+            [e.to_dict() for e in ctx["events"]], default=str
+        ) if ctx["events"] else None
         prediction_id = storage.save_prediction(
             analysis_id=analysis_id,
             symbol=args.symbol,
@@ -243,6 +275,26 @@ def cmd_analyze(args, cfg: Config, storage: Storage) -> int:
             expected_magnitude_pct=llm.expected_magnitude_pct,
             horizon_bars=llm.horizon_bars,
             invalidation_price=llm.invalidation_price,
+            final_decision_action=decision.action,
+            executed_action=decision.action,
+            blocked_by=",".join(decision.blocked_by) if decision.blocked_by else None,
+            final_reason=decision.reason,
+            rule_chain=",".join(decision.rule_chain) if decision.rule_chain else None,
+            risk_reward=ctx_obj.risk_reward,
+            detected_pattern=(
+                ctx["pattern"].detected_pattern if ctx["pattern"] else None
+            ),
+            trend_state=(
+                ctx["pattern"].trend_state.value if ctx["pattern"] else None
+            ),
+            higher_timeframe_trend=ctx["higher_tf"],
+            event_risk_level=ctx_obj.event_risk_level,
+            economic_events_nearby=events_json,
+            sentiment_score=ctx_obj.sentiment_score,
+            sentiment_volume_spike=(
+                1 if ctx_obj.sentiment_volume_spike else 0
+            ),
+            spread_at_entry=ctx_obj.spread_pct,
         )
 
     # Push notification when LLM produced a directional, confident signal.
@@ -306,12 +358,51 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
 
     Default broker is PaperBroker. Real-broker support is explicitly opt-in
     via --broker oanda (requires environment guards, see src/fx/oanda.py).
+
+    Live brokers (oanda) trigger two extra guards on top of the analyst path:
+      * `require_calendar_fresh`: events.json must be fresh (spec §11)
+      * `require_spread`: broker must return a Bid/Ask quote (spec §12)
+    Both flow through Risk Gate, so the Decision Engine returns HOLD when
+    either is missing — no order is placed.
     """
+    is_live_broker = args.broker == "oanda"
+
+    # Build broker first so we can query its quote BEFORE running the
+    # Decision Engine. Quote is what produces spread_pct.
+    broker: Broker = _build_broker(args)
+    quote = None
+    spread_pct = None
+    if is_live_broker:
+        try:
+            quote = broker.quote(args.symbol)
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] broker.quote failed: {e}", file=sys.stderr)
+        if quote is not None:
+            spread_pct = quote.spread_pct
+
+    # Make the gathering step aware of live-broker enforcement. We reuse
+    # _gather_inputs by stamping the args with the override fields it
+    # checks via getattr — keeps backward compat for analyze/watch.
+    args._spread_pct_override = spread_pct
+    args.require_fresh_calendar = is_live_broker
+    args.require_spread = is_live_broker
+
     ctx = _gather_inputs(args, cfg, storage)
     snap, decision, atr_value = ctx["snapshot"], ctx["decision"], ctx["atr"]
 
     if decision.action == "HOLD":
-        _print({"action": "HOLD", "reason": decision.reason})
+        _print(
+            {
+                "action": "HOLD",
+                "reason": decision.reason,
+                "blocked_by": list(decision.blocked_by),
+                "spread_pct": spread_pct,
+                "calendar": (
+                    ctx["calendar_freshness"].to_dict()
+                    if ctx.get("calendar_freshness") else None
+                ),
+            }
+        )
         return 0
 
     if atr_value <= 0:
@@ -328,8 +419,6 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
         risk_pct=args.risk_pct,
     )
 
-    broker: Broker = _build_broker(args)
-
     if args.dry_run:
         _print(
             {
@@ -341,6 +430,7 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
                     "reason": decision.reason,
                 },
                 "plan": plan.to_dict(),
+                "spread_pct": spread_pct,
                 "would_place_order": True,
             }
         )
@@ -417,6 +507,76 @@ def cmd_backtest(args, cfg: Config, storage: Storage) -> int:
                     "entry": round(t.entry, 6),
                     "exit": round(t.exit, 6),
                     "return_pct": round(t.return_pct, 3),
+                    "entry_ts": str(t.entry_ts),
+                    "exit_ts": str(t.exit_ts),
+                }
+                for t in result.trades[-5:]
+            ],
+        }
+    )
+    return 0
+
+
+def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
+    """Backtest using the full Decision Engine + Risk Gate chain (spec §4)."""
+    df = fetch_ohlcv(
+        args.symbol,
+        interval=args.interval,
+        period=args.period,
+        start=args.start,
+        end=args.end,
+    )
+
+    events = ()
+    if not args.no_events:
+        cal_health = calendar_freshness(EVENTS_PATH)
+        if cal_health.is_fresh:
+            events = tuple(load_events(EVENTS_PATH))
+        else:
+            print(
+                f"[warn] calendar {cal_health.status}: "
+                f"{cal_health.detail or 'unhealthy'} — "
+                "running backtest without macro events",
+                file=sys.stderr,
+            )
+
+    result = run_engine_backtest(
+        df,
+        symbol=args.symbol,
+        interval=args.interval,
+        warmup=args.warmup,
+        stop_atr_mult=args.stop_atr,
+        tp_atr_mult=args.tp_atr,
+        max_holding_bars=args.max_holding_bars,
+        events=events,
+        use_higher_tf=not args.no_higher_tf,
+    )
+    metrics = result.metrics()
+    start_date = str(df.index[0])
+    end_date = str(df.index[-1])
+    storage.save_backtest(
+        symbol=args.symbol,
+        interval=args.interval,
+        start_date=start_date,
+        end_date=end_date,
+        strategy="decision_engine",
+        metrics=metrics,
+    )
+    _print(
+        {
+            "symbol": args.symbol,
+            "interval": args.interval,
+            "period": f"{start_date} -> {end_date}",
+            "bars": len(df),
+            "metrics": metrics,
+            "last_5_trades": [
+                {
+                    "side": t.side,
+                    "entry": round(t.entry, 6),
+                    "exit": round(t.exit, 6),
+                    "return_pct": round(t.return_pct, 3),
+                    "bars_held": t.bars_held,
+                    "exit_reason": t.exit_reason,
                     "entry_ts": str(t.entry_ts),
                     "exit_ts": str(t.exit_ts),
                 }
@@ -548,12 +708,33 @@ def cmd_postmortem(args, cfg: Config, storage: Storage) -> int:
             print(f"[warn] post-mortem failed for prediction {p['id']}: {e}",
                   file=sys.stderr)
             continue
+        # Spec §13: capture the diagnostic snapshot of what the engine
+        # saw at decision time, so future readers see the WHY, not just
+        # the prediction.
+        pm_context = {
+            "final_decision_action": p.get("final_decision_action"),
+            "executed_action": p.get("executed_action"),
+            "blocked_by": p.get("blocked_by"),
+            "rule_chain": p.get("rule_chain"),
+            "detected_pattern": p.get("detected_pattern"),
+            "trend_state": p.get("trend_state"),
+            "higher_timeframe_trend": p.get("higher_timeframe_trend"),
+            "event_risk_level": p.get("event_risk_level"),
+            "economic_events_nearby": p.get("economic_events_nearby"),
+            "sentiment_score": p.get("sentiment_score"),
+            "sentiment_volume_spike": p.get("sentiment_volume_spike"),
+            "spread_at_entry": p.get("spread_at_entry"),
+            "risk_reward": p.get("risk_reward"),
+            "rule_version": p.get("rule_version"),
+            "final_reason": p.get("final_reason"),
+        }
         pm_id = storage.save_postmortem(
             prediction_id=p["id"],
             root_cause=result.root_cause,
             narrative=result.narrative,
             proposed_rule=result.proposed_rule,
             tags=",".join(result.tags),
+            context=pm_context,
         )
         written.append(
             {
@@ -708,6 +889,25 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--end", default=None)
     b.add_argument("--warmup", type=int, default=50)
     b.set_defaults(func=cmd_backtest)
+
+    be = sub.add_parser(
+        "backtest-engine",
+        help="Backtest with the full Decision Engine + Risk Gate chain (spec §4)",
+    )
+    be.add_argument("--symbol", default="USDJPY=X")
+    be.add_argument("--interval", default="1h")
+    be.add_argument("--period", default="180d")
+    be.add_argument("--start", default=None)
+    be.add_argument("--end", default=None)
+    be.add_argument("--warmup", type=int, default=50)
+    be.add_argument("--stop-atr", type=float, default=2.0)
+    be.add_argument("--tp-atr", type=float, default=3.0)
+    be.add_argument("--max-holding-bars", type=int, default=48)
+    be.add_argument("--no-events", action="store_true",
+                    help="Ignore data/events.json (skip macro-event gate)")
+    be.add_argument("--no-higher-tf", action="store_true",
+                    help="Skip higher-timeframe alignment check")
+    be.set_defaults(func=cmd_backtest_engine)
 
     r = sub.add_parser("review", help="Weekly self-review via Claude")
     r.add_argument("--limit", type=int, default=50)

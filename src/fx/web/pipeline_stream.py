@@ -16,7 +16,7 @@ import time
 from typing import Any, Generator
 
 from ..analyst import Analyst
-from ..calendar import load_events, upcoming_for_symbol
+from ..calendar import calendar_freshness, load_events, upcoming_for_symbol
 from ..config import Config
 from ..context import (
     MarketContext,
@@ -158,18 +158,39 @@ def run_pipeline(
     else:
         yield _event("correlation", "skip", 0.0)
 
-    # Step 6: upcoming events
+    # Step 6: upcoming events + calendar freshness
     events = []
+    cal_health = None
     t0 = time.perf_counter()
-    if want_events and events_path is not None and events_path.exists():
-        all_events = load_events(events_path)
-        events = upcoming_for_symbol(all_events, symbol, within_hours=24)
-        yield _event(
-            "upcoming_events",
-            "ok",
-            time.perf_counter() - t0,
-            {"count": len(events), "items": [e.to_dict() for e in events]},
-        )
+    if want_events and events_path is not None:
+        cal_health = calendar_freshness(events_path)
+        if cal_health.is_fresh:
+            all_events = load_events(events_path)
+            events = upcoming_for_symbol(all_events, symbol, within_hours=24)
+            yield _event(
+                "upcoming_events",
+                "ok",
+                time.perf_counter() - t0,
+                {
+                    "count": len(events),
+                    "items": [e.to_dict() for e in events],
+                    "calendar": cal_health.to_dict(),
+                },
+            )
+        else:
+            yield _event(
+                "upcoming_events",
+                "skip",
+                time.perf_counter() - t0,
+                {
+                    "note": (
+                        f"calendar {cal_health.status}: "
+                        f"{cal_health.detail or 'unhealthy'} — "
+                        "live trading would be blocked"
+                    ),
+                    "calendar": cal_health.to_dict(),
+                },
+            )
     else:
         yield _event(
             "upcoming_events",
@@ -270,12 +291,16 @@ def run_pipeline(
     else:
         yield _event("claude", "skip", 0.0, {"note": "LLM disabled by flag"})
 
-    # Step 9: fixed-rule Decision Engine (LLM is advisory only)
+    # Step 9: fixed-rule Decision Engine (LLM is advisory only).
+    # Web pipeline is research-mode: we surface calendar health but don't
+    # force HOLD on stale data; CLI's `trade --broker oanda` is what
+    # enables `require_calendar_fresh=True`/`require_spread=True`.
     risk_state = RiskState(
         df=df,
         events=tuple(events),
         spread_pct=None,
         sentiment_snapshot=sentiment,
+        calendar_freshness=cal_health,
     )
     decision = decide_action(
         technical_signal=tech,
@@ -326,6 +351,10 @@ def run_pipeline(
     )
     prediction_id = None
     if llm_signal is not None:
+        import json as _json  # local import to avoid widening module imports
+        events_json = _json.dumps(
+            [e.to_dict() for e in events], default=str
+        ) if events else None
         prediction_id = storage.save_prediction(
             analysis_id=analysis_id,
             symbol=symbol,
@@ -338,6 +367,20 @@ def run_pipeline(
             expected_magnitude_pct=llm_signal.expected_magnitude_pct,
             horizon_bars=llm_signal.horizon_bars,
             invalidation_price=llm_signal.invalidation_price,
+            final_decision_action=decision.action,
+            executed_action=decision.action,
+            blocked_by=",".join(decision.blocked_by) if decision.blocked_by else None,
+            final_reason=decision.reason,
+            rule_chain=",".join(decision.rule_chain) if decision.rule_chain else None,
+            risk_reward=context.risk_reward,
+            detected_pattern=pattern.detected_pattern,
+            trend_state=pattern.trend_state.value,
+            higher_timeframe_trend=higher_tf,
+            event_risk_level=context.event_risk_level,
+            economic_events_nearby=events_json,
+            sentiment_score=context.sentiment_score,
+            sentiment_volume_spike=1 if context.sentiment_volume_spike else 0,
+            spread_at_entry=context.spread_pct,
         )
     yield _event(
         "persist",

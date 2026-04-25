@@ -57,7 +57,14 @@ CREATE TABLE IF NOT EXISTS predictions (
     symbol TEXT NOT NULL,
     interval TEXT NOT NULL,
     entry_price REAL NOT NULL,
+    -- `action` is the LLM's advisory action, kept for backward compat &
+    -- evaluation. The two columns below split out spec §13's distinction:
+    --   final_decision_action  : what the Decision Engine returned (BUY/SELL/HOLD)
+    --   executed_action        : what was actually placed (HOLD if engine HELD,
+    --                            even when llm_action=BUY)
     action TEXT NOT NULL,
+    final_decision_action TEXT,
+    executed_action TEXT,
     confidence REAL,
     reason TEXT,
     expected_direction TEXT NOT NULL,
@@ -86,6 +93,8 @@ CREATE TABLE IF NOT EXISTS predictions (
     sentiment_volume_spike INTEGER,
     blocked_by TEXT,
     final_reason TEXT,
+    rule_chain TEXT,
+    risk_reward REAL,
     FOREIGN KEY (analysis_id) REFERENCES analyses(id)
 );
 
@@ -167,6 +176,10 @@ class Storage:
                 ("sentiment_volume_spike", "INTEGER"),
                 ("blocked_by", "TEXT"),
                 ("final_reason", "TEXT"),
+                ("final_decision_action", "TEXT"),
+                ("executed_action", "TEXT"),
+                ("rule_chain", "TEXT"),
+                ("risk_reward", "REAL"),
             ],
             "postmortems": [
                 ("loss_category", "TEXT"),
@@ -308,14 +321,43 @@ class Storage:
         expected_magnitude_pct: float,
         horizon_bars: int,
         invalidation_price: float | None,
+        *,
+        # spec §13: separate the LLM's advisory action from what the
+        # Decision Engine concluded and what was actually executed.
+        # Default `final_decision_action`/`executed_action` to `action`
+        # so older callers behave the same.
+        final_decision_action: str | None = None,
+        executed_action: str | None = None,
+        blocked_by: str | None = None,
+        final_reason: str | None = None,
+        rule_chain: str | None = None,
+        risk_reward: float | None = None,
+        detected_pattern: str | None = None,
+        trend_state: str | None = None,
+        higher_timeframe_trend: str | None = None,
+        event_risk_level: str | None = None,
+        economic_events_nearby: str | None = None,
+        sentiment_score: float | None = None,
+        sentiment_volume_spike: int | None = None,
+        spread_at_entry: float | None = None,
+        rule_version: str | None = None,
     ) -> int:
+        fdec = final_decision_action if final_decision_action is not None else action
+        execd = executed_action if executed_action is not None else action
         with self._conn() as conn:
             cur = conn.execute(
                 """INSERT INTO predictions
                    (analysis_id, ts, symbol, interval, entry_price, action,
+                    final_decision_action, executed_action,
                     confidence, reason, expected_direction,
-                    expected_magnitude_pct, horizon_bars, invalidation_price)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    expected_magnitude_pct, horizon_bars, invalidation_price,
+                    blocked_by, final_reason, rule_chain, risk_reward,
+                    detected_pattern, trend_state, higher_timeframe_trend,
+                    event_risk_level, economic_events_nearby,
+                    sentiment_score, sentiment_volume_spike,
+                    spread_at_entry, rule_version)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     analysis_id,
                     datetime.utcnow().isoformat(),
@@ -323,12 +365,27 @@ class Storage:
                     interval,
                     entry_price,
                     action,
+                    fdec,
+                    execd,
                     confidence,
                     reason,
                     expected_direction,
                     expected_magnitude_pct,
                     horizon_bars,
                     invalidation_price,
+                    blocked_by,
+                    final_reason,
+                    rule_chain,
+                    risk_reward,
+                    detected_pattern,
+                    trend_state,
+                    higher_timeframe_trend,
+                    event_risk_level,
+                    economic_events_nearby,
+                    sentiment_score,
+                    sentiment_volume_spike,
+                    spread_at_entry,
+                    rule_version,
                 ),
             )
             return cur.lastrowid
@@ -391,12 +448,22 @@ class Storage:
         narrative: str,
         proposed_rule: str | None,
         tags: str | None,
+        *,
+        loss_category: str | None = None,
+        is_system_accident: bool = False,
+        # Free-form structured snapshot (spec §13). The caller assembles
+        # whatever context is useful — final_decision/blocked_by/rule_chain/
+        # pattern/event_risk/sentiment_spike/spread_pct/risk_reward — and
+        # passes it as a dict; we serialise to JSON.
+        context: dict | None = None,
     ) -> int:
+        ctx_json = json.dumps(context, default=str) if context else None
         with self._conn() as conn:
             cur = conn.execute(
                 """INSERT INTO postmortems
-                   (prediction_id, ts, root_cause, narrative, proposed_rule, tags)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                   (prediction_id, ts, root_cause, narrative, proposed_rule, tags,
+                    loss_category, is_system_accident, context_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     prediction_id,
                     datetime.utcnow().isoformat(),
@@ -404,6 +471,9 @@ class Storage:
                     narrative,
                     proposed_rule,
                     tags,
+                    loss_category,
+                    1 if is_system_accident else 0,
+                    ctx_json,
                 ),
             )
             return cur.lastrowid

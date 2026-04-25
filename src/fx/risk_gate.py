@@ -4,13 +4,15 @@ The Decision Engine consults the gate first. Anything blocked here
 results in HOLD regardless of what the technical signal, the LLM, or
 the sentiment data say. AI cannot override this.
 
-Gate ordering (spec §6):
-  1. data_quality      missing data / price anomaly / API key
-  2. event_high        high-impact macro event in window
-  3. spread_abnormal   spread blew out
-  4. daily_loss_cap    cumulative loss above limit
-  5. consecutive_losses  too many losses in a row
-  6. rule_unverified   rule version was changed too recently to trust
+Gate ordering (spec §6, extended in §11/§12):
+  1. data_quality       missing data / price anomaly / API key
+  2. calendar_stale     events.json missing / stale / unreadable (live only)
+  3. event_high         high-impact macro event in window
+  4. spread_abnormal    spread blew out / unobserved on a live broker
+  5. daily_loss_cap     cumulative loss above limit
+  6. consecutive_losses too many losses in a row
+  7. rule_unverified    rule version was changed too recently to trust
+  8. sentiment_spike    crowd panic + crisis keywords
 
 Each gate is a small, named function returning Maybe[BlockReason]. The
 top-level `evaluate` runs them in order and returns the FIRST block.
@@ -25,7 +27,7 @@ from typing import Iterable
 
 import pandas as pd
 
-from .calendar import Event
+from .calendar import CalendarFreshness, Event
 
 
 @dataclass(frozen=True)
@@ -143,6 +145,7 @@ def check_spread(
     spread_pct: float | None,
     *,
     max_pct: float = 0.05,
+    require_spread: bool = False,
 ) -> BlockReason | None:
     """Block when spread (as % of price) is abnormally wide.
 
@@ -150,8 +153,17 @@ def check_spread(
     sessions. yfinance does not give bid/ask, so callers may pass None
     if the data is unavailable — we fall through silently in that case
     rather than constantly forcing HOLD.
+
+    When `require_spread=True` (live / demo broker per spec §12), a missing
+    spread_pct is itself a block: we refuse to trade without observing
+    Bid/Ask, since we cannot then verify execution conditions.
     """
     if spread_pct is None:
+        if require_spread:
+            return BlockReason(
+                "spread_unavailable",
+                "Spread (Bid/Ask) unavailable; live broker requires observed spread",
+            )
         return None
     if not math.isfinite(spread_pct):
         return BlockReason("spread_abnormal", f"Spread is non-finite: {spread_pct}")
@@ -222,6 +234,37 @@ SENTIMENT_KEYWORD_TRIGGERS = (
 )
 
 
+def check_calendar_freshness(
+    freshness: CalendarFreshness | None,
+    *,
+    require_fresh: bool = False,
+) -> BlockReason | None:
+    """Block when the economic-calendar file is stale, missing, or unreadable.
+
+    Two operating modes (spec §11):
+      - `require_fresh=False` (analyst / research): caller may still want
+        to know the calendar is unhealthy, so we never block here. The
+        warning lives in the freshness object itself.
+      - `require_fresh=True`  (live / demo entry): a non-"fresh" calendar
+        forces HOLD. Missing FOMC because the feed is two weeks old is
+        exactly what we refuse to gamble on.
+    """
+    if not require_fresh or freshness is None:
+        return None
+    if freshness.is_fresh:
+        return None
+    return BlockReason(
+        "calendar_stale",
+        f"Calendar {freshness.status}: {freshness.detail or 'no detail'}",
+        {
+            "status": freshness.status,
+            "age_hours": freshness.age_hours,
+            "event_count": freshness.event_count,
+            "max_age_hours": freshness.max_age_hours,
+        },
+    )
+
+
 def check_sentiment_spike(
     sentiment_snapshot: dict | None,
     *,
@@ -278,6 +321,14 @@ class RiskState:
     rule_min_age_hours: float = 24.0
     sentiment_snapshot: dict | None = None
     now: datetime | None = None
+    # Calendar health view + whether to enforce it. Live/demo entry callers
+    # set require_calendar_fresh=True; analyst/research paths leave it False
+    # so a stale feed produces a warning, not a hard HOLD.
+    calendar_freshness: CalendarFreshness | None = None
+    require_calendar_fresh: bool = False
+    # Spread enforcement. When True, a missing spread_pct (callers couldn't
+    # observe Bid/Ask) blocks trading — required for live brokers per spec §12.
+    require_spread: bool = False
 
 
 def evaluate(state: RiskState) -> GateResult:
@@ -288,8 +339,11 @@ def evaluate(state: RiskState) -> GateResult:
     """
     checks: list[BlockReason | None] = [
         check_data_quality(state.df) if state.df is not None else None,
+        check_calendar_freshness(
+            state.calendar_freshness, require_fresh=state.require_calendar_fresh
+        ),
         check_high_impact_event(state.events, now=state.now),
-        check_spread(state.spread_pct),
+        check_spread(state.spread_pct, require_spread=state.require_spread),
         check_daily_loss_cap(state.pnl_today, cap=state.daily_loss_cap)
         if state.daily_loss_cap is not None else None,
         check_consecutive_losses(state.consecutive_losses,
