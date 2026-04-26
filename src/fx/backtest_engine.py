@@ -89,6 +89,7 @@ class EngineBacktestResult:
 
     def metrics(self) -> dict:
         bars = self.bars_processed or 1
+        execution_metadata = _synthetic_execution_metadata()
         if not self.trades:
             return {
                 "n_trades": 0,
@@ -99,6 +100,7 @@ class EngineBacktestResult:
                 "hold_rate": 1.0,
                 "hold_reasons": dict(self.hold_reasons),
                 "bars_processed": self.bars_processed,
+                **execution_metadata,
             }
         wins = [t for t in self.trades if t.pnl > 0]
         losses = [t for t in self.trades if t.pnl < 0]
@@ -136,7 +138,25 @@ class EngineBacktestResult:
             "hold_reasons": dict(self.hold_reasons),
             "exit_reasons": _count_by_attr(self.trades, "exit_reason"),
             "bars_processed": self.bars_processed,
+            **execution_metadata,
         }
+
+
+def _synthetic_execution_metadata() -> dict[str, str | bool]:
+    """Disclose execution assumptions used by this research backtest.
+
+    The engine replay validates the decision rule chain, not real broker
+    execution quality. These fields make reports self-describing so the
+    result is not mistaken for spread/slippage/fill-aware live performance.
+    """
+    return {
+        "synthetic_execution": True,
+        "spread_mode": "not_modelled",
+        "slippage_mode": "not_modelled",
+        "fill_model": "close_price",
+        "bid_ask_mode": "not_modelled",
+        "sentiment_archive": "not_available",
+    }
 
 
 def _count_by_attr(trades: list[EngineTrade], attr: str) -> dict[str, int]:
