@@ -118,7 +118,12 @@ def _gather_inputs(args, cfg: Config, storage: Storage):
     Builds a MarketContext, runs the fixed-rule Decision Engine, and
     returns everything the callers and notifications need. The LLM is
     consulted but cannot override the engine.
+
+    `args.strategy_config` (if set) is a `StrategyConfig` loaded from
+    `--config`. Its risk + waveform thresholds flow into `decide()`
+    so live tuning happens via the config file rather than code edits.
     """
+    strategy: StrategyConfig | None = getattr(args, "strategy_config", None)
     df = fetch_ohlcv(args.symbol, interval=args.interval, period=args.period)
     snap = build_snapshot(args.symbol, df)
     tech = technical_signal(snap)
@@ -173,9 +178,16 @@ def _gather_inputs(args, cfg: Config, storage: Storage):
         except Exception as e:  # noqa: BLE001
             print(f"[warn] higher-timeframe fetch failed: {e}", file=sys.stderr)
 
-    # Estimate risk-reward from ATR (stop=2*ATR, TP=3*ATR → 1.5 floor)
-    risk_reward = 1.5 if atr_value > 0 else None
-    atr_stop_distance = 2.0 * atr_value if atr_value > 0 else None
+    # Risk-reward + stop distance derive from the StrategyConfig's
+    # ratios (defaults: stop=2*ATR, TP=3*ATR → RR=1.5).
+    if strategy is not None and strategy.risk.stop_atr > 0:
+        rr_ratio = strategy.risk.take_profit_atr / strategy.risk.stop_atr
+        stop_mult = strategy.risk.stop_atr
+    else:
+        rr_ratio = 1.5
+        stop_mult = 2.0
+    risk_reward = rr_ratio if atr_value > 0 else None
+    atr_stop_distance = stop_mult * atr_value if atr_value > 0 else None
 
     context = MarketContext(
         symbol=args.symbol,
@@ -224,6 +236,16 @@ def _gather_inputs(args, cfg: Config, storage: Storage):
         require_spread=require_spread,
     )
 
+    # Decision Engine thresholds come from StrategyConfig when provided
+    # — the function defaults are kept in sync but explicit is better
+    # than implicit when the user has dialled in custom values.
+    decide_kwargs = {}
+    if strategy is not None:
+        decide_kwargs["min_risk_reward"] = strategy.risk.min_risk_reward
+        # waveform.min_confidence doubles as the LLM/min_confidence
+        # floor in the engine — keep one knob, one effect.
+        decide_kwargs["min_confidence"] = strategy.waveform.min_confidence
+
     decision = decide_action(
         technical_signal=tech,
         pattern=pattern,
@@ -231,6 +253,7 @@ def _gather_inputs(args, cfg: Config, storage: Storage):
         risk_reward=risk_reward,
         risk_state=risk_state,
         llm_signal=llm_signal,
+        **decide_kwargs,
     )
 
     return {
@@ -425,14 +448,28 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
         print("[warn] ATR is non-positive; cannot size trade.", file=sys.stderr)
         return 1
 
+    # Strategy config can override the per-broker stop/TP/risk_pct
+    # defaults if the user supplied --config and didn't pass an
+    # explicit --stop-atr/--tp-atr/--risk-pct on the command line.
+    s_cfg = getattr(args, "strategy_config", None)
+    stop_atr = args.stop_atr if args.stop_atr is not None else (
+        s_cfg.risk.stop_atr if s_cfg else 2.0
+    )
+    tp_atr = args.tp_atr if args.tp_atr is not None else (
+        s_cfg.risk.take_profit_atr if s_cfg else 3.0
+    )
+    risk_pct = args.risk_pct if args.risk_pct is not None else (
+        s_cfg.risk.risk_pct if s_cfg else 0.01
+    )
+
     plan = plan_trade(
         side=decision.action,
         entry=snap.last_close,
         atr_value=atr_value,
         capital=args.capital,
-        stop_mult=args.stop_atr,
-        tp_mult=args.tp_atr,
-        risk_pct=args.risk_pct,
+        stop_mult=stop_atr,
+        tp_mult=tp_atr,
+        risk_pct=risk_pct,
     )
 
     if args.dry_run:
@@ -1280,6 +1317,22 @@ def _add_context_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lesson-limit", type=int, default=5)
     parser.add_argument("--news-limit", type=int, default=5)
     parser.add_argument("--event-window-hours", type=int, default=24)
+    parser.add_argument(
+        "--config", default=None,
+        help="StrategyConfig YAML/JSON; overrides risk/waveform/min_confidence",
+    )
+
+
+def _load_strategy_config(args) -> None:
+    """Stamp `args.strategy_config` from `--config` if provided.
+
+    Mutates `args` in place — keeps every cmd_* function dependency-free
+    on argparse plumbing.
+    """
+    path = getattr(args, "config", None)
+    args.strategy_config = (
+        StrategyConfig.load(Path(path)) if path else None
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1294,10 +1347,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_context_flags(t)
     t.add_argument("--broker", choices=["paper", "oanda"], default="paper")
     t.add_argument("--capital", type=float, default=10_000.0)
-    t.add_argument("--risk-pct", type=float, default=0.01,
-                   help="Fraction of capital risked per trade (default 1%%)")
-    t.add_argument("--stop-atr", type=float, default=2.0)
-    t.add_argument("--tp-atr", type=float, default=3.0)
+    # Defaults are None so the StrategyConfig (or hard-coded fallback)
+    # supplies the actual values inside cmd_trade. This lets `--config
+    # cfg.yaml` override stop/TP/risk_pct via the file.
+    t.add_argument("--risk-pct", type=float, default=None,
+                   help="Fraction of capital risked per trade "
+                        "(falls back to StrategyConfig.risk.risk_pct, then 0.01)")
+    t.add_argument("--stop-atr", type=float, default=None)
+    t.add_argument("--tp-atr", type=float, default=None)
     t.add_argument("--dry-run", action="store_true",
                    help="Print the plan but do not place the order")
     t.add_argument("--confirm-demo", action="store_true",
@@ -1536,6 +1593,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     cfg = Config.load()
     storage = Storage(cfg.db_path)
+    _load_strategy_config(args)
     return args.func(args, cfg, storage)
 
 
