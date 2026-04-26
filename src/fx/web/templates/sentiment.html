@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}Sentiment · fx/bot{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-between mb-2">
+  <h1 class="text-2xl font-bold">Crowd sentiment</h1>
+  <div class="text-xs text-slate-400">
+    {% if age_s is not none %}
+      snapshot age: <span class="font-mono text-slate-300">{{ "%.0f"|format(age_s) }}s</span>
+    {% else %}
+      <span class="text-rose-400">no snapshot</span>
+    {% endif %}
+  </div>
+</div>
+<p class="text-sm text-slate-400 mb-6">
+  Aggregated from Reddit, Stocktwits, TradingView ideas, curated Twitter
+  influencers, and RSS feeds. Refresh from the CLI:
+  <code class="text-emerald-400">python -m src.fx.cli sentiment-refresh</code>
+</p>
+
+{% if not snapshots %}
+<div class="card p-8 text-center text-sm text-slate-500">
+  No sentiment data yet — run
+  <code class="text-emerald-400">python -m src.fx.cli sentiment-refresh
+    --symbols USDJPY=X EURUSD=X BTC-USD</code>
+  to populate <code>{{ path }}</code>.
+</div>
+{% endif %}
+
+<div class="space-y-4">
+  {% for symbol, snap in snapshots.items() %}
+    {% set score = snap.sentiment_score %}
+    {% set color = "emerald" if score > 0.15 else "rose" if score < -0.15 else "slate" %}
+    <div class="card p-5">
+      <div class="flex items-center justify-between mb-3">
+        <div>
+          <span class="font-mono text-emerald-300 text-lg">{{ symbol }}</span>
+          <span class="text-xs text-slate-500 ml-2">{{ snap.as_of }}</span>
+        </div>
+        <div class="text-right">
+          <div class="text-3xl font-bold text-{{ color }}-400">
+            {{ "%+.2f"|format(score) }}
+          </div>
+          <div class="text-xs text-slate-500">
+            mentions: {{ snap.mention_count_24h }} ·
+            velocity: {{ "%+.2f"|format(snap.sentiment_velocity) }}
+          </div>
+        </div>
+      </div>
+
+      <!-- Score bar from -1 to +1 -->
+      <div class="relative h-3 bg-slate-800 rounded mb-4">
+        <div class="absolute inset-y-0 left-1/2 w-px bg-slate-600"></div>
+        {% set offset = (score + 1) / 2 * 100 %}
+        <div class="absolute inset-y-0 w-3 -ml-1.5 rounded
+                    bg-{{ color }}-400"
+             style="left: {{ offset }}%"></div>
+      </div>
+
+      <!-- By source -->
+      {% if snap.by_source %}
+        <div class="grid md:grid-cols-5 gap-2 text-xs">
+          {% for src, info in snap.by_source.items() %}
+            <div class="border border-slate-800 rounded p-2">
+              <div class="text-slate-400 capitalize">{{ src }}</div>
+              <div class="font-mono">
+                <span class="text-slate-200">{{ info.count }}</span>
+                <span class="text-slate-500"> · {{ "%+.2f"|format(info.score) }}</span>
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+
+      <!-- Notable posts -->
+      {% if snap.notable_posts %}
+        <div class="mt-4">
+          <div class="text-xs text-slate-400 mb-2">Notable posts</div>
+          <div class="space-y-2">
+            {% for p in snap.notable_posts %}
+              {% set pscore = p.score or 0 %}
+              {% set pcolor = "emerald" if pscore > 0 else "rose" if pscore < 0 else "slate" %}
+              <div class="border border-slate-800 rounded p-3 text-sm">
+                <div class="flex items-center justify-between text-xs mb-1">
+                  <div>
+                    <span class="font-mono text-slate-300">{{ p.source }}</span>
+                    <span class="text-slate-500"> · {{ p.author }}</span>
+                  </div>
+                  <span class="px-2 py-0.5 rounded font-mono
+                               bg-{{ pcolor }}-900/40 text-{{ pcolor }}-300">
+                    {{ "%+.2f"|format(pscore) }}
+                  </span>
+                </div>
+                <p class="text-slate-200 whitespace-pre-wrap">{{ p.text }}</p>
+              </div>
+            {% endfor %}
+          </div>
+        </div>
+      {% endif %}
+    </div>
+  {% endfor %}
+</div>
+{% endblock %}
