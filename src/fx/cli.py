@@ -19,12 +19,22 @@ import sys
 import time
 from pathlib import Path
 
+import pandas as pd
+
 from .analyst import Analyst
+from .attribution import attribute_move
 from .backtest import run_backtest
 from .backtest_engine import run_engine_backtest
+from .calibration import SWEEP_KEYS, calibrate
 from .event_overlay import KEYWORD_MAP, overlay_events
+from .external import (
+    aggregate_comparisons,
+    compare_signals,
+    read_external_csv,
+)
 from .macro import MACRO_SYMBOLS, fetch_macro_snapshot
 from .market_timeline import build_timeline
+from .strategy_config import StrategyConfig
 from .waveform_backtest import waveform_lookup
 from .waveform_library import build_library, read_library, write_library
 from .waveform_matcher import compute_signature
@@ -812,6 +822,166 @@ def cmd_waveform_match(args, cfg: Config, storage: Storage) -> int:
     return 0
 
 
+def cmd_attribution_report(args, cfg: Config, storage: Storage) -> int:
+    """Run attribution over the largest moves in `period` (spec §8)."""
+    df = fetch_ohlcv(
+        args.symbol, interval=args.interval, period=args.period,
+        start=args.start, end=args.end,
+    )
+    closes = df["close"].astype(float).values
+    rets_pct = (closes[1:] / closes[:-1] - 1.0) * 100.0
+    bars = list(df.index[1:])
+
+    events = []
+    if not args.no_events:
+        cal_health = calendar_freshness(EVENTS_PATH)
+        if cal_health.is_fresh:
+            events = load_events(EVENTS_PATH)
+        else:
+            print(
+                f"[warn] calendar {cal_health.status}: "
+                f"{cal_health.detail or 'unhealthy'}", file=sys.stderr,
+            )
+
+    # Pull macro deltas if available — single fetch for the full period
+    macro = None
+    if not args.no_macro:
+        try:
+            macro = fetch_macro_snapshot(
+                df.index, interval="1d", period=args.macro_period,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] macro fetch failed: {e}", file=sys.stderr)
+
+    # Pick the top-N moves by absolute return.
+    indexed = sorted(
+        enumerate(rets_pct), key=lambda t: abs(t[1]), reverse=True,
+    )[: args.top_n]
+
+    reports = []
+    from datetime import timedelta
+    for raw_i, ret in indexed:
+        ts = bars[raw_i]
+        # Window: events within ±6h of the move.
+        nearby = [
+            e.to_dict() for e in events
+            if abs((e.when - ts.to_pydatetime()).total_seconds()) <= 6 * 3600
+        ]
+        # Macro deltas: change over the previous 24h.
+        macro_chg: dict = {}
+        if macro is not None:
+            for slot in macro.series.keys():
+                v_now = macro.value_at(slot, ts)
+                v_prev = macro.value_at(slot, ts - timedelta(hours=24))
+                if v_now is not None and v_prev is not None:
+                    if slot in ("us10y", "us_short_yield_proxy"):
+                        # Yields are quoted in %; report basis-point change
+                        macro_chg[slot] = float((v_now - v_prev) * 100.0)
+                    else:
+                        macro_chg[slot] = (
+                            float((v_now / v_prev - 1.0) * 100.0)
+                            if v_prev != 0 else None
+                        )
+        result = attribute_move(
+            float(ret),
+            events_nearby=nearby,
+            macro_changes_pct=macro_chg,
+            notable_threshold_pct=args.notable_threshold,
+        )
+        reports.append({
+            "ts": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+            "result": result.to_dict(),
+        })
+
+    _print({
+        "symbol": args.symbol,
+        "interval": args.interval,
+        "n_bars": len(df),
+        "top_n": args.top_n,
+        "reports": reports,
+    })
+    return 0
+
+
+def cmd_calibrate(args, cfg: Config, storage: Storage) -> int:
+    """Sweep parameters and rank by stability_score (spec §10)."""
+    df = fetch_ohlcv(
+        args.symbol, interval=args.interval, period=args.period,
+        start=args.start, end=args.end,
+    )
+    base = (
+        StrategyConfig.load(Path(args.config)) if args.config
+        else StrategyConfig(symbol=args.symbol, interval=args.interval)
+    )
+
+    ranges: dict = {}
+    if args.stop_atr:
+        ranges["stop_atr"] = [float(x) for x in args.stop_atr]
+    if args.tp_atr:
+        ranges["tp_atr"] = [float(x) for x in args.tp_atr]
+    if args.max_holding_bars:
+        ranges["max_holding_bars"] = [int(x) for x in args.max_holding_bars]
+    if not ranges:
+        # Sensible default: explore stop_atr and tp_atr
+        ranges = {
+            "stop_atr": [1.5, 2.0, 2.5],
+            "tp_atr": [2.0, 3.0, 4.0],
+        }
+
+    report = calibrate(
+        df,
+        symbol=args.symbol,
+        interval=args.interval,
+        base=base,
+        ranges=ranges,
+    )
+    _print(report.to_dict())
+    return 0
+
+
+def cmd_compare_external(args, cfg: Config, storage: Storage) -> int:
+    """Compare engine decisions against an external CSV (spec §9)."""
+    externals = read_external_csv(Path(args.external_csv), source=args.source)
+    if not externals:
+        _print({"n": 0, "note": "no external rows parsed"})
+        return 0
+
+    # Pull self decisions from the predictions table within the time window.
+    if args.symbol:
+        rows = storage.list_predictions(symbol=args.symbol, limit=args.limit)
+    else:
+        rows = storage.list_predictions(limit=args.limit)
+
+    self_decisions = [
+        {
+            "symbol": r["symbol"],
+            "ts": r["ts"],
+            "action": r.get("final_decision_action") or r.get("action"),
+            "advisory": {
+                "event_risk_level": r.get("event_risk_level"),
+                "sentiment_score": r.get("sentiment_score"),
+                "pattern": r.get("detected_pattern"),
+            },
+            "entry_price": r.get("entry_price"),
+            "stop_loss": None,
+            "take_profit": None,
+        }
+        for r in rows
+    ]
+    pair_within = pd.Timedelta(args.pair_within)
+    cmps = compare_signals(
+        self_decisions, externals,
+        pair_within=pair_within.to_pytimedelta(),
+    )
+    _print({
+        "n_external": len(externals),
+        "n_paired": len(cmps),
+        "aggregate": aggregate_comparisons(cmps),
+        "samples": [c.to_dict() for c in cmps[: args.show]],
+    })
+    return 0
+
+
 def cmd_review(args, cfg: Config, storage: Storage) -> int:
     if not cfg.anthropic_api_key:
         print("ANTHROPIC_API_KEY not set; cannot run review.", file=sys.stderr)
@@ -1184,6 +1354,60 @@ def build_parser() -> argparse.ArgumentParser:
                     choices=["z_score", "start_price", "min_max"],
                     default="z_score")
     wm.set_defaults(func=cmd_waveform_match)
+
+    ar = sub.add_parser(
+        "attribution-report",
+        help="Rank candidate causes for the largest moves (spec §8)",
+    )
+    ar.add_argument("--symbol", default="USDJPY=X")
+    ar.add_argument("--interval", default="1h")
+    ar.add_argument("--period", default="180d")
+    ar.add_argument("--start", default=None)
+    ar.add_argument("--end", default=None)
+    ar.add_argument("--top-n", type=int, default=10)
+    ar.add_argument("--no-events", action="store_true")
+    ar.add_argument("--no-macro", action="store_true")
+    ar.add_argument("--macro-period", default="2y")
+    ar.add_argument("--notable-threshold", type=float, default=0.5,
+                    help="|return|%% above which a move is flagged as notable")
+    ar.set_defaults(func=cmd_attribution_report)
+
+    cb = sub.add_parser(
+        "calibrate",
+        help="Sweep parameter ranges and rank by stability (spec §10)",
+    )
+    cb.add_argument("--symbol", default="USDJPY=X")
+    cb.add_argument("--interval", default="1h")
+    cb.add_argument("--period", default="180d")
+    cb.add_argument("--start", default=None)
+    cb.add_argument("--end", default=None)
+    cb.add_argument("--config", default=None,
+                    help="Optional StrategyConfig YAML/JSON to use as the base")
+    cb.add_argument("--stop-atr", nargs="*", default=None,
+                    help="Values to try for stop_atr (e.g. 1.5 2.0 2.5)")
+    cb.add_argument("--tp-atr", nargs="*", default=None,
+                    help="Values to try for tp_atr")
+    cb.add_argument("--max-holding-bars", nargs="*", default=None,
+                    help="Values to try for max_holding_bars")
+    cb.set_defaults(func=cmd_calibrate)
+
+    ce = sub.add_parser(
+        "compare-external",
+        help="Compare engine predictions against an external-vendor CSV (spec §9)",
+    )
+    ce.add_argument("--external-csv", required=True,
+                    help="Path to a vendor-exported CSV file")
+    ce.add_argument("--source", required=True,
+                    help="Vendor label (quantconnect, trendspider, ...)")
+    ce.add_argument("--symbol", default=None,
+                    help="Restrict self-side to this symbol; default = all")
+    ce.add_argument("--limit", type=int, default=500,
+                    help="Max self-predictions to read for pairing")
+    ce.add_argument("--pair-within", default="1h",
+                    help="Pandas-style timedelta for pairing tolerance")
+    ce.add_argument("--show", type=int, default=10,
+                    help="How many sample comparisons to print")
+    ce.set_defaults(func=cmd_compare_external)
 
     eo = sub.add_parser(
         "event-overlay",
