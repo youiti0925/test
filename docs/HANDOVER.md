@@ -195,9 +195,10 @@ docs/
 | sentiment 過去データ | ⚠️ 未反映 | アーカイブ未保存 |
 | events.json 鮮度判定 | ⚠️ 未反映 | live のみ |
 
-**ユーザーの直近の修正（未push）** で `metrics()` に
-`synthetic_execution: true` 等のフラグが追加される予定。これによりこの限界が
-metrics 側からも一目で分かる構造になる。
+**PR #3 (`fix/backtest-synthetic-metrics`, merged `4532e16`)** で `metrics()` に
+`synthetic_execution: true` / `spread_mode` / `slippage_mode` / `fill_model` /
+`bid_ask_mode` / `sentiment_archive` の 6 キーが追加された。この限界が metrics
+側からも一目で分かる構造になっている（`_synthetic_execution_metadata()` で集中管理）。
 
 ---
 
@@ -252,11 +253,13 @@ python sample.py     # debug mode :5000
 
 これは `DESIGN.md §9.4` の残課題リストとも整合。
 
-### A. 取り込み確認
-1. **ユーザーが local で作業した synthetic_execution metrics の push & 確認**
-   - `backtest_engine.py` と `tests/test_backtest_engine.py` 2ファイル変更
-   - 51 行追加、2 コミット
-   - push 後 `pytest tests/test_backtest_engine.py` を実行
+### A. 取り込み確認 — ✅ 完了
+1. **synthetic_execution metrics — PR #3 として merge 済み (`4532e16`, 2026-04-26)**
+   - `backtest_engine.py` と `tests/test_backtest_engine.py` 2 ファイル / 51 行
+   - 2 コミット (`27f57e5`, `827f23a`) は merge commit 経由で main に保存
+   - 検証結果: `pytest tests/test_backtest_engine.py` → **8 passed** /
+     `pytest tests/ --ignore=tests/test_notify.py` → **250 passed**
+   - CI: リポジトリ未設定 (`check_runs: 0`) のためローカル実行で代替確認
 
 ### B. 中規模・low-risk
 2. `backtest-compare` CLI — 旧/新 backtest を 1 コマンド並走で diff JSON
