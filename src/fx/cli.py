@@ -25,6 +25,9 @@ from .backtest_engine import run_engine_backtest
 from .event_overlay import KEYWORD_MAP, overlay_events
 from .macro import MACRO_SYMBOLS, fetch_macro_snapshot
 from .market_timeline import build_timeline
+from .waveform_backtest import waveform_lookup
+from .waveform_library import build_library, read_library, write_library
+from .waveform_matcher import compute_signature
 from .broker import Broker, PaperBroker
 from .calendar import (
     calendar_freshness,
@@ -723,6 +726,92 @@ def cmd_event_overlay(args, cfg: Config, storage: Storage) -> int:
     return 0
 
 
+def cmd_waveform_build_library(args, cfg: Config, storage: Storage) -> int:
+    """Build a waveform sample library from a long history (spec §7.2)."""
+    df = fetch_ohlcv(
+        args.symbol,
+        interval=args.interval,
+        period=args.period,
+        start=args.start,
+        end=args.end,
+    )
+    samples = build_library(
+        df,
+        symbol=args.symbol,
+        timeframe=args.interval,
+        window_bars=args.window_bars,
+        step_bars=args.step_bars,
+        forward_horizons=tuple(args.horizons),
+        normalize=args.normalize,
+    )
+    out_path = Path(args.output)
+    n = write_library(out_path, samples, append=args.append)
+    _print({
+        "symbol": args.symbol,
+        "interval": args.interval,
+        "window_bars": args.window_bars,
+        "step_bars": args.step_bars,
+        "horizons": args.horizons,
+        "samples_written": n,
+        "output": str(out_path),
+        "appended": bool(args.append),
+        "first_sample_end": (
+            samples[0].end_ts.isoformat() if samples else None
+        ),
+        "last_sample_end": (
+            samples[-1].end_ts.isoformat() if samples else None
+        ),
+    })
+    return 0
+
+
+def cmd_waveform_match(args, cfg: Config, storage: Storage) -> int:
+    """Match the current window against a library and report a bias (spec §7.3)."""
+    df = fetch_ohlcv(
+        args.symbol,
+        interval=args.interval,
+        period=args.period,
+    )
+    if len(df) < args.window:
+        print(f"[err] need ≥ {args.window} bars; got {len(df)}", file=sys.stderr)
+        return 1
+    target_window = df.iloc[-args.window:]
+    target_sig = compute_signature(target_window, method=args.normalize)
+
+    library = read_library(Path(args.library))
+    if not library:
+        print(
+            f"[err] empty/missing library at {args.library} — "
+            "run `waveform-build-library` first",
+            file=sys.stderr,
+        )
+        return 1
+
+    bias, matches = waveform_lookup(
+        target_sig,
+        library,
+        horizon_bars=args.horizon,
+        method=args.method,
+        top_k=args.top_k,
+        min_score=args.min_score,
+        min_sample_count=args.min_samples,
+        min_directional_share=args.min_share,
+    )
+
+    _print({
+        "symbol": args.symbol,
+        "interval": args.interval,
+        "window_bars": args.window,
+        "library": args.library,
+        "library_size": len(library),
+        "method": args.method,
+        "horizon_bars": args.horizon,
+        "bias": bias.to_dict(),
+        "top_matches": [m.to_dict() for m in matches[: args.show]],
+    })
+    return 0
+
+
 def cmd_review(args, cfg: Config, storage: Storage) -> int:
     if not cfg.anthropic_api_key:
         print("ANTHROPIC_API_KEY not set; cannot run review.", file=sys.stderr)
@@ -1051,6 +1140,50 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional path; .csv or .parquet — written if set",
     )
     bt.set_defaults(func=cmd_build_timeline)
+
+    wbl = sub.add_parser(
+        "waveform-build-library",
+        help="Slide a window over history and write a JSONL waveform library (spec §7.2)",
+    )
+    wbl.add_argument("--symbol", default="USDJPY=X")
+    wbl.add_argument("--interval", default="1h")
+    wbl.add_argument("--period", default="2y")
+    wbl.add_argument("--start", default=None)
+    wbl.add_argument("--end", default=None)
+    wbl.add_argument("--window-bars", type=int, default=60)
+    wbl.add_argument("--step-bars", type=int, default=5)
+    wbl.add_argument("--horizons", type=int, nargs="+", default=[4, 12, 24])
+    wbl.add_argument("--normalize",
+                     choices=["z_score", "start_price", "min_max"],
+                     default="z_score")
+    wbl.add_argument("--output", default="data/waveforms/library.jsonl")
+    wbl.add_argument("--append", action="store_true",
+                     help="Append to an existing library instead of overwriting")
+    wbl.set_defaults(func=cmd_waveform_build_library)
+
+    wm = sub.add_parser(
+        "waveform-match",
+        help="Match the most recent window against a library; report bias (spec §7.3)",
+    )
+    wm.add_argument("--symbol", default="USDJPY=X")
+    wm.add_argument("--interval", default="1h")
+    wm.add_argument("--period", default="60d")
+    wm.add_argument("--window", type=int, default=60,
+                    help="Bars at the right edge of the chart used as the target")
+    wm.add_argument("--library", default="data/waveforms/library.jsonl")
+    wm.add_argument("--method", choices=["dtw", "cosine", "correlation"],
+                    default="dtw")
+    wm.add_argument("--horizon", type=int, default=24)
+    wm.add_argument("--top-k", type=int, default=30)
+    wm.add_argument("--min-score", type=float, default=0.55)
+    wm.add_argument("--min-samples", type=int, default=20)
+    wm.add_argument("--min-share", type=float, default=0.6)
+    wm.add_argument("--show", type=int, default=5,
+                    help="How many top matches to print")
+    wm.add_argument("--normalize",
+                    choices=["z_score", "start_price", "min_max"],
+                    default="z_score")
+    wm.set_defaults(func=cmd_waveform_match)
 
     eo = sub.add_parser(
         "event-overlay",

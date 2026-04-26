@@ -10,6 +10,7 @@ real entry. It consults inputs in spec-order:
     → SNS-only veto (sentiment alone never triggers a trade)
     → Confidence floor
     → Technical / LLM agreement
+    → Waveform-bias agreement (advisory only)
     → Action
 
 The LLM is an ADVISOR. It can:
@@ -20,6 +21,14 @@ But it CANNOT:
   * Lift the action above HOLD when the rule engine says HOLD.
   * Change the side from the technical signal (the engine ignores any
     BUY/SELL the LLM puts when the rules don't support it).
+
+Waveform bias (spec §7.4) is also advisory:
+  * A BUY-only waveform_bias on a HOLD technical signal does NOT trade.
+  * A waveform_bias agreeing with technical_signal is recorded in the
+    advisory payload and contributes a small confidence bump.
+  * A waveform_bias DISAGREEING with the technical signal is treated
+    as a veto: HOLD with reason mentioning the disagreement. This is
+    the asymmetry that keeps the engine conservative.
 """
 from __future__ import annotations
 
@@ -29,6 +38,7 @@ from typing import Optional
 from .analyst import TradeSignal
 from .patterns import PatternResult, TrendState
 from .risk_gate import GateResult, RiskState, evaluate as evaluate_gate
+from .waveform_backtest import WaveformBias
 
 MIN_CONFIDENCE = 0.6
 MIN_RISK_REWARD = 1.5
@@ -74,6 +84,7 @@ def decide(
     risk_reward: float | None = None,
     risk_state: RiskState,
     llm_signal: TradeSignal | None = None,
+    waveform_bias: "WaveformBias | None" = None,
     min_confidence: float = MIN_CONFIDENCE,
     min_risk_reward: float = MIN_RISK_REWARD,
 ) -> Decision:
@@ -93,7 +104,7 @@ def decide(
             f"Risk gate blocked: {gate.block.message if gate.block else 'unknown'}",
             blocked_by=gate.blocked_codes,
             chain=chain,
-            advisory=_advisory_from_llm(llm_signal),
+            advisory=_merge_advisory(llm_signal, waveform_bias),
         )
 
     # ── Technical signal must be directional ──────────────────────────
@@ -102,7 +113,7 @@ def decide(
         return _hold(
             f"Technical signal is {technical_signal}; nothing to confirm",
             chain=chain,
-            advisory=_advisory_from_llm(llm_signal),
+            advisory=_merge_advisory(llm_signal, waveform_bias),
         )
 
     # ── Pattern check: top patterns require neckline break ───────────
@@ -119,13 +130,13 @@ def decide(
             return _hold(
                 f"{pattern.detected_pattern}: neckline not yet broken on close",
                 chain=chain,
-                advisory=_advisory_from_llm(llm_signal),
+                advisory=_merge_advisory(llm_signal, waveform_bias),
             )
         if is_bottom and technical_signal == "BUY" and not pattern.neckline_broken:
             return _hold(
                 f"{pattern.detected_pattern}: neckline not yet broken on close",
                 chain=chain,
-                advisory=_advisory_from_llm(llm_signal),
+                advisory=_merge_advisory(llm_signal, waveform_bias),
             )
 
     # ── Higher-timeframe alignment ───────────────────────────────────
@@ -136,13 +147,13 @@ def decide(
             return _hold(
                 "Counter-trend BUY against higher-timeframe DOWNTREND",
                 chain=chain,
-                advisory=_advisory_from_llm(llm_signal),
+                advisory=_merge_advisory(llm_signal, waveform_bias),
             )
         if technical_signal == "SELL" and ht == TrendState.UPTREND.value:
             return _hold(
                 "Counter-trend SELL against higher-timeframe UPTREND",
                 chain=chain,
-                advisory=_advisory_from_llm(llm_signal),
+                advisory=_merge_advisory(llm_signal, waveform_bias),
             )
 
     # ── Risk-reward floor ────────────────────────────────────────────
@@ -151,7 +162,7 @@ def decide(
         return _hold(
             f"Risk-reward {risk_reward:.2f} below floor {min_risk_reward}",
             chain=chain,
-            advisory=_advisory_from_llm(llm_signal),
+            advisory=_merge_advisory(llm_signal, waveform_bias),
         )
 
     # ── LLM consensus (advisory only) ────────────────────────────────
@@ -162,21 +173,51 @@ def decide(
                 f"LLM confidence {llm_signal.confidence:.2f} < {min_confidence}",
                 chain=chain,
                 confidence=llm_signal.confidence,
-                advisory=_advisory_from_llm(llm_signal),
+                advisory=_merge_advisory(llm_signal, waveform_bias),
             )
         if llm_signal.action != technical_signal:
             return _hold(
                 f"Tech={technical_signal} disagrees with LLM={llm_signal.action}",
                 chain=chain,
                 confidence=llm_signal.confidence,
-                advisory=_advisory_from_llm(llm_signal),
+                advisory=_merge_advisory(llm_signal, waveform_bias),
+            )
+
+    # ── Waveform bias (advisory veto only) ───────────────────────────
+    # Per spec §7.4: a directional waveform bias that DISAGREES with the
+    # technical signal forces HOLD; agreement is recorded but doesn't
+    # lift confidence above the LLM's, and an absent / HOLD bias is
+    # neutral. Waveform alone never produces an entry — that's enforced
+    # by the fact that we only get here when technical_signal is
+    # directional and all earlier gates passed.
+    chain.append("waveform_advisory")
+    if waveform_bias is not None and waveform_bias.action in ("BUY", "SELL"):
+        if waveform_bias.action != technical_signal:
+            return _hold(
+                f"Waveform bias {waveform_bias.action} "
+                f"({waveform_bias.confidence:.2f}, "
+                f"{waveform_bias.sample_count} samples) disagrees with "
+                f"technical {technical_signal}",
+                chain=chain,
+                confidence=(
+                    llm_signal.confidence if llm_signal is not None else 0.0
+                ),
+                advisory=_merge_advisory(llm_signal, waveform_bias),
             )
 
     # ── All checks passed ────────────────────────────────────────────
     chain.append("approve")
-    confidence = (
+    base_confidence = (
         llm_signal.confidence if llm_signal is not None else 0.55
     )
+    # Waveform agreement contributes a small additive bump capped at 0.95
+    # — never enough to override the LLM/min_confidence floors above.
+    confidence = base_confidence
+    if (waveform_bias is not None
+            and waveform_bias.action == technical_signal
+            and waveform_bias.sample_count > 0):
+        confidence = min(0.95, base_confidence + 0.05 * waveform_bias.confidence)
+
     reason_parts = [f"Rule chain approved {technical_signal}"]
     if llm_signal is not None:
         reason_parts.append(f"LLM agrees ({llm_signal.confidence:.2f}): {llm_signal.reason}")
@@ -184,13 +225,18 @@ def decide(
         reason_parts.append(
             f"pattern={pattern.detected_pattern}, neckline_broken={pattern.neckline_broken}"
         )
+    if waveform_bias is not None and waveform_bias.action == technical_signal:
+        reason_parts.append(
+            f"waveform agrees ({waveform_bias.sample_count} similar past windows, "
+            f"conf={waveform_bias.confidence:.2f})"
+        )
     return Decision(
         action=technical_signal,
         confidence=confidence,
         reason=" | ".join(reason_parts),
         blocked_by=(),
         rule_chain=tuple(chain),
-        advisory=_advisory_from_llm(llm_signal),
+        advisory=_merge_advisory(llm_signal, waveform_bias),
     )
 
 
@@ -205,3 +251,17 @@ def _advisory_from_llm(llm: TradeSignal | None) -> dict:
         "llm_expected_direction": llm.expected_direction,
         "llm_expected_magnitude_pct": llm.expected_magnitude_pct,
     }
+
+
+def _advisory_from_waveform(bias: "WaveformBias | None") -> dict:
+    if bias is None:
+        return {}
+    return {"waveform_bias": bias.to_dict()}
+
+
+def _merge_advisory(
+    llm: TradeSignal | None, bias: "WaveformBias | None"
+) -> dict:
+    out = _advisory_from_llm(llm)
+    out.update(_advisory_from_waveform(bias))
+    return out
