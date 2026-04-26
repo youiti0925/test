@@ -21,7 +21,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from .broker import Broker, ClosedPosition, OpenPosition, Quote
+from .broker import Broker, ClosedPosition, ExecutionFill, OpenPosition, Quote
 
 
 class LiveTradingBlocked(RuntimeError):
@@ -90,6 +90,9 @@ class OANDABroker(Broker):
         self._positions: dict[int, OpenPosition] = {}
         self._closed: list[ClosedPosition] = []
         self._next_id = 1
+        # Most-recent ExecutionFill from place_order — written so cmd_trade
+        # can persist slippage / latency / Bid-Ask without re-querying.
+        self.last_fill: ExecutionFill | None = None
 
     # --- Broker interface ---
 
@@ -174,23 +177,63 @@ class OANDABroker(Broker):
         if take_profit is not None:
             order_body["order"]["takeProfitOnFill"] = {"price": f"{take_profit:.5f}"}
 
+        request_time = datetime.now(timezone.utc)
         r = OrderCreate(accountID=self.config.account_id, data=order_body)
-        self._api.request(r)
+        response = self._api.request(r) or {}
+        response_time = datetime.now(timezone.utc)
 
-        # Record the actual fill side of the quote (BUY pays ask, SELL hits bid)
+        # Pull the actual fill price + broker order id from the response.
+        # OANDA returns an `orderFillTransaction` (or `orderCancelTransaction`
+        # if the request was rejected). We trust the response price over
+        # our pre-trade quote — it's what we actually paid.
+        fill_tx = (
+            response.get("orderFillTransaction")
+            or response.get("orderCreateTransaction")
+            or {}
+        )
         actual_entry = q.ask if side == "BUY" else q.bid
+        broker_order_id = (
+            fill_tx.get("id")
+            or (response.get("orderCreateTransaction") or {}).get("id")
+        )
+        try:
+            if "price" in fill_tx:
+                actual_entry = float(fill_tx["price"])
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            fill_time = (
+                datetime.fromisoformat(fill_tx["time"].replace("Z", "+00:00"))
+                if fill_tx.get("time") else response_time
+            )
+        except (TypeError, ValueError):
+            fill_time = response_time
+
         pos = OpenPosition(
             id=self._next_id,
             symbol=symbol,
             side=side,
             entry=actual_entry,
             size=abs(size),
-            opened_at=datetime.now(timezone.utc),
+            opened_at=fill_time,
             stop=stop,
             take_profit=take_profit,
         )
         self._positions[pos.id] = pos
         self._next_id += 1
+
+        self.last_fill = ExecutionFill(
+            symbol=symbol, side=side,
+            expected_entry_price=price,
+            actual_fill_price=actual_entry,
+            size=abs(size),
+            bid=q.bid, ask=q.ask, spread_pct=q.spread_pct,
+            broker_order_id=str(broker_order_id) if broker_order_id else None,
+            order_request_time=request_time,
+            order_response_time=response_time,
+            fill_time=fill_time,
+        )
         return pos
 
     def close_position(  # pragma: no cover - network call

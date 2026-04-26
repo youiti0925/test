@@ -27,12 +27,28 @@ CREATE TABLE IF NOT EXISTS trades (
     closed_at TEXT,
     symbol TEXT NOT NULL,
     side TEXT NOT NULL,
-    entry REAL NOT NULL,
+    entry REAL NOT NULL,                 -- actual fill price (post slippage)
     exit REAL,
     size REAL NOT NULL,
     pnl REAL,
     analysis_id INTEGER,
     note TEXT,
+    -- spec §12 / §16 execution audit (nullable; only set on real fills)
+    expected_entry_price REAL,
+    actual_fill_price REAL,
+    slippage REAL,                       -- signed price-units, +ve = paid more
+    bid_at_entry REAL,
+    ask_at_entry REAL,
+    spread_pct_at_entry REAL,
+    bid_at_exit REAL,
+    ask_at_exit REAL,
+    spread_pct_at_exit REAL,
+    broker_order_id TEXT,
+    broker TEXT,
+    order_request_time TEXT,
+    order_response_time TEXT,
+    fill_time TEXT,
+    execution_latency_ms REAL,
     FOREIGN KEY (analysis_id) REFERENCES analyses(id)
 );
 
@@ -162,6 +178,23 @@ class Storage:
         We list the columns each table should have and add anything missing.
         """
         targets = {
+            "trades": [
+                ("expected_entry_price", "REAL"),
+                ("actual_fill_price", "REAL"),
+                ("slippage", "REAL"),
+                ("bid_at_entry", "REAL"),
+                ("ask_at_entry", "REAL"),
+                ("spread_pct_at_entry", "REAL"),
+                ("bid_at_exit", "REAL"),
+                ("ask_at_exit", "REAL"),
+                ("spread_pct_at_exit", "REAL"),
+                ("broker_order_id", "TEXT"),
+                ("broker", "TEXT"),
+                ("order_request_time", "TEXT"),
+                ("order_response_time", "TEXT"),
+                ("fill_time", "TEXT"),
+                ("execution_latency_ms", "REAL"),
+            ],
             "predictions": [
                 ("spread_at_entry", "REAL"),
                 ("spread_at_exit", "REAL"),
@@ -244,18 +277,54 @@ class Storage:
         opened_at: datetime,
         analysis_id: int | None = None,
         note: str | None = None,
+        *,
+        # Spec §12 / §16: the execution audit. All optional so PaperBroker
+        # tests and pre-existing callers keep working unchanged.
+        broker: str | None = None,
+        expected_entry_price: float | None = None,
+        actual_fill_price: float | None = None,
+        slippage: float | None = None,
+        bid_at_entry: float | None = None,
+        ask_at_entry: float | None = None,
+        spread_pct_at_entry: float | None = None,
+        broker_order_id: str | None = None,
+        order_request_time: datetime | None = None,
+        order_response_time: datetime | None = None,
+        fill_time: datetime | None = None,
+        execution_latency_ms: float | None = None,
     ) -> int:
         with self._conn() as conn:
             cur = conn.execute(
                 """INSERT INTO trades
-                   (opened_at, symbol, side, entry, size, analysis_id, note)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (opened_at.isoformat(), symbol, side, entry, size, analysis_id, note),
+                   (opened_at, symbol, side, entry, size, analysis_id, note,
+                    broker, expected_entry_price, actual_fill_price, slippage,
+                    bid_at_entry, ask_at_entry, spread_pct_at_entry,
+                    broker_order_id, order_request_time, order_response_time,
+                    fill_time, execution_latency_ms)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    opened_at.isoformat(), symbol, side, entry, size,
+                    analysis_id, note, broker,
+                    expected_entry_price, actual_fill_price, slippage,
+                    bid_at_entry, ask_at_entry, spread_pct_at_entry,
+                    broker_order_id,
+                    order_request_time.isoformat() if order_request_time else None,
+                    order_response_time.isoformat() if order_response_time else None,
+                    fill_time.isoformat() if fill_time else None,
+                    execution_latency_ms,
+                ),
             )
             return cur.lastrowid
 
     def close_trade(
-        self, trade_id: int, exit_price: float, closed_at: datetime
+        self,
+        trade_id: int,
+        exit_price: float,
+        closed_at: datetime,
+        *,
+        bid_at_exit: float | None = None,
+        ask_at_exit: float | None = None,
+        spread_pct_at_exit: float | None = None,
     ) -> None:
         with self._conn() as conn:
             row = conn.execute(
@@ -266,9 +335,15 @@ class Storage:
             direction = 1 if row["side"] == "BUY" else -1
             pnl = (exit_price - row["entry"]) * row["size"] * direction
             conn.execute(
-                """UPDATE trades SET exit = ?, closed_at = ?, pnl = ?
+                """UPDATE trades SET exit = ?, closed_at = ?, pnl = ?,
+                          bid_at_exit = ?, ask_at_exit = ?,
+                          spread_pct_at_exit = ?
                    WHERE id = ?""",
-                (exit_price, closed_at.isoformat(), pnl, trade_id),
+                (
+                    exit_price, closed_at.isoformat(), pnl,
+                    bid_at_exit, ask_at_exit, spread_pct_at_exit,
+                    trade_id,
+                ),
             )
 
     def save_backtest(

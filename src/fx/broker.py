@@ -58,6 +58,71 @@ class OpenPosition:
         return (current_price - self.entry) * self.size * direction
 
 
+@dataclass(frozen=True)
+class ExecutionFill:
+    """Everything we need to audit a real fill (spec §12 / §16).
+
+    Captured at place_order time and stashed on the broker as
+    `last_fill`. Persisted by `cmd_trade` into the trades table so the
+    weekly review can compute slippage and execution-latency stats
+    without depending on broker logs.
+
+    `expected_entry_price` is the price the engine asked for. The diff
+    against `actual_fill_price` is the slippage we paid.
+    """
+
+    symbol: str
+    side: str                       # BUY | SELL
+    expected_entry_price: float
+    actual_fill_price: float
+    size: float
+    bid: float | None
+    ask: float | None
+    spread_pct: float | None
+    broker_order_id: str | None
+    order_request_time: datetime
+    order_response_time: datetime
+    fill_time: datetime
+
+    @property
+    def slippage(self) -> float:
+        """Signed slippage in price units (positive = paid more than expected)."""
+        sign = 1 if self.side == "BUY" else -1
+        return sign * (self.actual_fill_price - self.expected_entry_price)
+
+    @property
+    def slippage_pct(self) -> float | None:
+        if self.expected_entry_price <= 0:
+            return None
+        return 100.0 * self.slippage / self.expected_entry_price
+
+    @property
+    def execution_latency_ms(self) -> float:
+        return max(
+            0.0,
+            (self.order_response_time - self.order_request_time).total_seconds() * 1000.0,
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "symbol": self.symbol,
+            "side": self.side,
+            "expected_entry_price": self.expected_entry_price,
+            "actual_fill_price": self.actual_fill_price,
+            "size": self.size,
+            "bid": self.bid,
+            "ask": self.ask,
+            "spread_pct": self.spread_pct,
+            "broker_order_id": self.broker_order_id,
+            "order_request_time": self.order_request_time.isoformat(),
+            "order_response_time": self.order_response_time.isoformat(),
+            "fill_time": self.fill_time.isoformat(),
+            "slippage": self.slippage,
+            "slippage_pct": self.slippage_pct,
+            "execution_latency_ms": self.execution_latency_ms,
+        }
+
+
 @dataclass
 class ClosedPosition:
     id: int
@@ -72,6 +137,14 @@ class ClosedPosition:
 
 
 class Broker(ABC):
+    """Broker interface.
+
+    Concrete implementations should also expose a `last_fill` attribute
+    (or override `last_execution_fill()`) so callers can persist the
+    full execution audit (spec §12 / §16). The base class returns None
+    by default.
+    """
+
     @abstractmethod
     def balance(self) -> float: ...
 
@@ -105,6 +178,10 @@ class Broker(ABC):
         """
         return None
 
+    def last_execution_fill(self) -> ExecutionFill | None:
+        """Return the ExecutionFill from the most recent place_order, if any."""
+        return getattr(self, "last_fill", None)
+
 
 @dataclass
 class PaperBroker(Broker):
@@ -120,6 +197,7 @@ class PaperBroker(Broker):
     _positions: dict[int, OpenPosition] = field(default_factory=dict)
     _closed: list[ClosedPosition] = field(default_factory=list)
     _next_id: int = 1
+    last_fill: ExecutionFill | None = None
 
     def __post_init__(self) -> None:
         self._cash = self.initial_cash
@@ -148,18 +226,30 @@ class PaperBroker(Broker):
             raise ValueError("size must be positive")
         if price <= 0:
             raise ValueError("price must be positive")
+        now = datetime.now(timezone.utc)
         pos = OpenPosition(
             id=self._next_id,
             symbol=symbol,
             side=side,
             entry=price,
             size=size,
-            opened_at=datetime.now(timezone.utc),
+            opened_at=now,
             stop=stop,
             take_profit=take_profit,
         )
         self._positions[pos.id] = pos
         self._next_id += 1
+        # Synthetic fill: zero spread, zero slippage, zero latency.
+        # Production callers MUST distinguish paper from real fills via
+        # `broker_order_id` (None here vs. an OANDA-issued id) when
+        # interpreting trade analytics.
+        self.last_fill = ExecutionFill(
+            symbol=symbol, side=side,
+            expected_entry_price=price, actual_fill_price=price,
+            size=size, bid=price, ask=price, spread_pct=0.0,
+            broker_order_id=None,
+            order_request_time=now, order_response_time=now, fill_time=now,
+        )
         return pos
 
     def close_position(self, position_id: int, price: float) -> ClosedPosition:

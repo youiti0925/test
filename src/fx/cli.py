@@ -460,10 +460,37 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
         stop=plan.stop,
         take_profit=plan.take_profit,
     )
+
+    # Persist the trade row with the full execution audit. The fill
+    # object is None for old broker implementations that haven't been
+    # upgraded — we still save the trade, just without the audit.
+    fill = broker.last_execution_fill()
+    trade_id = storage.save_trade(
+        symbol=args.symbol,
+        side=plan.side,
+        entry=fill.actual_fill_price if fill else plan.entry,
+        size=plan.size,
+        opened_at=fill.fill_time if fill else pos.opened_at,
+        analysis_id=None,
+        note=decision.reason,
+        broker=args.broker,
+        expected_entry_price=fill.expected_entry_price if fill else plan.entry,
+        actual_fill_price=fill.actual_fill_price if fill else None,
+        slippage=fill.slippage if fill else None,
+        bid_at_entry=fill.bid if fill else None,
+        ask_at_entry=fill.ask if fill else None,
+        spread_pct_at_entry=fill.spread_pct if fill else None,
+        broker_order_id=fill.broker_order_id if fill else None,
+        order_request_time=fill.order_request_time if fill else None,
+        order_response_time=fill.order_response_time if fill else None,
+        fill_time=fill.fill_time if fill else None,
+        execution_latency_ms=fill.execution_latency_ms if fill else None,
+    )
     _print(
         {
             "mode": "live",
             "broker": args.broker,
+            "trade_id": trade_id,
             "position": {
                 "id": pos.id,
                 "symbol": pos.symbol,
@@ -473,6 +500,7 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
                 "stop": pos.stop,
                 "take_profit": pos.take_profit,
             },
+            "fill": fill.to_dict() if fill else None,
             "plan": plan.to_dict(),
         }
     )
