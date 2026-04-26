@@ -1,7 +1,8 @@
-"""Gunicorn entry point.
+"""Gunicorn / Flask entry point.
 
-Wires the existing `Procfile` (`gunicorn sample:app`) to the new FX
-dashboard. Local dev: `python sample.py` runs Flask's debug server.
+Local dev: `python sample.py` runs Flask's debug server on :5000.
+For production-style deploy: `gunicorn sample:app --log-file=-`
+(the project no longer ships a Procfile; pick your own deploy target).
 """
 from src.fx.web import create_app
 
