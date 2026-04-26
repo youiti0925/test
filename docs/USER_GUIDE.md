@@ -120,14 +120,35 @@ python -m src.fx.cli lessons --symbol USDJPY=X
 |---------|-----|----------------|
 | `analyze` | 1回の分析 + 反証可能予測を保存 | `--symbol`, `--interval`, `--period`, `--no-llm`, `--no-news`, `--no-correlation`, `--no-events`, `--no-lessons`, `--no-sentiment` |
 | `watch` | analyzeを定期実行 | 上記 + `--every <秒>` |
-| `backtest` | 過去データで戦略を再生 | `--symbol`, `--period`, `--start`, `--end`, `--warmup` |
+
+### バックテスト二系統
+
+| コマンド | 用途 |
+|---------|-----|
+| `backtest` | 過去データを **テクニカル素** で再生 (ベースライン比較用) |
+| `backtest-engine` | 過去データを **本番Decision Engine + Risk Gate** で再生 (spec §4) |
+
+`backtest-engine` の出力には `hold_reasons` が含まれ、ゲートが何回・
+何で止めたかが集計されます。普段の判断はこちらを基準に。
+
+### 研究 (Phase B〜D)
+
+| コマンド | 用途 |
+|---------|-----|
+| `build-timeline` | OHLCV + テクニカル + パターン + 上位足 + イベント + マクロ + decision を **point-in-time** で1表に (spec §5) |
+| `event-overlay` | FOMC/BOJ/CPI/NFP 前後の値動き集計 (spec §6) |
+| `waveform-build-library` | 過去波形をスライディングで JSONL に蓄積 (spec §7.2) |
+| `waveform-match` | 現在波形 → 類似過去波形 → 方向バイアス (spec §7.3) |
+| `attribution-report` | 大きい move の **原因候補** を closed taxonomy でランキング (spec §8) |
+| `calibrate` | パラメータ走査 → **安定性スコアで** ランキング (spec §10) |
+| `compare-external` | 外部ベンダー CSV と engine 予測を突き合わせ (spec §9) |
 
 ### 学習ループ
 
 | コマンド | 用途 |
 |---------|-----|
 | `evaluate` | 期日経過した PENDING 予測を実価格と照合 → CORRECT/PARTIAL/WRONG/INCONCLUSIVE |
-| `postmortem` | WRONG だった予測に Claude を通して原因分析 |
+| `postmortem` | WRONG だった予測に Claude を通して原因分析 (`blocked_by`/`rule_chain`/`pattern`/`event_risk`/`spread`/`risk_reward` を `context_json` に保存) |
 | `lessons` | 蓄積した教訓のサマリ + シンボル別最近のレッスン |
 | `review` | 過去トレード全体を Claude にレビューさせる(週次) |
 
@@ -135,9 +156,15 @@ python -m src.fx.cli lessons --symbol USDJPY=X
 
 | コマンド | 用途 |
 |---------|-----|
-| `trade` | analyze → リスクプラン → (任意で) 発注 |
+| `trade` | analyze → Decision Engine → リスクプラン → (任意で) 発注 |
 | | `--broker paper` (デフォルト) または `--broker oanda --confirm-demo` (デモ口座のみ) |
 | | `--dry-run` で発注せず計画だけ表示 |
+
+OANDA 経路 (`--broker oanda`) では:
+* 起動時に `data/events.json` の鮮度をチェックし、stale/欠落なら HOLD
+* 発注前に Bid/Ask を取得 (取れなければ発注拒否)
+* 約定後、実 fill 価格・スリッページ・レイテンシ・broker_order_id を
+  `trades` テーブルに自動保存
 
 ### 補助
 
@@ -148,6 +175,35 @@ python -m src.fx.cli lessons --symbol USDJPY=X
 | `sentiment-show` | キャッシュ済みスナップショットを表示 |
 
 各コマンドに `--help` を付けると詳細オプションが出ます。
+
+### 典型的な研究ワークフロー
+
+```bash
+# 1. 経済カレンダーを seed (もしくは自前 JSON を data/events.json に置く)
+python -m src.fx.cli calendar-seed
+
+# 2. 本番ルールでバックテスト
+python -m src.fx.cli backtest-engine --symbol USDJPY=X --interval 1h --period 180d
+
+# 3. 同じ期間で hold_reasons を見て、何が止めてるか把握
+#    (上の出力に metrics.hold_reasons がある)
+
+# 4. パラメータをグリッド走査して安定性スコアで比較
+python -m src.fx.cli calibrate --symbol USDJPY=X \
+    --stop-atr 1.5 2.0 2.5 --tp-atr 2.5 3.0 3.5
+
+# 5. 大きい move の原因候補ランキング
+python -m src.fx.cli attribution-report --symbol USDJPY=X --top-n 10
+
+# 6. CPI 前後の値動きアグリゲート
+python -m src.fx.cli event-overlay --symbol USDJPY=X --event CPI --period 2y
+
+# 7. 波形ライブラリを構築 → 現在波形を照合
+python -m src.fx.cli waveform-build-library \
+    --symbol USDJPY=X --period 2y --output data/waveforms/lib.jsonl
+python -m src.fx.cli waveform-match \
+    --symbol USDJPY=X --library data/waveforms/lib.jsonl --horizon 24
+```
 
 ---
 
@@ -283,12 +339,23 @@ python -m src.fx.cli analyze --symbol USDJPY=X
 
 ## 10. 安全に運用するためのチェックリスト
 
-- [ ] バックテストで PF > 1.3 / 最大 DD < 20% を確認した
+- [ ] **`backtest-engine` で** PF > 1.3 / 最大 DD < 20% を確認した
+      (`backtest` 単独ではなく Decision Engine 経由で)
+- [ ] `metrics.hold_reasons` を見て、ゲートが何を止めているか把握した
+- [ ] `calibrate` で **安定性スコア** (`stability_score`) ベースに
+      パラメータを選んだ (収益最大ではなく)
 - [ ] ペーパートレード (`--broker paper`) で 1ヶ月以上動かした
-- [ ] `lessons` の集計を見て、システムプロンプトを 1 回以上チューニングした
+- [ ] `lessons` の集計と `postmortem` の `context_json` を見て、
+      システムプロンプトを 1 回以上チューニングした
+- [ ] **`data/events.json` を毎日更新する仕組み** (cron + 自前
+      フィード) を整えた (live broker は stale で発注しない)
 - [ ] OANDA demo の鍵を `.env` に入れて gitignore してある
 - [ ] `git status` で `.env` が「Untracked」「Ignored」のどちらかになっている
 - [ ] cron 実行時のログを `>> /var/log/fx.log 2>&1` に流して**過去ログを残している**
+- [ ] `trade --broker oanda --dry-run` で **fill オーディット**
+      (Bid/Ask, slippage, latency) が想定通り出ることを確認した
+- [ ] `compare-external` で外部ベンダーとの一致率を一度測った
+      (盲目的に追従しないため)
 
 これらをクリアしてから初めて、デモ口座での発注を検討する流れを推奨します。
 本番(リアルマネー)は **自己責任** で。

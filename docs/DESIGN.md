@@ -15,6 +15,11 @@
 7. 拡張ポイント (新ソース・新ブローカー追加)
 8. セキュリティ
 9. 既知の制限と非目標
+10. バックテスト二系統 (`backtest` / `backtest-engine`)
+11. 市場タイムライン + イベント・オーバーレイ + マクロ
+12. 波形マッチング (matcher / library / backtest)
+13. アトリビューション・キャリブレーション・外部比較
+14. 実約定オーディット (Bid/Ask、スプレッド、スリッページ、レイテンシ)
 
 ---
 
@@ -840,18 +845,28 @@ export FX_RULE_VERSION="$(git rev-parse --short HEAD)"
 | LLM コスト | Opus 4.7 で 1 回 ~$0.05;cron で頻繁に回すと月 $10〜30 | プロンプトキャッシュ + Haiku 使い分けで軽減 |
 | 同時実行 | SQLite は 1 writer のみ; 複数 cron が同時 `analyze` するとロック発生 | プロセスを直列化 (cron で `flock` 等) |
 
-### 9.3 仕様書の完了条件 (§17) と本実装の対応
+### 9.3 仕様書の完了条件 (§17/§19) と本実装の対応
 
-| 仕様書 §17 の条件 | 本実装 |
+| 仕様書 §17 / §19 の条件 | 本実装 |
 |------------------|------|
 | Risk Gate NG 時に BUY/SELL が絶対に出ない | `test_ai_cannot_override_risk_gate` 含む 3 テスト |
 | FOMC・日銀・CPI・PCE・雇用統計の前後で HOLD | `test_fomc_forces_hold` / `test_boj_forces_hold` / `test_high_impact_event_forces_hold` |
 | 三山候補だけでは SELL せず、ネックライン割れ後のみ | `test_triple_top_requires_neckline_break` |
 | SNS データだけでは BUY/SELL にならない | `test_sentiment_alone_never_trades` |
-| AI が BUY/SELL しても、固定ルール違反なら HOLD | Decision Engine 全体の構造 + `test_ai_cannot_override_risk_gate` |
+| AI が BUY/SELL しても、固定ルール違反なら HOLD | `test_ai_cannot_override_risk_gate` |
 | すべての判断理由がログに残る | `Decision.reason` + `blocked_by` + `rule_chain` + analyses テーブル |
-| バックテストで未来参照がないことをテストで示す | `test_patterns_no_future_leak` + `test_backtest_never_peeks_at_future` |
-| 実発注は OFF のまま、デモ検証に進める状態 | `OANDABroker` 3 重ロック維持 |
+| バックテストで未来参照がないこと | `test_patterns_no_future_leak` + `test_engine_backtest_no_future_leak` + `test_timeline_no_future_leak_in_decision_column` |
+| 実発注は OFF のまま、デモ検証に進める状態 | `OANDABroker` 3 重ロック + `require_spread` |
+| バックテストと trade/analyze が同じロジック | backtest_engine が `decide()` 直接呼出し |
+| events.json 古い/欠損で live は HOLD | `test_gate_blocks_when_calendar_required_and_stale` |
+| spread_pct が None で live 発注しない | `test_gate_require_spread_blocks_without_quote` |
+| 波形マッチだけでは BUY/SELL しない | `test_waveform_alone_never_trades_when_technical_is_hold` |
+| DTW で時間軸ズレに寛容 | `test_dtw_more_tolerant_than_correlation_to_small_warp` |
+| 価格水準違いでも形が同じなら類似 | `test_signature_same_shape_different_level_is_similar` |
+| 過去波形の future_return を signature に混ぜない | `test_build_library_signature_window_excludes_future_labels` |
+| イベント発表前判断に発表後の値を使わない | `test_overlay_no_future_leak_in_returns` (after_24h はイベント以降のみ) |
+| postmortem に blocked_by/rule_chain が残る | `test_postmortem_persists_context_json` |
+| Calibration は最良収益だけを採用しない | `test_calibrate_best_is_highest_stability_score` + `test_stability_score_penalises_drawdown` |
 
 ### 9.4 残課題 (将来作業)
 
@@ -863,6 +878,288 @@ export FX_RULE_VERSION="$(git rev-parse --short HEAD)"
 * 1日損失上限 / 連敗上限の自動計算 (現状 `RiskState` に手で渡す)
 * デモ口座の往復テスト (PaperBroker で実装済みだが、OANDA 実 demo
   との突き合わせは未)
+* `StrategyConfig` を `decide()` に直結する (現状 calibration では
+  使うが、ライブパスは引数固定)
+
+---
+
+## §10 バックテスト二系統 (`backtest` / `backtest-engine`)
+
+### 10.1 設計動機
+
+仕様書 §4 の要件は「本番の Decision Engine + Risk Gate と同じ判断で
+過去検証する」こと。だが「テクニカル単独で見たら何回エントリーする?」
+というベースラインも研究上は欲しい。両方残し、差分で **ゲートが何を
+止めているか** を見えるようにした。
+
+### 10.2 `src/fx/backtest.py` (旧)
+
+* シグナル関数: `technical_signal` 一本
+* スプレッド・スリッページなし (純粋にチャートだけ)
+* CLI: `python -m src.fx.cli backtest`
+* 用途: テクニカル素のベースライン
+
+### 10.3 `src/fx/backtest_engine.py` (新)
+
+* シグナル関数: `decision_engine.decide(...)`
+* バーごとに本番と同じ Risk Gate / patterns / 上位足 / risk_reward
+  を通す
+* `events` パラメータでマクロイベントを投入 (±48h で gate に渡る)
+* `EngineBacktestResult.metrics()` に `hold_reasons` を含む
+  (`event_high`, `data_quality`, `spread_unavailable`, ...)
+  → ゲートが何回・何で止めたかが追える
+* point-in-time: `df.iloc[: i + 1]` のみ参照、`patterns.detect_swings`
+  と同じ未来参照防止ロジック
+* CLI: `python -m src.fx.cli backtest-engine`
+
+### 10.4 結果の比較ポイント
+
+| 観点 | `backtest` | `backtest-engine` |
+|------|-----------|-------------------|
+| エントリー数 | 多い (テクニカルだけで判断) | 少ない (ゲートで弾かれる) |
+| 平均勝率 | やや低 | やや高 (悪条件を避ける) |
+| 最大DD | 大きい | 小さい |
+| `hold_reasons` | なし | あり (改善のヒント) |
+
+両方で同じ期間を回し、`hold_reasons` を見て「何が一番足を引っ張ってるか」
+を判定する。
+
+---
+
+## §11 市場タイムライン + イベント・オーバーレイ + マクロ
+
+### 11.1 `src/fx/macro.py`
+
+* yfinance から `^TNX` (US 10Y), `^FVX` (短期金利), `DX-Y.NYB` (DXY),
+  `^N225`, `^GSPC`, `^IXIC`, `^VIX` を取得
+* `MacroSnapshot.value_at(slot, ts)` は `Series.asof(ts)` で
+  「観測時点までの最新値」のみ返す → point-in-time
+* yields は yfinance の慣習で ×10 (4.25% が 42.5) なので /10 して
+  通常の % に戻す
+* fetch失敗は `fetch_errors` に積む (silent zeroにしない)
+
+### 11.2 `src/fx/market_timeline.py`
+
+仕様書 §5 の `MarketTimelineRow` を実装。1バー = 1行。
+
+各列:
+
+* **OHLCV**: open/high/low/close/volume
+* **テクニカル**: technical_snapshot, technical_signal
+* **パターン**: pattern_summary, swing_structure, market_structure,
+  detected_pattern, trend_state
+* **上位足**: higher_timeframe_trend (`_resample_higher_tf`)
+* **イベント**: economic_events_nearby (±24h), event_risk_level
+* **マクロ**: us10y, us_short_yield_proxy, yield_spread, dxy,
+  nikkei, sp500, nasdaq, vix
+* **センチメント (現バーのみ)**: sentiment_score, sentiment_volume,
+  sentiment_keywords
+* **スプレッド (現バーのみ)**: bid, ask, spread_pct
+* **エンジン出力**: final_decision_action, blocked_by, rule_chain
+
+### 11.3 `src/fx/event_overlay.py`
+
+仕様書 §6 のイベント別リターン集計。
+
+* イベント時刻 ±N時間のバーから return を計算
+* `before_30m / before_2h / after_30m / after_1h / after_4h / after_24h`
+  の return %
+* `max_favorable_after_pct / max_adverse_after_pct` (24h)
+* `atr_multiple_after`: |return_24h| / ATR (規模感)
+* `volatility_spike`: round-trip > 2×ATR
+* `KEYWORD_MAP` で `FOMC / BOJ / CPI / NFP / ...` を closed taxonomy で分類
+* CLI: `python -m src.fx.cli event-overlay --event CPI --period 2y`
+
+### 11.4 重要不変条件
+
+* タイムラインを途中で trim しても、各行の `final_decision_action`
+  は full run と一致する (`test_timeline_no_future_leak_in_decision_column`)
+* macro 列は `asof` で観測時点までの最新値のみ
+  (`test_timeline_macro_columns_use_asof`)
+* event_overlay の `after_24h` はイベント時刻以降のバーのみ参照
+  (`test_overlay_no_future_leak_in_returns`)
+
+---
+
+## §12 波形マッチング (matcher / library / backtest)
+
+### 12.1 `src/fx/waveform_matcher.py`
+
+* 正規化: `z_score / start_price / atr / min_max`
+  (z_score は価格水準・スケールに不変)
+* 類似度プリミティブ: `cosine_similarity`, `correlation_similarity`,
+  `dtw_distance`, `dtw_similarity`
+* DTW は Sakoe-Chiba band (`window_ratio=0.1`) で近接セルのみ計算
+* `structure_similarity`: HH/HL/LH/LL の末尾 N 個 position-wise 一致率
+* `WaveformSignature` (vector + structure + trend + pattern + length)
+* `similarity(a, b, method=, structure_weight=)`: shape * (1-w) + struct * w
+
+### 12.2 `src/fx/waveform_library.py`
+
+* `build_library(df, window_bars=, step_bars=, forward_horizons=, normalize=)`
+  でスライディングウィンドウから `WaveformSample` を生成
+* signature は [start, end), forward_returns_pct は [end, end+horizon)
+  を見る → **signature と label が時間的に重ならない**
+* JSONL 永続化: `write_library / read_library / append=`
+
+### 12.3 `src/fx/waveform_backtest.py`
+
+* `find_similar(target, library, method=, top_k=, min_score=)`
+* `aggregate_bias(matches, horizon_bars=, min_sample_count=,
+  min_directional_share=, neutral_band_pct=)` → `WaveformBias`
+* 厳格ルール:
+  * `< min_sample_count` 件しかマッチしなければ `HOLD, conf=0`
+  * confidence は `min(directional_share, share * avg_score)`
+    (60/40 split は 60% を超えない)
+  * `min_directional_share` 未満なら `HOLD`
+
+### 12.4 Decision Engine への組み込み (advisory only)
+
+`decide(..., waveform_bias=)` を追加。仕様書 §7.4 のルール:
+
+* テクニカル `HOLD` のとき waveform `BUY` でも入らない
+  (`test_waveform_alone_never_trades_when_technical_is_hold`)
+* テクニカルと waveform が**逆方向**なら veto して HOLD
+  (`test_waveform_disagreement_vetoes_to_hold`)
+* テクニカルと waveform が**同方向**なら confidence を最大 +0.05 *
+  waveform.conf 上げる (上限 0.95)
+* Risk Gate は waveform より優先
+  (`test_risk_gate_still_wins_over_waveform_buy`)
+
+CLI:
+* `python -m src.fx.cli waveform-build-library`
+* `python -m src.fx.cli waveform-match`
+
+---
+
+## §13 アトリビューション・キャリブレーション・外部比較
+
+### 13.1 `src/fx/attribution.py` (仕様書 §8)
+
+「この値動きの原因は X だ」とは断定しない。**候補を closed taxonomy
+でランキング** する。
+
+`ATTRIBUTION_CODES`:
+```
+TECHNICAL_PATTERN, CPI_SURPRISE, PCE_SURPRISE, FOMC_RISK,
+BOJ_EVENT, NFP_RISK, RATE_DECISION, YIELD_MOVE, DXY_MOVE,
+RISK_ON_OFF, NEWS_SPIKE, SENTIMENT_SPIKE, SPREAD_SPIKE, UNKNOWN
+```
+
+`attribute_move(move_pct, events_nearby=, pattern=, macro_changes_pct=,
+sentiment_snapshot=, news_volume_z=, spread_pct=, spread_baseline_pct=)`
+→ `AttributionResult(candidates, top, notable)`
+
+* `weight ∈ [0, 1]` は確率ではなく相対的確信度
+* 複数候補が同時に高 weight になることを許す (実際の市場が confounded だから)
+* `notable_threshold_pct` 未満の小さい move は `notable=False`
+* CLI: `python -m src.fx.cli attribution-report --top-n 10`
+
+### 13.2 `src/fx/strategy_config.py` + `src/fx/calibration.py` (仕様書 §10)
+
+#### 設定束ね
+
+`StrategyConfig` (型付き) の dataclass 構造:
+```
+SwingConfig / RiskConfig / EventsConfig / SpreadConfig / WaveformConfig
+```
+YAML ⇄ JSON 双方向 (`StrategyConfig.write / load`).
+
+#### 安定性スコア
+
+```
+score = clamp(total_return / 50, -1, 1)
+      + 0.5 * clamp(profit_factor / 2, 0, 1)
+      - 0.5 * clamp(|max_drawdown| / 30, 0, 1)
+      - 0.2 * clamp(max_consecutive_losses / 10, 0, 1)
+      + 0.2 * clamp(n_trades / 50, 0, 1)
+```
+
+→ **収益最大ではなく安定最良** をランキング (仕様書 §10 の方針)
+
+#### Sweep
+
+* `SWEEP_KEYS = ("stop_atr", "tp_atr", "max_holding_bars", "warmup",
+  "use_higher_tf")` のみ受け付ける (探索面を明示)
+* CLI: `python -m src.fx.cli calibrate --stop-atr 1.5 2.0 2.5 --tp-atr 2.5 3.0 3.5`
+
+### 13.3 `src/fx/external/` (仕様書 §9)
+
+* `ExternalSignal`: 外部 (QuantConnect / TrendSpider / EconPulse /
+  StockGeist) の signal を統一ラッパで保存
+* `read_external_csv(path, source=)`: 列エイリアス対応
+  (ticker/symbol, time/timestamp, signal/action, ...)
+* `compare_signals(self_decisions, externals, pair_within=)`:
+  (symbol, ~timestamp) でペアリング
+* `aggregate_comparisons`: source 別 action_match_rate /
+  self_only_directional / external_only_directional
+* **スクレイピングなし**。CSV / Webhook / API のみ (利用規約遵守)
+* CLI: `python -m src.fx.cli compare-external --external-csv vendor.csv --source x`
+
+---
+
+## §14 実約定オーディット (spec §12 / §16)
+
+### 14.1 `ExecutionFill` dataclass (`src/fx/broker.py`)
+
+毎回の `place_order` で記録するもの:
+
+| フィールド | 用途 |
+|---|---|
+| `expected_entry_price` | 注文要求価格 (engine が出した) |
+| `actual_fill_price` | 実約定価格 (broker が返した) |
+| `bid` / `ask` / `spread_pct` | 注文時の Bid/Ask 観測 |
+| `broker_order_id` | OANDA 等が払い出した ID |
+| `order_request_time` | 注文送信時刻 |
+| `order_response_time` | 応答受信時刻 |
+| `fill_time` | 約定時刻 (broker side) |
+| `slippage` (派生) | `sign(side) * (actual - expected)` |
+| `slippage_pct` (派生) | `100 * slippage / expected` |
+| `execution_latency_ms` (派生) | `response - request` |
+
+* PaperBroker は zero-spread / zero-slippage / zero-latency で `last_fill` を埋める
+  (オフライン研究用)
+* OANDABroker は v20 の `orderFillTransaction.price` から `actual_fill_price` を取得
+  (フォールバックとして pre-trade quote)
+* base class に `last_execution_fill()` メソッド (default `getattr(self, 'last_fill', None)`)
+
+### 14.2 `trades` テーブル拡張
+
+```
+expected_entry_price, actual_fill_price, slippage,
+bid_at_entry, ask_at_entry, spread_pct_at_entry,
+bid_at_exit, ask_at_exit, spread_pct_at_exit,
+broker_order_id, broker,
+order_request_time, order_response_time, fill_time,
+execution_latency_ms
+```
+
+すべて nullable (PaperBroker や旧テストの後方互換維持)。
+`storage._migrate(conn)` で既存 DB に idempotent ALTER TABLE 追加。
+
+### 14.3 `cmd_trade` での自動永続化
+
+```python
+fill = broker.last_execution_fill()
+trade_id = storage.save_trade(
+    ...,
+    broker=args.broker,
+    expected_entry_price=fill.expected_entry_price,
+    actual_fill_price=fill.actual_fill_price,
+    slippage=fill.slippage,
+    ...
+)
+```
+
+これにより**スリッページ・レイテンシ・実 Bid/Ask** が trades 行に
+自動で残り、weekly review で「想定通りの spread を払えたか?」を
+集計可能。
+
+### 14.4 Risk Gate との連動
+
+`require_spread=True` (live broker) では `spread_pct=None` のまま発注
+できない (§9.3 を再掲)。fill の `spread_pct` も `bid/ask` も None に
+なる経路は構造的にあり得ない。
 
 ---
 
