@@ -67,7 +67,12 @@ class EngineTrade:
     pnl: float
     return_pct: float
     bars_held: int
-    exit_reason: str  # stop | take_profit | max_holding | flip
+    # Possible values: "stop" | "take_profit" | "max_holding" | "end_of_data".
+    # NOTE: "flip" (close-on-opposite-signal) is INTENTIONALLY NOT
+    # implemented — the engine relies on stop / TP / max_holding to
+    # frame each trade. The legacy `backtest.py` is the flip-on-signal
+    # path; pick that if you want flip semantics for comparison.
+    exit_reason: str
     rule_chain: tuple[str, ...] = ()
     blocked_by: tuple[str, ...] = ()
 
@@ -155,9 +160,21 @@ def _resample_higher_tf(df_window: pd.DataFrame, base_interval: str) -> str:
     Resamples the in-memory window and re-runs `analyse` — keeps the
     backtest fully offline AND point-in-time. Returns "UNKNOWN" if the
     base interval has no entry in the map (e.g. unsupported TF).
+
+    Map mirrors the live-side `HIGHER_INTERVAL_MAP` so 30m/2h/4h
+    backtests don't silently degrade to UNKNOWN — pandas freq aliases
+    are spelled here (e.g. "4H" not "4h" since pandas needs uppercase
+    for the hour alias when not paired with "min"; "1W" for weekly).
     """
     rule = {
-        "1m": "15min", "5m": "1h", "15m": "4h", "1h": "1D", "1d": "1W",
+        "1m": "15min",
+        "5m": "1h",
+        "15m": "4h",
+        "30m": "4h",
+        "1h": "1D",
+        "2h": "1D",
+        "4h": "1W",
+        "1d": "1W",
     }.get(base_interval)
     if rule is None or len(df_window) < 30:
         return "UNKNOWN"

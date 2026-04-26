@@ -186,8 +186,18 @@ def _event_risk_label(events: list[Event]) -> str:
 
 
 def _resample_higher_tf(df_window: pd.DataFrame, base_interval: str) -> str:
+    # Mirror live-side HIGHER_INTERVAL_MAP: 30m/2h/4h were missing from
+    # the offline map, which silently turned the higher-TF gate into a
+    # no-op for those base intervals.
     rule = {
-        "1m": "15min", "5m": "1h", "15m": "4h", "1h": "1D", "1d": "1W",
+        "1m": "15min",
+        "5m": "1h",
+        "15m": "4h",
+        "30m": "4h",
+        "1h": "1D",
+        "2h": "1D",
+        "4h": "1W",
+        "1d": "1W",
     }.get(base_interval)
     if rule is None or len(df_window) < 30:
         return "UNKNOWN"

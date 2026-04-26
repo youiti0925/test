@@ -13,22 +13,30 @@ real entry. It consults inputs in spec-order:
     → Waveform-bias agreement (advisory only)
     → Action
 
-The LLM is an ADVISOR. It can:
-  * Justify or argue against a setup in the `reason` payload.
-  * Lower confidence (additive).
-But it CANNOT:
-  * Override the Risk Gate (test_ai_cannot_override_risk_gate pins this).
-  * Lift the action above HOLD when the rule engine says HOLD.
-  * Change the side from the technical signal (the engine ignores any
-    BUY/SELL the LLM puts when the rules don't support it).
+LLM authority — read carefully (asymmetric)
+-------------------------------------------
+The LLM is "advisory" only in one direction: it CANNOT lift HOLD into
+BUY/SELL, and it CANNOT change the side away from the technical signal.
 
-Waveform bias (spec §7.4) is also advisory:
+But it DOES have **veto power** in the conservative direction:
+  * `llm_signal.confidence < min_confidence` → HOLD
+  * `llm_signal.action != technical_signal` → HOLD
+
+So the accurate description is "LLM cannot start a trade, but it can
+stop one." This is intentional and matches the spec's
+"AIは保守的に止める権限を持つ" framing — the bot would rather miss
+a trade than enter one the LLM is unconfident about.
+
+What the LLM can NEVER do:
+  * Override the Risk Gate (test_ai_cannot_override_risk_gate pins this).
+  * Lift HOLD into BUY/SELL.
+  * Pick a direction the technical signal doesn't already favour.
+
+Waveform bias (spec §7.4) follows the same asymmetric pattern:
   * A BUY-only waveform_bias on a HOLD technical signal does NOT trade.
   * A waveform_bias agreeing with technical_signal is recorded in the
     advisory payload and contributes a small confidence bump.
-  * A waveform_bias DISAGREEING with the technical signal is treated
-    as a veto: HOLD with reason mentioning the disagreement. This is
-    the asymmetry that keeps the engine conservative.
+  * A waveform_bias DISAGREEING with the technical signal vetoes to HOLD.
 """
 from __future__ import annotations
 
@@ -165,7 +173,10 @@ def decide(
             advisory=_merge_advisory(llm_signal, waveform_bias),
         )
 
-    # ── LLM consensus (advisory only) ────────────────────────────────
+    # ── LLM consensus (asymmetric: can veto, cannot promote) ─────────
+    # Low confidence or disagreement with the technical signal blocks
+    # the trade; the LLM never lifts HOLD into BUY/SELL. See module
+    # docstring for the full asymmetry explanation.
     chain.append("llm_advisory")
     if llm_signal is not None:
         if llm_signal.confidence < min_confidence:
