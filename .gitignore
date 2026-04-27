@@ -7,3 +7,8 @@ data/*.sqlite
 .pytest_cache/
 .coverage
 *.egg-info/
+
+# decision_trace export artefacts (backtest-engine --trace-out / --trace-out-default).
+# Each run produces ~14 MB of decision_traces.jsonl plus run_metadata.json
+# and summary.json — generated artefacts, never committed.
+runs/
