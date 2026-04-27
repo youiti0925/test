@@ -28,6 +28,51 @@ from typing import Any, IO
 from .decision_trace import RULE_TAXONOMY
 
 
+# Sentinel used as the inner-dict factory for hold-reason aggregates so a
+# fresh row gets every sub-counter pre-allocated.
+def _new_hold_reason_row() -> dict[str, Any]:
+    return {
+        "n": 0,
+        "gate_effect": Counter(),
+        "outcome_if_technical_action_taken": Counter(),
+        "technical_only_action": Counter(),
+        # Running stats for hypothetical_technical_trade_return_pct so we
+        # don't keep every value in memory. Finalised in
+        # _finalise_cross_stats().
+        "_return_count": 0,
+        "_return_sum": 0.0,
+        "_return_min": None,
+        "_return_max": None,
+    }
+
+
+def _finalise_hold_reason_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Convert running counters/floats to the public output shape."""
+    n_with_return = row["_return_count"]
+    if n_with_return > 0:
+        avg = row["_return_sum"] / n_with_return
+        sum_pct = row["_return_sum"]
+        min_pct = row["_return_min"]
+        max_pct = row["_return_max"]
+    else:
+        avg = sum_pct = min_pct = max_pct = None
+    return {
+        "n": row["n"],
+        "gate_effect": dict(row["gate_effect"]),
+        "outcome_if_technical_action_taken": dict(
+            row["outcome_if_technical_action_taken"]
+        ),
+        "technical_only_action": dict(row["technical_only_action"]),
+        "return_stats": {
+            "n_with_return": n_with_return,
+            "avg_pct": avg,
+            "sum_pct": sum_pct,
+            "min_pct": min_pct,
+            "max_pct": max_pct,
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Hard caps so a giant run with pathological errors does not balloon RAM.
 # `*_total` keeps the precise count; the list keeps a representative sample.
@@ -111,6 +156,16 @@ def aggregate_stats(
     exit_reason_counter: Counter[str] = Counter()
 
     hold_reason_counter: Counter[str] = Counter()
+
+    # ── Cross-stats accumulators (PR #7) ─────────────────────────────────
+    # `hold_reason_outcome` — keyed by decision.reason for HOLD bars only.
+    # Each row carries Counters + running return stats so we never keep
+    # the per-bar values in memory.
+    hold_reason_aggregates: dict[str, dict[str, Any]] = {}
+    # `gate_effect_by_technical_action` and `final_action_by_outcome`
+    # apply to all bars regardless of final_action.
+    gate_effect_by_tech: dict[str, Counter[str]] = defaultdict(Counter)
+    final_action_by_outcome: dict[str, Counter[str]] = defaultdict(Counter)
 
     # Metadata accumulators
     schema_versions: set[str] = set()
@@ -244,6 +299,56 @@ def aggregate_stats(
                 if isinstance(outcome, str):
                     outcome_counter[outcome] += 1
 
+            # ── Cross-stats updates (PR #7) ──────────────────────────
+            # Read once per bar; the same fields are reused below. fo may
+            # be None or non-dict, in which case ge/outcome stay None so
+            # the cross counters bucket those bars under "MISSING_*".
+            fo_dict = fo if isinstance(fo, dict) else {}
+            ge_value = fo_dict.get("gate_effect") if isinstance(
+                fo_dict.get("gate_effect"), str
+            ) else None
+            outcome_value = fo_dict.get(
+                "outcome_if_technical_action_taken"
+            ) if isinstance(
+                fo_dict.get("outcome_if_technical_action_taken"), str
+            ) else None
+            return_value = fo_dict.get(
+                "hypothetical_technical_trade_return_pct"
+            )
+
+            # gate_effect × technical_only_action — all bars
+            if isinstance(tech_action, str) and ge_value is not None:
+                gate_effect_by_tech[tech_action][ge_value] += 1
+
+            # final_action × outcome_if_technical_action_taken — all bars
+            if isinstance(final_action, str) and outcome_value is not None:
+                final_action_by_outcome[final_action][outcome_value] += 1
+
+            # hold_reason_outcome — only HOLD bars
+            if final_action == "HOLD":
+                reason_str = decision.get("reason")
+                if isinstance(reason_str, str):
+                    row = hold_reason_aggregates.setdefault(
+                        reason_str, _new_hold_reason_row()
+                    )
+                    row["n"] += 1
+                    if ge_value is not None:
+                        row["gate_effect"][ge_value] += 1
+                    if outcome_value is not None:
+                        row["outcome_if_technical_action_taken"][
+                            outcome_value
+                        ] += 1
+                    if isinstance(tech_action, str):
+                        row["technical_only_action"][tech_action] += 1
+                    if isinstance(return_value, (int, float)):
+                        rv = float(return_value)
+                        row["_return_count"] += 1
+                        row["_return_sum"] += rv
+                        if row["_return_min"] is None or rv < row["_return_min"]:
+                            row["_return_min"] = rv
+                        if row["_return_max"] is None or rv > row["_return_max"]:
+                            row["_return_max"] = rv
+
             # ── Execution trace distributions ────────────────────────
             et = rec.get("execution_trace") or {}
             if isinstance(et.get("entry_executed"), bool):
@@ -339,6 +444,20 @@ def aggregate_stats(
             {"reason": r, "count": c}
             for r, c in hold_reason_counter.most_common(top_n_hold_reasons)
         ],
+        "cross_stats": {
+            "hold_reason_outcome": {
+                reason: _finalise_hold_reason_row(row)
+                for reason, row in hold_reason_aggregates.items()
+            },
+            "gate_effect_by_technical_action": {
+                tech: dict(counts)
+                for tech, counts in gate_effect_by_tech.items()
+            },
+            "final_action_by_outcome": {
+                action: dict(counts)
+                for action, counts in final_action_by_outcome.items()
+            },
+        },
         "consistency_checks": consistency_checks,
     }
 
