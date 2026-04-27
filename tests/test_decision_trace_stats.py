@@ -21,6 +21,12 @@ from src.fx.decision_trace_stats import (
 )
 
 
+# Resolve repo root so subprocess CLI invocations work on any host
+# (developer laptop, CI, container) — never hardcode an absolute path.
+# tests/ -> repo_root.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
 def _ohlcv(n: int, seed: int = 1) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     idx = pd.date_range("2025-01-01", periods=n, freq="1h", tz="UTC")
@@ -238,7 +244,7 @@ def _run_cli(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-m", "src.fx.cli", *args],
         capture_output=True, text=True,
-        cwd="/home/user/test",
+        cwd=REPO_ROOT,
     )
 
 
