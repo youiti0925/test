@@ -643,28 +643,43 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
         strategy="decision_engine",
         metrics=metrics,
     )
-    _print(
-        {
-            "symbol": args.symbol,
-            "interval": args.interval,
-            "period": f"{start_date} -> {end_date}",
-            "bars": len(df),
-            "metrics": metrics,
-            "last_5_trades": [
-                {
-                    "side": t.side,
-                    "entry": round(t.entry, 6),
-                    "exit": round(t.exit, 6),
-                    "return_pct": round(t.return_pct, 3),
-                    "bars_held": t.bars_held,
-                    "exit_reason": t.exit_reason,
-                    "entry_ts": str(t.entry_ts),
-                    "exit_ts": str(t.exit_ts),
-                }
-                for t in result.trades[-5:]
-            ],
-        }
-    )
+    payload = {
+        "symbol": args.symbol,
+        "interval": args.interval,
+        "period": f"{start_date} -> {end_date}",
+        "bars": len(df),
+        "metrics": metrics,
+        "last_5_trades": [
+            {
+                "side": t.side,
+                "entry": round(t.entry, 6),
+                "exit": round(t.exit, 6),
+                "return_pct": round(t.return_pct, 3),
+                "bars_held": t.bars_held,
+                "exit_reason": t.exit_reason,
+                "entry_ts": str(t.entry_ts),
+                "exit_ts": str(t.exit_ts),
+            }
+            for t in result.trades[-5:]
+        ],
+    }
+
+    if args.trace_out:
+        from .decision_trace_io import export_run
+        from pathlib import Path
+        try:
+            paths = export_run(
+                result,
+                out_dir=Path(args.trace_out),
+                overwrite=args.overwrite,
+                gzip=args.gzip,
+            )
+        except (FileExistsError, ValueError) as exc:
+            print(f"[error] trace export failed: {exc}", file=sys.stderr)
+            return 2
+        payload["trace_export"] = {k: str(v) for k, v in paths.items()}
+
+    _print(payload)
     return 0
 
 
@@ -1534,6 +1549,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Ignore data/events.json (skip macro-event gate)")
     be.add_argument("--no-higher-tf", action="store_true",
                     help="Skip higher-timeframe alignment check")
+    be.add_argument("--trace-out", default=None,
+                    help="Directory to write run_metadata.json / "
+                         "decision_traces.jsonl / summary.json. Skip the "
+                         "flag to disable export (default behaviour).")
+    be.add_argument("--overwrite", action="store_true",
+                    help="Allow --trace-out to overwrite existing files. "
+                         "Without this flag, any pre-existing output file "
+                         "in the target dir aborts the export.")
+    be.add_argument("--gzip", action="store_true",
+                    help="Write decision_traces.jsonl.gz instead of plain "
+                         "JSONL (only meaningful with --trace-out).")
     be.set_defaults(func=cmd_backtest_engine)
 
     r = sub.add_parser("review", help="Weekly self-review via Claude")
