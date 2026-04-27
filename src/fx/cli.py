@@ -665,12 +665,25 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
     }
 
     if args.trace_out:
+        trace_out_dir = Path(args.trace_out)
+    elif args.trace_out_default:
+        if result.run_metadata is None:
+            print(
+                "[error] --trace-out-default requires capture_traces=True "
+                "(run_metadata is None)",
+                file=sys.stderr,
+            )
+            return 2
+        trace_out_dir = Path("runs") / result.run_metadata.run_id
+    else:
+        trace_out_dir = None
+
+    if trace_out_dir is not None:
         from .decision_trace_io import export_run
-        from pathlib import Path
         try:
             paths = export_run(
                 result,
-                out_dir=Path(args.trace_out),
+                out_dir=trace_out_dir,
                 overwrite=args.overwrite,
                 gzip=args.gzip,
             )
@@ -1059,6 +1072,41 @@ def cmd_compare_external(args, cfg: Config, storage: Storage) -> int:
         "aggregate": aggregate_comparisons(cmps),
         "samples": [c.to_dict() for c in cmps[: args.show]],
     })
+    return 0
+
+
+def cmd_trace_stats(args, cfg: Config, storage: Storage) -> int:
+    """Aggregate a `decision_traces.jsonl` (or .jsonl.gz) into a JSON summary.
+
+    Errors raised by `aggregate_stats` (FileNotFoundError / ValueError)
+    propagate as stderr + exit 2. When parsing succeeded but malformed
+    lines were skipped, the stats JSON is still emitted to stdout AND
+    exit code is 2 so a downstream caller can detect the partial read.
+    """
+    from .decision_trace_stats import aggregate_stats
+    try:
+        stats = aggregate_stats(
+            args.path,
+            top_n_hold_reasons=args.top_hold_reasons,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"[error] trace-stats: {exc}", file=sys.stderr)
+        return 2
+
+    if args.pretty:
+        out = json.dumps(stats, indent=2, ensure_ascii=False, default=str)
+    else:
+        out = json.dumps(stats, ensure_ascii=False, default=str)
+    print(out)
+
+    errors_total = stats["consistency_checks"]["errors_total"]
+    if errors_total > 0:
+        print(
+            f"[warn] trace-stats: {errors_total} error(s) recorded; "
+            f"see consistency_checks.errors",
+            file=sys.stderr,
+        )
+        return 2
     return 0
 
 
@@ -1553,6 +1601,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Directory to write run_metadata.json / "
                          "decision_traces.jsonl / summary.json. Skip the "
                          "flag to disable export (default behaviour).")
+    be.add_argument("--trace-out-default", action="store_true",
+                    help="When --trace-out is omitted, write the trace "
+                         "artefacts to runs/<run_id>/. --trace-out wins "
+                         "if both are given.")
     be.add_argument("--overwrite", action="store_true",
                     help="Allow --trace-out to overwrite existing files. "
                          "Without this flag, any pre-existing output file "
@@ -1561,6 +1613,20 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Write decision_traces.jsonl.gz instead of plain "
                          "JSONL (only meaningful with --trace-out).")
     be.set_defaults(func=cmd_backtest_engine)
+
+    ts = sub.add_parser(
+        "trace-stats",
+        help="Aggregate a decision_traces.jsonl (or .gz) to a JSON summary",
+    )
+    ts.add_argument("path",
+                    help="Path to decision_traces.jsonl or .jsonl.gz")
+    ts.add_argument("--pretty", action="store_true",
+                    help="Pretty-print the output JSON (indent=2). "
+                         "Default is compact one-line JSON.")
+    ts.add_argument("--top-hold-reasons", type=int, default=10,
+                    help="Number of (reason, count) pairs to surface in "
+                         "top_hold_reasons (default 10).")
+    ts.set_defaults(func=cmd_trace_stats)
 
     r = sub.add_parser("review", help="Weekly self-review via Claude")
     r.add_argument("--limit", type=int, default=50)

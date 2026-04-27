@@ -1,8 +1,11 @@
 """Tests for decision_trace_io.export_run — JSONL/JSON disk export."""
 from __future__ import annotations
 
+import argparse
 import gzip
 import json
+import os
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -240,3 +243,102 @@ def test_gzip_writes_jsonl_gz_and_is_readable(tmp_path):
     s = json.loads(paths["summary"].read_text(encoding="utf-8"))
     assert s["export_gzip"] is True
     assert s["output_files"]["decision_traces"] == "decision_traces.jsonl.gz"
+
+
+# ─── --trace-out-default flag (new in PR #6) ────────────────────────────────
+
+
+def _build_be_namespace(**overrides):
+    """Build the argparse.Namespace `cmd_backtest_engine` consumes.
+
+    Only the fields the function reads are populated; defaults match
+    the argparse defaults defined in `cli.build_parser`.
+    """
+    ns = argparse.Namespace(
+        symbol="USDJPY=X",
+        interval="1h",
+        period="60d",
+        start=None,
+        end=None,
+        warmup=50,
+        stop_atr=2.0,
+        tp_atr=3.0,
+        max_holding_bars=48,
+        no_events=True,
+        no_higher_tf=True,
+        trace_out=None,
+        trace_out_default=False,
+        overwrite=False,
+        gzip=False,
+        config=None,
+    )
+    for k, v in overrides.items():
+        setattr(ns, k, v)
+    return ns
+
+
+@pytest.fixture
+def cmd_backtest_engine_with_stub(monkeypatch, tmp_path):
+    """Yield (cmd_fn, run_id, cwd_dir). Stubs out network/storage/io."""
+    from src.fx import cli as cli_mod
+
+    df = _ohlcv(200, seed=77)
+
+    def fake_fetch_ohlcv(symbol, interval, period=None, start=None, end=None):
+        return df
+
+    class FakeStorage:
+        def save_backtest(self, **kwargs):
+            return None
+
+    monkeypatch.setattr(cli_mod, "fetch_ohlcv", fake_fetch_ohlcv)
+    monkeypatch.setattr(cli_mod, "_print", lambda *a, **k: None)
+
+    # cwd to tmp_path so the auto-generated `runs/<run_id>/` lives there.
+    monkeypatch.chdir(tmp_path)
+    cfg = type("Cfg", (), {})()
+    return cli_mod.cmd_backtest_engine, FakeStorage(), tmp_path, cfg
+
+
+def test_trace_out_default_writes_to_runs_run_id(cmd_backtest_engine_with_stub):
+    cmd, storage, cwd, cfg = cmd_backtest_engine_with_stub
+    args = _build_be_namespace(trace_out_default=True)
+    rc = cmd(args, cfg, storage)
+    assert rc == 0
+    runs_dir = cwd / "runs"
+    assert runs_dir.exists()
+    # Exactly one `runs/<run_id>/` was created with all 3 expected files.
+    children = list(runs_dir.iterdir())
+    assert len(children) == 1
+    run_dir = children[0]
+    assert run_dir.is_dir()
+    assert run_dir.name.startswith("bt_")
+    for fname in ("run_metadata.json", "decision_traces.jsonl",
+                  "summary.json"):
+        assert (run_dir / fname).exists(), f"missing {fname}"
+
+
+def test_trace_out_wins_over_trace_out_default(cmd_backtest_engine_with_stub):
+    """Both flags set: --trace-out wins; runs/<run_id>/ is NOT created."""
+    cmd, storage, cwd, cfg = cmd_backtest_engine_with_stub
+    explicit = cwd / "explicit_dest"
+    args = _build_be_namespace(
+        trace_out=str(explicit),
+        trace_out_default=True,
+    )
+    rc = cmd(args, cfg, storage)
+    assert rc == 0
+    # Files landed in --trace-out target.
+    assert (explicit / "summary.json").exists()
+    # The auto-default path was NOT used.
+    assert not (cwd / "runs").exists()
+
+
+def test_no_trace_out_flag_skips_export(cmd_backtest_engine_with_stub):
+    """Neither --trace-out nor --trace-out-default: no files created,
+    backtest still runs successfully."""
+    cmd, storage, cwd, cfg = cmd_backtest_engine_with_stub
+    args = _build_be_namespace()
+    rc = cmd(args, cfg, storage)
+    assert rc == 0
+    assert not (cwd / "runs").exists()
