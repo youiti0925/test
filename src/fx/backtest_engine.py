@@ -614,13 +614,17 @@ def run_engine_backtest(
             result.decision_traces.append(trace)
 
     # Force-close anything still open at the end so equity / trade counts
-    # don't omit the final position's PnL.
+    # don't omit the final position's PnL. The end_of_data exit must also
+    # be reflected in the LAST decision_trace's execution_trace so the
+    # trace is consistent with EngineTrade — pinned by
+    # test_end_of_data_exit_recorded_in_last_trace.
     if pos is not None:
         ts = df.index[-1]
         price = float(df["close"].iloc[-1])
         direction = 1 if pos.side == "BUY" else -1
         pnl = (price - pos.entry) * pos.size * direction
         ret_pct = 100 * (price - pos.entry) / pos.entry * direction
+        forced_trade_id = pos.trade_id
         result.trades.append(
             EngineTrade(
                 side=pos.side,
@@ -634,9 +638,47 @@ def run_engine_backtest(
                 exit_reason="end_of_data",
                 rule_chain=pending_chain,
                 blocked_by=pending_blocked,
-                trade_id=pos.trade_id,
+                trade_id=forced_trade_id,
             )
         )
+        if capture_traces and result.decision_traces:
+            last_trace = result.decision_traces[-1]
+            new_exec = dataclasses.replace(
+                last_trace.execution_trace,
+                position_after=None,
+                exit_event=True,
+                exit_reason="end_of_data",
+                exit_price=price,
+                exit_trade_id=forced_trade_id,
+                trade_id=(
+                    last_trace.execution_trace.entry_trade_id
+                    or forced_trade_id
+                ),
+            )
+            # Patch the exit_check rule_check so it stays consistent with
+            # the execution_trace — otherwise readers see exit_event=true
+            # while exit_check still says "position remains open".
+            new_checks = []
+            for rc in last_trace.rule_checks:
+                if rc.canonical_rule_id == "exit_check":
+                    new_checks.append(dataclasses.replace(
+                        rc,
+                        result="PASS",
+                        computed=True,
+                        used_in_decision=True,
+                        value={
+                            "exited": True,
+                            "exit_reason": "end_of_data",
+                            "exit_price": price,
+                            "forced_close_at_end_of_data": True,
+                        },
+                        reason="position force-closed at end_of_data",
+                        source_chain_step="post_loop",
+                    ))
+                else:
+                    new_checks.append(rc)
+            last_trace.execution_trace = new_exec
+            last_trace.rule_checks = tuple(new_checks)
 
     # Finalise run metadata now that we know the actual processed range,
     # then run the second pass that fills FutureOutcomeSlice. The second

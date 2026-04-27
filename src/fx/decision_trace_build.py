@@ -309,12 +309,23 @@ def execution_trace_slice(
     bars_held_after = (
         position_after["bars_held"] if position_after is not None else None
     )
+    # entry_trade_id only set when an entry actually opened a position on
+    # this bar — read it from position_after which the engine just wrote.
     if bar_entry_executed and position_after is not None:
-        trade_id = position_after.get("trade_id") or None
+        entry_trade_id = position_after.get("trade_id") or None
+    else:
+        entry_trade_id = None
+    # exit_trade_id only set when this bar closed an existing position.
+    exit_trade_id = bar_exit_trade_id if bar_exit_event else None
+    # Compat field — prefer the new entry id when present, else exit id,
+    # else fall back to the open position's id (so still-open bars match
+    # the pre-PR behaviour). Tests should migrate to the explicit pair.
+    if entry_trade_id is not None:
+        trade_id = entry_trade_id
+    elif exit_trade_id is not None:
+        trade_id = exit_trade_id
     elif position_after is not None:
         trade_id = position_after.get("trade_id") or None
-    elif bar_exit_event:
-        trade_id = bar_exit_trade_id
     else:
         trade_id = None
     return ExecutionTraceSlice(
@@ -328,6 +339,8 @@ def execution_trace_slice(
         exit_event=bar_exit_event,
         exit_reason=bar_exit_reason,
         exit_price=bar_exit_price,
+        entry_trade_id=entry_trade_id,
+        exit_trade_id=exit_trade_id,
         trade_id=trade_id,
         bars_held_before=bars_held_before,
         bars_held_after=bars_held_after,
@@ -514,6 +527,7 @@ def build_rule_checks_full(
     risk_reward: float,
     min_risk_reward: float,
     atr_value: float | None,
+    technical_only_action: str,
     llm_signal_present: bool,
     waveform_bias_present: bool,
     bar_exit_event: bool,
@@ -550,14 +564,16 @@ def build_rule_checks_full(
         ))
 
     # 10: technical_directionality
+    # value MUST be the actual technical_only_action computed by
+    # indicators.technical_signal — never derive it from advisory or
+    # pattern. Pinned by test_technical_directionality_value_matches_action.
     checks.append(_chain_check(
         "technical_directionality",
         gate_passed=gate_passed, chain_steps=tuple(decision.rule_chain),
         computed=True,
-        value=decision.advisory.get("technical_only_action") or
-              (pattern and "BUY") or "see_decision",
+        value=technical_only_action,
         threshold="BUY|SELL",
-        pass_reason="technical signal is directional",
+        pass_reason=f"technical_only_action={technical_only_action}",
     ))
 
     # 11: pattern_check
@@ -623,9 +639,15 @@ def build_rule_checks_full(
             pass_reason="waveform agrees or neutral",
         ))
 
-    # 16: position_state — only BLOCK when BUY/SELL AND existing position
+    # 16: position_state — BLOCK only when the slot is still occupied at
+    # the moment decide() returned BUY/SELL. If an exit fired earlier on
+    # this bar the slot was cleared before the decision, so the new entry
+    # is permitted; recording BLOCK here would contradict
+    # entry_execution=PASS and entry_executed=True. Pinned by
+    # test_same_bar_exit_and_entry_records_both_trade_ids.
     final_action = decision.action
-    if final_action in ("BUY", "SELL") and had_open_position:
+    slot_blocked = had_open_position and not bar_exit_event
+    if final_action in ("BUY", "SELL") and slot_blocked:
         checks.append(RuleCheck(
             canonical_rule_id="position_state", rule_group=RULE_TAXONOMY["position_state"],
             result="BLOCK", computed=True, used_in_decision=True,
@@ -633,6 +655,16 @@ def build_rule_checks_full(
             evidence_ids=(),
             reason=("Final action was directional but an existing position is open; "
                     "no new entry"),
+            source_chain_step="post_decision",
+        ))
+    elif final_action in ("BUY", "SELL") and had_open_position and bar_exit_event:
+        checks.append(RuleCheck(
+            canonical_rule_id="position_state", rule_group=RULE_TAXONOMY["position_state"],
+            result="PASS", computed=True, used_in_decision=True,
+            value="exit_then_entry", threshold="one_position_at_a_time",
+            evidence_ids=(),
+            reason=("Existing position closed earlier in this bar; slot is "
+                    "free for new entry"),
             source_chain_step="post_decision",
         ))
     elif final_action in ("BUY", "SELL"):
@@ -932,6 +964,7 @@ def build_full_trace(
         risk_state=risk_state, decision=decision, pattern=pattern,
         higher_tf=higher_tf, risk_reward=risk_reward,
         min_risk_reward=1.5, atr_value=atr_value,
+        technical_only_action=tech,
         llm_signal_present=llm_signal is not None,
         waveform_bias_present=False,
         bar_exit_event=bar_exit_event, bar_exit_reason=bar_exit_reason,

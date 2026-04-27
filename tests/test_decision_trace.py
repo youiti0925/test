@@ -259,29 +259,181 @@ def test_future_outcome_horizon_bars_per_interval(interval, expected):
 # ─── Position / execution trace ────────────────────────────────────────────
 
 
-def test_entry_skipped_when_position_already_open():
-    """Force a long-running position so a directional signal during it
-    surfaces position_already_open + entry_execution BLOCK."""
-    df = _ohlcv(400, seed=31)
-    res = run_engine_backtest(df, "X", interval="1h", warmup=60,
-                               max_holding_bars=1000)
-    # Find any trace where final_action ∈ BUY/SELL AND position_state BLOCK
-    found = False
+def _stub_decide_always(action: str, *, blocked_by=()):
+    """Build a `decide` stub that returns the same action on every bar.
+
+    Used to make position-management traces deterministic without relying
+    on whatever BUY/SELL/HOLD the technical signal happens to produce on
+    a synthetic fixture.
+    """
+    from src.fx.decision_engine import Decision
+
+    def _stub(*, technical_signal, pattern, higher_timeframe_trend,
+              risk_reward, risk_state, llm_signal=None, waveform_bias=None,
+              min_confidence=0.6, min_risk_reward=1.5):
+        if blocked_by:
+            return Decision(
+                action="HOLD", confidence=0.0,
+                reason="forced HOLD for test",
+                blocked_by=tuple(blocked_by),
+                rule_chain=("risk_gate",), advisory={},
+            )
+        return Decision(
+            action=action, confidence=0.9,
+            reason=f"forced {action} for test",
+            blocked_by=(),
+            rule_chain=(
+                "risk_gate", "technical_directionality", "pattern_check",
+                "higher_tf_alignment", "risk_reward_floor",
+            ),
+            advisory={},
+        )
+    return _stub
+
+
+def test_entry_skipped_when_position_already_open(monkeypatch):
+    """Deterministic: force decide to always return BUY and use stop/TP wide
+    enough that the position never closes. Once a position is open, every
+    subsequent bar must surface position_already_open + entry_execution BLOCK."""
+    from src.fx import backtest_engine as bte
+
+    monkeypatch.setattr(bte, "decide_action", _stub_decide_always("BUY"))
+    df = _ohlcv(200, seed=31)
+    res = run_engine_backtest(
+        df, "X", interval="1h", warmup=60,
+        max_holding_bars=10_000,
+        stop_atr_mult=200.0,
+        tp_atr_mult=200.0,
+    )
+    # First directional bar opens the position; from then on, every bar
+    # with a directional decision while the position is open must BLOCK.
+    blocked_bars = []
     for t in res.decision_traces:
-        ps = next(rc for rc in t.rule_checks
-                  if rc.canonical_rule_id == "position_state")
-        if t.decision.final_action in ("BUY", "SELL") and ps.result == "BLOCK":
-            assert ps.value == "already_in_position"
-            ee = next(rc for rc in t.rule_checks
-                      if rc.canonical_rule_id == "entry_execution")
-            assert ee.result == "BLOCK"
-            assert t.execution_trace.entry_executed is False
-            assert t.execution_trace.entry_skipped_reason == "position_already_open"
-            found = True
-            break
-    if not found:
-        # Synthetic data may or may not produce this scenario — accept skip.
-        pytest.skip("No bar with directional decision while position open in this fixture")
+        if (t.decision.final_action in ("BUY", "SELL")
+                and t.execution_trace.had_open_position):
+            blocked_bars.append(t)
+
+    assert blocked_bars, (
+        "Expected at least one bar with directional decision while position "
+        "is open; got none. Stub may not be wired up."
+    )
+    # Spot-check the first such bar — every required field must hold.
+    t = blocked_bars[0]
+    ps = next(rc for rc in t.rule_checks
+              if rc.canonical_rule_id == "position_state")
+    ee = next(rc for rc in t.rule_checks
+              if rc.canonical_rule_id == "entry_execution")
+    assert t.decision.final_action in ("BUY", "SELL")
+    assert t.execution_trace.had_open_position is True
+    assert ps.result == "BLOCK"
+    assert ps.value == "already_in_position"
+    assert ee.result == "BLOCK"
+    assert t.execution_trace.entry_executed is False
+    assert t.execution_trace.entry_skipped_reason == "position_already_open"
+
+
+def test_end_of_data_exit_recorded_in_last_trace(monkeypatch):
+    """Force a position to remain open until the loop ends; the LAST trace
+    must reflect the engine's end_of_data force-close — otherwise EngineTrade
+    has the close but decision_trace says the position is still open."""
+    from src.fx import backtest_engine as bte
+
+    monkeypatch.setattr(bte, "decide_action", _stub_decide_always("BUY"))
+    df = _ohlcv(200, seed=132)
+    res = run_engine_backtest(
+        df, "X", interval="1h", warmup=60,
+        max_holding_bars=10_000,
+        stop_atr_mult=200.0,
+        tp_atr_mult=200.0,
+    )
+    # The engine must have force-closed exactly one trade with end_of_data.
+    eod_trades = [t for t in res.trades if t.exit_reason == "end_of_data"]
+    assert eod_trades, "expected end_of_data trade from forced-BUY fixture"
+    last_trade = eod_trades[-1]
+
+    last_trace = res.decision_traces[-1]
+    et = last_trace.execution_trace
+    assert et.exit_event is True
+    assert et.exit_reason == "end_of_data"
+    assert et.exit_price == pytest.approx(float(df["close"].iloc[-1]))
+    assert et.exit_trade_id == last_trade.trade_id
+    assert et.position_after is None
+
+    # exit_check rule_check stays consistent with the execution_trace.
+    ec = next(rc for rc in last_trace.rule_checks
+              if rc.canonical_rule_id == "exit_check")
+    assert ec.result == "PASS"
+    assert isinstance(ec.value, dict)
+    assert ec.value.get("exited") is True
+    assert ec.value.get("exit_reason") == "end_of_data"
+
+
+def test_same_bar_exit_and_entry_records_both_trade_ids(monkeypatch):
+    """When a stop closes the existing position AND a new BUY fires on the
+    same bar, the trace must carry BOTH trade_ids: exit_trade_id for the
+    closed trade and entry_trade_id for the freshly opened one."""
+    from src.fx import backtest_engine as bte
+
+    monkeypatch.setattr(bte, "decide_action", _stub_decide_always("BUY"))
+    df = _ohlcv(300, seed=133, drift=0.0)
+    # Tight stop so positions get knocked out frequently; with stub always
+    # BUY, the bar where stop fires also opens a fresh position.
+    res = run_engine_backtest(
+        df, "X", interval="1h", warmup=60,
+        max_holding_bars=200,
+        stop_atr_mult=0.25,
+        tp_atr_mult=10.0,
+    )
+    same_bar = [
+        t for t in res.decision_traces
+        if t.execution_trace.exit_event
+        and t.execution_trace.entry_executed
+    ]
+    assert same_bar, (
+        "expected at least one bar with simultaneous exit + entry under "
+        "tight stop + always-BUY stub"
+    )
+    t = same_bar[0]
+    et = t.execution_trace
+    assert et.entry_trade_id is not None
+    assert et.exit_trade_id is not None
+    assert et.entry_trade_id != et.exit_trade_id
+    # Both ids must also link back to EngineTrade entries.
+    engine_ids = {tr.trade_id for tr in res.trades}
+    assert et.exit_trade_id in engine_ids
+    # Self-consistency: position_state must NOT be BLOCK on this bar —
+    # the exit cleared the slot before the entry, so entry was allowed.
+    ps = next(rc for rc in t.rule_checks
+              if rc.canonical_rule_id == "position_state")
+    assert ps.result == "PASS"
+    assert ps.value == "exit_then_entry"
+    ee = next(rc for rc in t.rule_checks
+              if rc.canonical_rule_id == "entry_execution")
+    assert ee.result == "PASS"
+
+
+def test_technical_directionality_value_matches_action():
+    """rule_check[technical_directionality].value MUST be the actual
+    technical_only_action — never derived from advisory or pattern. This
+    pins the bug where pattern presence alone could record value='BUY'."""
+    df = _ohlcv(300, seed=134)
+    res = run_engine_backtest(df, "X", interval="1h", warmup=60)
+    # At least one trace must have technical_directionality computed.
+    checked = 0
+    for t in res.decision_traces:
+        # atr_unavailable bars have technical_directionality NOT_REACHED
+        # (computed=False); skip those — only check fully-processed bars.
+        td = next(rc for rc in t.rule_checks
+                  if rc.canonical_rule_id == "technical_directionality")
+        if not td.computed:
+            continue
+        # value must equal the technical_only_action stored on the slice
+        # AND on the decision.
+        assert td.value == t.technical.technical_only_action
+        assert td.value == t.decision.technical_only_action
+        assert td.value in ("BUY", "SELL", "HOLD")
+        checked += 1
+    assert checked > 0, "expected at least one bar with computed technical_directionality"
 
 
 def test_position_state_not_block_when_final_action_hold():

@@ -394,6 +394,16 @@ class ExecutionTraceSlice:
     exit_event: bool
     exit_reason: str | None
     exit_price: float | None
+    # Distinct from `trade_id`: when exit and entry happen on the same bar
+    # (e.g. existing position hits stop and a fresh BUY/SELL fires) we need
+    # both ids to reconstruct what closed and what opened. Either or both
+    # may be None on bars that did not entry/exit.
+    entry_trade_id: str | None
+    exit_trade_id: str | None
+    # Compat field — equal to entry_trade_id when an entry executed,
+    # else exit_trade_id when an exit fired, else None. Older readers
+    # that only know `trade_id` keep working; new readers should prefer
+    # the explicit entry_trade_id / exit_trade_id pair.
     trade_id: str | None
     bars_held_before: int | None
     bars_held_after: int | None
