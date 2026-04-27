@@ -30,17 +30,33 @@ right of `i`.
 """
 from __future__ import annotations
 
+import dataclasses
+import secrets
 from dataclasses import dataclass, field
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import Callable, Iterable
 
 import numpy as np
 import pandas as pd
 
 from .calendar import Event
-from .decision_engine import decide as decide_action
+from .decision_engine import Decision, decide as decide_action
+from .decision_trace import (
+    BarDecisionTrace,
+    RunMetadata,
+    TRACE_SCHEMA_VERSION,
+    compute_data_snapshot_hash,
+    compute_strategy_config_hash,
+    get_commit_sha,
+)
+from .decision_trace_build import (
+    build_atr_unavailable_trace as _build_atr_unavailable_trace,
+    build_full_trace as _build_full_trace,
+    build_run_id as _build_run_id,
+    populate_future_outcomes as _populate_future_outcomes,
+)
 from .higher_timeframe import HIGHER_INTERVAL_MAP
-from .indicators import build_snapshot, technical_signal
+from .indicators import build_snapshot, technical_signal, technical_signal_reasons
 from .patterns import TrendState, analyse as analyse_patterns
 from .risk import atr as compute_atr
 from .risk_gate import RiskState
@@ -55,6 +71,24 @@ class EnginePosition:
     stop: float
     take_profit: float
     bars_held: int = 0
+    # Stable id of the form f"{run_id}_T{N}" so the trade can be joined
+    # back to the BarDecisionTrace entries at entry and exit.
+    trade_id: str = ""
+
+
+def _position_dict(p: "EnginePosition | None") -> dict | None:
+    if p is None:
+        return None
+    return {
+        "side": p.side,
+        "entry": p.entry,
+        "entry_ts": p.entry_ts,
+        "size": p.size,
+        "stop": p.stop,
+        "take_profit": p.take_profit,
+        "bars_held": p.bars_held,
+        "trade_id": p.trade_id,
+    }
 
 
 @dataclass
@@ -75,6 +109,10 @@ class EngineTrade:
     exit_reason: str
     rule_chain: tuple[str, ...] = ()
     blocked_by: tuple[str, ...] = ()
+    # Joins this trade to the corresponding ExecutionTraceSlice entries
+    # (entry bar + exit bar). Empty default keeps existing tests/code that
+    # construct EngineTrade directly working unchanged.
+    trade_id: str = ""
 
 
 @dataclass
@@ -86,6 +124,21 @@ class EngineBacktestResult:
     # synthetic "hold_no_signal" / "hold_pattern" / "hold_other" buckets.
     hold_reasons: dict[str, int] = field(default_factory=dict)
     bars_processed: int = 0
+    # Per-bar audit trail. Shape: list of BarDecisionTrace, one entry per
+    # bar processed (warmup excluded — they don't go through decide()).
+    # Empty when run_engine_backtest is called with capture_traces=False.
+    decision_traces: list[BarDecisionTrace] = field(default_factory=list)
+    # Reproducibility metadata — strategy hash, data hash, commit sha,
+    # run_id linking every trace back to this run.
+    run_metadata: RunMetadata | None = None
+
+    def to_decision_trace_records(self) -> list[dict]:
+        """Return all traces as JSON-serialisable dicts."""
+        return [t.to_dict() for t in self.decision_traces]
+
+    def to_run_metadata_dict(self) -> dict:
+        """Return run metadata as a JSON-serialisable dict (or empty)."""
+        return self.run_metadata.to_dict() if self.run_metadata else {}
 
     def metrics(self) -> dict:
         bars = self.bars_processed or 1
@@ -237,6 +290,10 @@ def run_engine_backtest(
     events: Iterable[Event] = (),
     llm_signal_fn: LLMSignalFn | None = None,
     use_higher_tf: bool = True,
+    capture_traces: bool = True,
+    compute_future_outcome: bool = True,
+    data_source: str = "unknown",
+    data_retrieved_at: datetime | None = None,
 ) -> EngineBacktestResult:
     """Run a Decision Engine-driven backtest over `df`.
 
@@ -266,6 +323,18 @@ def run_engine_backtest(
         Default `None` keeps the test deterministic.
     use_higher_tf:
         Compute higher-TF trend per bar (slightly slower). Default True.
+    capture_traces:
+        When True (default), every processed bar produces a BarDecisionTrace
+        in result.decision_traces. Decision logic is identical with or
+        without this flag — pinned by test_decisions_unchanged_with_trace_logging.
+    compute_future_outcome:
+        When True (default), a second pass after the bar loop fills the
+        FutureOutcomeSlice on every trace. The decision pipeline never
+        consults future_outcome — pinned by
+        test_future_outcome_does_not_affect_decisions.
+    data_source / data_retrieved_at:
+        Provenance metadata copied into RunMetadata and MarketSlice. Pure
+        labelling — no behaviour depends on these.
     """
     result = EngineBacktestResult()
     pos: EnginePosition | None = None
@@ -280,14 +349,67 @@ def run_engine_backtest(
     events_tuple = tuple(events)
     risk_reward = tp_atr_mult / stop_atr_mult
 
+    # ── Trace metadata ──────────────────────────────────────────────────
+    # Built up-front so every trace can carry the same run_id. bar_range
+    # is finalised after the loop so it reflects what actually ran.
+    run_metadata: RunMetadata | None = None
+    trade_counter = 0
+    if capture_traces:
+        run_id = _build_run_id(symbol)
+        config_payload = {
+            "interval": interval,
+            "initial_cash": initial_cash,
+            "warmup": warmup,
+            "stop_atr_mult": stop_atr_mult,
+            "tp_atr_mult": tp_atr_mult,
+            "max_holding_bars": max_holding_bars,
+            "use_higher_tf": use_higher_tf,
+            "n_events": len(events_tuple),
+            "llm_signal_fn_used": llm_signal_fn is not None,
+        }
+        sha, sha_status = get_commit_sha()
+        run_metadata = RunMetadata(
+            run_id=run_id,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            symbol=symbol,
+            timeframe=interval,
+            bar_range={"start": None, "end": None, "n_bars": 0, "warmup": warmup},
+            trace_schema_version=TRACE_SCHEMA_VERSION,
+            strategy_config_hash=compute_strategy_config_hash(config_payload),
+            data_snapshot_hash=compute_data_snapshot_hash(df, symbol, interval),
+            input_data_source=data_source,
+            input_data_retrieved_at=(
+                data_retrieved_at.isoformat() if data_retrieved_at else None
+            ),
+            synthetic_execution=True,
+            commit_sha=sha,
+            commit_sha_status=sha_status,
+            execution_mode="synthetic_backtest",
+            engine_version="backtest_engine.run_engine_backtest",
+            timezone_name="UTC",
+        )
+        result.run_metadata = run_metadata
+    else:
+        run_id = ""
+
     for i in range(warmup, len(df)):
         result.bars_processed += 1
         window = df.iloc[: i + 1]
         ts = window.index[-1]
         price = float(window["close"].iloc[-1])
 
+        # Snapshot before any state mutation on this bar, so the trace can
+        # reproduce what the engine "saw" entering the bar.
+        position_before = _position_dict(pos)
+        bars_held_before = pos.bars_held if pos is not None else None
+        had_open_position = pos is not None
+
         # Mark-to-market the existing position first; stops/TPs win over
         # any new signal on the same bar.
+        bar_exit_event = False
+        bar_exit_reason: str | None = None
+        bar_exit_price: float | None = None
+        bar_exit_trade_id: str | None = None
         if pos is not None:
             pos.bars_held += 1
             high = float(window["high"].iloc[-1])
@@ -325,9 +447,14 @@ def run_engine_backtest(
                         exit_reason=exit_reason,
                         rule_chain=pending_chain,
                         blocked_by=pending_blocked,
+                        trade_id=pos.trade_id,
                     )
                 )
                 cash += pnl
+                bar_exit_event = True
+                bar_exit_reason = exit_reason
+                bar_exit_price = exit_price
+                bar_exit_trade_id = pos.trade_id
                 pos = None
 
         # Build the engine inputs from the window only. Skip bars where
@@ -337,10 +464,33 @@ def run_engine_backtest(
             _bump(result.hold_reasons, "atr_unavailable")
             equity = cash + _unrealized(pos, price)
             result.equity_curve.append((ts, equity))
+            if capture_traces:
+                trace = _build_atr_unavailable_trace(
+                    run_id=run_id,
+                    df=df,
+                    i=i,
+                    ts=ts,
+                    symbol=symbol,
+                    interval=interval,
+                    data_source=data_source,
+                    events_tuple=events_tuple,
+                    pos_after=pos,
+                    position_before=position_before,
+                    bars_held_before=bars_held_before,
+                    had_open_position=had_open_position,
+                    bar_exit_event=bar_exit_event,
+                    bar_exit_reason=bar_exit_reason,
+                    bar_exit_price=bar_exit_price,
+                    bar_exit_trade_id=bar_exit_trade_id,
+                )
+                result.decision_traces.append(trace)
             continue
 
         snap = build_snapshot(symbol, window)
         tech = technical_signal(snap)
+        # Mirror call for trace only — action is delegated back to
+        # technical_signal so it cannot drift. See indicators.py docstring.
+        tech_action_for_trace, tech_reason_codes = technical_signal_reasons(snap)
         pattern = analyse_patterns(window)
         higher_tf = (
             _resample_higher_tf(window, interval) if use_higher_tf else "UNKNOWN"
@@ -385,6 +535,9 @@ def run_engine_backtest(
         # from BUY to SELL on the same bar is rare and would over-trade
         # in a backtest — close on flip is handled at the NEXT bar via
         # mark-to-market once the new direction's stop/TP frames it.
+        bar_entry_executed = False
+        bar_entry_price: float | None = None
+        bar_entry_skipped_reason = "entry_executed"  # set per case below
         if decision.action in ("BUY", "SELL") and pos is None:
             offset = stop_atr_mult * float(atr_value)
             tp_offset = tp_atr_mult * float(atr_value)
@@ -398,6 +551,8 @@ def run_engine_backtest(
             # convention. Real sizing is risk-fraction; we keep this
             # comparable to backtest.py for direct A/B reads.
             size = cash / price
+            trade_counter += 1
+            new_trade_id = f"{run_id}_T{trade_counter}" if run_id else ""
             pos = EnginePosition(
                 side=decision.action,
                 entry=price,
@@ -405,12 +560,58 @@ def run_engine_backtest(
                 size=size,
                 stop=stop,
                 take_profit=tp,
+                trade_id=new_trade_id,
             )
             pending_chain = decision.rule_chain
             pending_blocked = decision.blocked_by
+            bar_entry_executed = True
+            bar_entry_price = price
+            bar_entry_skipped_reason = "entry_executed"
+        elif decision.action in ("BUY", "SELL") and pos is not None:
+            bar_entry_skipped_reason = "position_already_open"
+        else:  # decision.action == "HOLD"
+            bar_entry_skipped_reason = "decision_was_HOLD"
 
         equity = cash + _unrealized(pos, price)
         result.equity_curve.append((ts, equity))
+
+        if capture_traces:
+            trace = _build_full_trace(
+                run_id=run_id,
+                df=df,
+                i=i,
+                ts=ts,
+                symbol=symbol,
+                interval=interval,
+                data_source=data_source,
+                events_tuple=events_tuple,
+                snap=snap,
+                atr_value=float(atr_value),
+                tech=tech,
+                tech_reason_codes=tech_reason_codes,
+                pattern=pattern,
+                higher_tf=higher_tf,
+                use_higher_tf=use_higher_tf,
+                risk_state=risk_state,
+                llm_signal=llm_signal,
+                decision=decision,
+                risk_reward=risk_reward,
+                stop_atr_mult=stop_atr_mult,
+                tp_atr_mult=tp_atr_mult,
+                max_holding_bars=max_holding_bars,
+                position_before=position_before,
+                position_after=_position_dict(pos),
+                bars_held_before=bars_held_before,
+                had_open_position=had_open_position,
+                bar_entry_executed=bar_entry_executed,
+                bar_entry_price=bar_entry_price,
+                bar_entry_skipped_reason=bar_entry_skipped_reason,
+                bar_exit_event=bar_exit_event,
+                bar_exit_reason=bar_exit_reason,
+                bar_exit_price=bar_exit_price,
+                bar_exit_trade_id=bar_exit_trade_id,
+            )
+            result.decision_traces.append(trace)
 
     # Force-close anything still open at the end so equity / trade counts
     # don't omit the final position's PnL.
@@ -433,7 +634,35 @@ def run_engine_backtest(
                 exit_reason="end_of_data",
                 rule_chain=pending_chain,
                 blocked_by=pending_blocked,
+                trade_id=pos.trade_id,
             )
+        )
+
+    # Finalise run metadata now that we know the actual processed range,
+    # then run the second pass that fills FutureOutcomeSlice. The second
+    # pass runs over the completed traces — it cannot influence decisions.
+    if capture_traces and result.run_metadata is not None:
+        if result.decision_traces:
+            result.run_metadata.bar_range = {
+                "start": result.decision_traces[0].timestamp,
+                "end": result.decision_traces[-1].timestamp,
+                "n_bars": len(result.decision_traces),
+                "warmup": warmup,
+            }
+        else:
+            result.run_metadata.bar_range = {
+                "start": None, "end": None, "n_bars": 0, "warmup": warmup,
+            }
+
+    if capture_traces and compute_future_outcome and result.decision_traces:
+        _populate_future_outcomes(
+            traces=result.decision_traces,
+            df=df,
+            interval=interval,
+            stop_atr_mult=stop_atr_mult,
+            tp_atr_mult=tp_atr_mult,
+            max_holding_bars=max_holding_bars,
+            atr_series=atr_series,
         )
 
     return result

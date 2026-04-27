@@ -151,3 +151,44 @@ def technical_signal(snap: Snapshot) -> str:
     if sell_signals >= 3 and sell_signals > buy_signals:
         return "SELL"
     return "HOLD"
+
+
+def technical_signal_reasons(snap: Snapshot) -> tuple[str, list[str]]:
+    """Mirror of `technical_signal` that also returns the reason codes.
+
+    For decision-trace logging only. Action MUST equal `technical_signal(snap)`
+    for every Snapshot — pinned by
+    test_technical_signal_reasons_action_equals_technical_signal. The rule
+    chain inside this function intentionally duplicates the body of
+    `technical_signal` so the canonical decision path stays untouched.
+    """
+    buy_codes: list[str] = []
+    sell_codes: list[str] = []
+
+    if snap.rsi_14 < 30:
+        buy_codes.append("rsi_oversold")
+    elif snap.rsi_14 > 70:
+        sell_codes.append("rsi_overbought")
+
+    if snap.macd_hist > 0 and snap.macd > snap.macd_signal:
+        buy_codes.append("macd_positive")
+    elif snap.macd_hist < 0 and snap.macd < snap.macd_signal:
+        sell_codes.append("macd_negative")
+
+    if snap.sma_20 > snap.sma_50:
+        buy_codes.append("sma20_above_sma50")
+    elif snap.sma_20 < snap.sma_50:
+        sell_codes.append("sma20_below_sma50")
+
+    if snap.bb_position < 0.2:
+        buy_codes.append("bb_position_below_0.2")
+    elif snap.bb_position > 0.8:
+        sell_codes.append("bb_position_above_0.8")
+
+    # Action delegated to the canonical function so they cannot drift.
+    action = technical_signal(snap)
+    if action == "BUY":
+        return action, buy_codes
+    if action == "SELL":
+        return action, sell_codes
+    return action, buy_codes + sell_codes
