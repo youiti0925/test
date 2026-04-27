@@ -1,0 +1,1163 @@
+"""Builders for `decision_trace.BarDecisionTrace` instances.
+
+Kept separate from `backtest_engine.py` so the engine's bar-loop reads
+straight while the slice/rule-check construction lives next to its own
+helpers. Decision logic lives in `decision_engine.py` / `risk_gate.py`;
+nothing here changes any decision — these functions only observe and
+record what already happened.
+"""
+from __future__ import annotations
+
+import secrets
+from datetime import datetime, timezone
+from typing import Any, Iterable
+
+import numpy as np
+import pandas as pd
+
+from .calendar import Event
+from .decision_engine import Decision
+from .decision_trace import (
+    BarDecisionTrace,
+    DecisionSlice,
+    ExecutionAssumptionSlice,
+    ExecutionTraceSlice,
+    FundamentalSlice,
+    FutureOutcomeSlice,
+    HORIZON_BARS_TABLE,
+    HigherTimeframeSlice,
+    MarketSlice,
+    RULE_TAXONOMY,
+    RuleCheck,
+    TRACE_SCHEMA_VERSION,
+    TechnicalSlice,
+    WaveformSlice,
+    horizon_to_bars,
+    make_not_reached_check,
+    make_skipped_check,
+)
+from .indicators import Snapshot
+from .patterns import PatternResult
+from .risk_gate import (
+    RiskState,
+    check_calendar_freshness,
+    check_consecutive_losses,
+    check_daily_loss_cap,
+    check_data_quality,
+    check_high_impact_event,
+    check_rule_unverified,
+    check_sentiment_spike,
+    check_spread,
+    _window_hours_for,
+)
+
+
+def build_run_id(symbol: str) -> str:
+    """`bt_{utc_compact}_{symbol}_{8charrand}` — sortable + unique."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    rand = secrets.token_hex(4)
+    return f"bt_{stamp}_{symbol}_{rand}"
+
+
+def _ts_iso(ts) -> str:
+    if isinstance(ts, pd.Timestamp):
+        return ts.isoformat()
+    return str(ts)
+
+
+def _events_to_dicts(events: Iterable[Event], ts_now: pd.Timestamp) -> list[dict]:
+    out = []
+    if ts_now.tzinfo is None:
+        now_dt = ts_now.tz_localize(timezone.utc).to_pydatetime()
+    else:
+        now_dt = ts_now.to_pydatetime()
+    for e in events:
+        delta_h = (e.when - now_dt).total_seconds() / 3600.0
+        out.append({
+            "title": e.title,
+            "currency": e.currency,
+            "impact": e.impact,
+            "when": e.when.isoformat(),
+            "hours_to_event": round(abs(delta_h), 2),
+            "signed_hours_to_event": round(delta_h, 2),
+            "window_hours": _window_hours_for(e),
+        })
+    return out
+
+
+def market_slice(df: pd.DataFrame, i: int, data_source: str) -> MarketSlice:
+    """Inspect the visible window up to bar i and report quality flags."""
+    window = df.iloc[: i + 1]
+    row = df.iloc[i]
+    last_5 = window[["open", "high", "low", "close"]].tail(5)
+    has_nan = bool(last_5.isna().any().any())
+    missing = int(window[["open", "high", "low", "close", "volume"]].tail(100).isna().sum().sum())
+    idx = window.index
+    monotonic = bool(idx.is_monotonic_increasing)
+    duplicate = int(idx.duplicated().sum())
+    tz = str(idx.tzinfo) if idx.tzinfo is not None else "naive"
+
+    # Gap detection: max consecutive timestamp delta vs median.
+    gap_detected = False
+    if len(window) >= 3:
+        deltas = idx.to_series().diff().dropna()
+        if len(deltas) > 0:
+            med = deltas.median()
+            if med.total_seconds() > 0 and (deltas.max() / med) > 2.5:
+                gap_detected = True
+
+    # Quality classification — used by tests/19 and rule_check data_quality.
+    quality = "OK"
+    quality_reason: str | None = None
+    if has_nan:
+        quality = "HAS_NAN"
+        quality_reason = "NaN found in OHLC of last 5 bars"
+    elif duplicate > 0:
+        quality = "DUPLICATE_INDEX"
+        quality_reason = f"{duplicate} duplicate timestamps in window"
+    elif tz == "naive":
+        quality = "TIMEZONE_NAIVE"
+        quality_reason = "DataFrame index is timezone-naive"
+    elif gap_detected:
+        quality = "GAP_DETECTED"
+        quality_reason = "Bar interval has unusually large gaps"
+
+    return MarketSlice(
+        open=float(row["open"]), high=float(row["high"]), low=float(row["low"]),
+        close=float(row["close"]), volume=float(row.get("volume", 0.0) or 0.0),
+        data_source=data_source,
+        is_complete_bar=True,
+        data_quality=quality,
+        bars_available=i + 1,
+        missing_ohlcv_count=missing,
+        has_nan=has_nan,
+        index_monotonic=monotonic,
+        duplicate_timestamp_count=duplicate,
+        timezone=tz,
+        gap_detected=gap_detected,
+        quality_reason=quality_reason,
+    )
+
+
+def technical_slice(
+    snap: Snapshot | None,
+    atr_value: float | None,
+    technical_only_action: str,
+    technical_reason_codes: list[str],
+) -> TechnicalSlice:
+    if snap is None:
+        return TechnicalSlice(
+            rsi_14=float("nan"), macd=0.0, macd_signal=0.0, macd_hist=0.0,
+            sma_20=0.0, sma_50=0.0, ema_12=0.0,
+            bb_upper=0.0, bb_lower=0.0, bb_position=0.0,
+            change_pct_1h=0.0, change_pct_24h=0.0,
+            atr_14=atr_value,
+            technical_only_action=technical_only_action,
+            technical_reason_codes=tuple(technical_reason_codes),
+            reason_derivation="snapshot_unavailable",
+        )
+    return TechnicalSlice(
+        rsi_14=snap.rsi_14, macd=snap.macd, macd_signal=snap.macd_signal,
+        macd_hist=snap.macd_hist, sma_20=snap.sma_20, sma_50=snap.sma_50,
+        ema_12=snap.ema_12, bb_upper=snap.bb_upper, bb_lower=snap.bb_lower,
+        bb_position=snap.bb_position,
+        change_pct_1h=snap.change_pct_1h, change_pct_24h=snap.change_pct_24h,
+        atr_14=atr_value,
+        technical_only_action=technical_only_action,
+        technical_reason_codes=tuple(technical_reason_codes),
+        reason_derivation="shared_scoring_helper",
+    )
+
+
+def waveform_slice(
+    pattern: PatternResult | None, atr_value: float | None, close: float
+) -> WaveformSlice:
+    if pattern is None:
+        return WaveformSlice(
+            trend_state="UNKNOWN",
+            detected_pattern=None, pattern_confidence=0.0,
+            neckline=None, neckline_broken=False,
+            distance_to_neckline_atr=None,
+            rsi_divergence=False, macd_momentum_weakening=False,
+            swing_points_recent=(), waveform_bias=None,
+            waveform_reason_codes=(),
+        )
+    distance = None
+    if pattern.neckline is not None and atr_value and atr_value > 0:
+        distance = (close - pattern.neckline) / atr_value
+    swings = list(pattern.swing_highs) + list(pattern.swing_lows)
+    swings.sort(key=lambda s: s.index)
+    recent = [
+        {"ts": s.ts.isoformat() if hasattr(s.ts, "isoformat") else str(s.ts),
+         "price": float(s.price), "kind": s.kind}
+        for s in swings[-10:]
+    ]
+    return WaveformSlice(
+        trend_state=pattern.trend_state.value,
+        detected_pattern=pattern.detected_pattern,
+        pattern_confidence=float(pattern.pattern_confidence),
+        neckline=(float(pattern.neckline) if pattern.neckline is not None else None),
+        neckline_broken=bool(pattern.neckline_broken),
+        distance_to_neckline_atr=(float(distance) if distance is not None else None),
+        rsi_divergence=bool(pattern.rsi_divergence),
+        macd_momentum_weakening=bool(pattern.macd_momentum_weakening),
+        swing_points_recent=tuple(recent),
+        waveform_bias=None,
+        waveform_reason_codes=(),
+    )
+
+
+def higher_tf_slice(
+    interval: str, trend: str, technical_only_action: str, use_higher_tf: bool
+) -> HigherTimeframeSlice:
+    rule = {
+        "1m": "15min", "5m": "1h", "15m": "4h", "30m": "4h",
+        "1h": "1D", "2h": "1D", "4h": "1W", "1d": "1W",
+    }.get(interval, "UNKNOWN")
+    align = "UNKNOWN"
+    if not use_higher_tf:
+        align = "DISABLED"
+    elif trend == "UNKNOWN":
+        align = "UNKNOWN"
+    elif technical_only_action == "BUY":
+        align = "AGAINST" if trend == "DOWNTREND" else (
+            "WITH" if trend == "UPTREND" else "NEUTRAL"
+        )
+    elif technical_only_action == "SELL":
+        align = "AGAINST" if trend == "UPTREND" else (
+            "WITH" if trend == "DOWNTREND" else "NEUTRAL"
+        )
+    else:
+        align = "NEUTRAL"
+    return HigherTimeframeSlice(source_interval=rule, trend=trend, alignment=align)
+
+
+def fundamental_slice(
+    events: tuple[Event, ...],
+    ts: pd.Timestamp,
+    blocked_codes: tuple[str, ...],
+) -> FundamentalSlice:
+    """Split ±48h events into nearby / blocking / warning buckets."""
+    nearby = _events_to_dicts(events, ts)
+    # blocking_events: high-impact events that fell inside their per-event
+    # block window AND the gate actually surfaced event_high.
+    blocking: list[dict] = []
+    warning: list[dict] = []
+    for ev_dict in nearby:
+        if (ev_dict["impact"] or "").lower() != "high":
+            continue
+        in_window = ev_dict["hours_to_event"] <= ev_dict["window_hours"]
+        if in_window and "event_high" in blocked_codes:
+            blocking.append({**ev_dict, "blocked_by_rule": "event_high"})
+        elif not in_window:
+            warning.append(ev_dict)
+        else:
+            # In-window but gate didn't block (paranoia case): still mark as
+            # blocking-class for diagnostics.
+            blocking.append({**ev_dict, "blocked_by_rule": "event_high"})
+    return FundamentalSlice(
+        nearby_events=tuple(nearby),
+        blocking_events=tuple(blocking),
+        warning_events=tuple(warning),
+        event_evidence_ids=(),
+        missing_event_evidence_reason=(
+            "events provided as in-memory Event objects; "
+            "source_documents.jsonl ingestion not implemented (out of scope for v1)"
+        ),
+        macro_observations=(),
+        macro_evidence_ids=(),
+        missing_macro_evidence_reason=(
+            "FRED/macro feed not connected in offline backtest"
+        ),
+        news_evidence_ids=(),
+        missing_news_evidence_reason=(
+            "news ingestion not connected to backtest_engine input"
+        ),
+        data_provenance={
+            "events_source": "in-memory tuple",
+            "freshness_check": "skipped_offline_backtest",
+        },
+    )
+
+
+def execution_assumption_slice() -> ExecutionAssumptionSlice:
+    return ExecutionAssumptionSlice(
+        synthetic_execution=True,
+        fill_model="close_price",
+        spread_mode="not_modelled",
+        slippage_mode="not_modelled",
+        bid_ask_mode="not_modelled",
+        sentiment_archive="not_available",
+    )
+
+
+def execution_trace_slice(
+    *,
+    position_before: dict | None,
+    position_after: dict | None,
+    had_open_position: bool,
+    decision_action: str,
+    bar_entry_executed: bool,
+    bar_entry_price: float | None,
+    bar_entry_skipped_reason: str,
+    bar_exit_event: bool,
+    bar_exit_reason: str | None,
+    bar_exit_price: float | None,
+    bar_exit_trade_id: str | None,
+    bars_held_before: int | None,
+) -> ExecutionTraceSlice:
+    bars_held_after = (
+        position_after["bars_held"] if position_after is not None else None
+    )
+    # entry_trade_id only set when an entry actually opened a position on
+    # this bar — read it from position_after which the engine just wrote.
+    if bar_entry_executed and position_after is not None:
+        entry_trade_id = position_after.get("trade_id") or None
+    else:
+        entry_trade_id = None
+    # exit_trade_id only set when this bar closed an existing position.
+    exit_trade_id = bar_exit_trade_id if bar_exit_event else None
+    # Compat field — prefer the new entry id when present, else exit id,
+    # else fall back to the open position's id (so still-open bars match
+    # the pre-PR behaviour). Tests should migrate to the explicit pair.
+    if entry_trade_id is not None:
+        trade_id = entry_trade_id
+    elif exit_trade_id is not None:
+        trade_id = exit_trade_id
+    elif position_after is not None:
+        trade_id = position_after.get("trade_id") or None
+    else:
+        trade_id = None
+    return ExecutionTraceSlice(
+        position_before=position_before,
+        position_after=position_after,
+        had_open_position=had_open_position,
+        entry_signal=decision_action,
+        entry_executed=bar_entry_executed,
+        entry_price=bar_entry_price,
+        entry_skipped_reason=bar_entry_skipped_reason,
+        exit_event=bar_exit_event,
+        exit_reason=bar_exit_reason,
+        exit_price=bar_exit_price,
+        entry_trade_id=entry_trade_id,
+        exit_trade_id=exit_trade_id,
+        trade_id=trade_id,
+        bars_held_before=bars_held_before,
+        bars_held_after=bars_held_after,
+    )
+
+
+def decision_slice(decision: Decision, technical_only_action: str) -> DecisionSlice:
+    return DecisionSlice(
+        technical_only_action=technical_only_action,
+        final_action=decision.action,
+        action_changed_by_engine=(decision.action != technical_only_action),
+        blocked_by=tuple(decision.blocked_by),
+        rule_chain=tuple(decision.rule_chain),
+        confidence=float(decision.confidence),
+        reason=decision.reason,
+        advisory=dict(decision.advisory),
+    )
+
+
+def _gate_subcheck(
+    rule_id: str,
+    *,
+    block,           # BlockReason | None — output of risk_gate.check_*
+    computed: bool,  # was the input present so the check actually ran?
+    skipped_reason: str,  # used when computed=False
+    threshold: Any,
+    value_when_pass: Any = None,
+) -> RuleCheck:
+    if not computed:
+        return make_skipped_check(rule_id, skipped_reason, threshold=threshold,
+                                  source_chain_step="risk_gate")
+    if block is None:
+        return RuleCheck(
+            canonical_rule_id=rule_id, rule_group=RULE_TAXONOMY[rule_id],
+            result="PASS", computed=True, used_in_decision=True,
+            value=value_when_pass, threshold=threshold,
+            evidence_ids=(),
+            reason=f"{rule_id} passed",
+            source_chain_step="risk_gate",
+        )
+    return RuleCheck(
+        canonical_rule_id=rule_id, rule_group=RULE_TAXONOMY[rule_id],
+        result="BLOCK", computed=True, used_in_decision=True,
+        value=dict(block.detail) if block.detail else block.message,
+        threshold=threshold, evidence_ids=(),
+        reason=block.message, source_chain_step="risk_gate",
+    )
+
+
+def _chain_check(
+    rule_id: str,
+    *,
+    gate_passed: bool,
+    chain_steps: tuple[str, ...],
+    computed: bool,
+    value: Any,
+    threshold: Any,
+    pass_reason: str,
+) -> RuleCheck:
+    """Decision-engine chain step: PASS if reached + value satisfies, else NOT_REACHED.
+
+    `chain_steps` is decision.rule_chain. We treat the chain step as
+    'reached' iff its name is present in chain_steps.
+    """
+    chain_step_name_map = {
+        "technical_directionality": "technical_directionality",
+        "pattern_check": "pattern_check",
+        "higher_tf_alignment": "higher_tf_alignment",
+        "risk_reward_floor": "risk_reward_floor",
+        "llm_advisory": "llm_advisory",
+        "waveform_advisory": "waveform_advisory",
+    }
+    step = chain_step_name_map.get(rule_id, rule_id)
+    if not gate_passed:
+        return make_not_reached_check(
+            rule_id,
+            f"engine stopped at risk_gate before reaching {rule_id}",
+            value=value, threshold=threshold, computed=computed,
+        )
+    reached = step in chain_steps
+    if not reached:
+        return make_not_reached_check(
+            rule_id,
+            f"chain stopped before {rule_id}",
+            value=value, threshold=threshold, computed=computed,
+        )
+    return RuleCheck(
+        canonical_rule_id=rule_id, rule_group=RULE_TAXONOMY[rule_id],
+        result="PASS", computed=computed, used_in_decision=True,
+        value=value, threshold=threshold, evidence_ids=(),
+        reason=pass_reason, source_chain_step="decision_chain",
+    )
+
+
+def _build_gate_subchecks(
+    risk_state: RiskState, decision: Decision
+) -> tuple[list[RuleCheck], bool]:
+    """Run all 8 gate sub-checks. Returns (checks, gate_passed)."""
+    checks: list[RuleCheck] = []
+    blocked_codes = tuple(decision.blocked_by)
+    gate_codes = {
+        "data_quality", "calendar_stale", "event_high",
+        "spread_abnormal", "spread_unavailable",
+        "daily_loss_cap", "consecutive_losses",
+        "rule_unverified", "sentiment_spike",
+    }
+    gate_passed = not any(c in gate_codes for c in blocked_codes)
+
+    # 1-8: gate sub-checks
+    checks.append(_gate_subcheck(
+        "data_quality",
+        block=check_data_quality(risk_state.df) if risk_state.df is not None else None,
+        computed=risk_state.df is not None,
+        skipped_reason="no DataFrame provided to risk_state",
+        threshold=">=50 bars and finite last close",
+        value_when_pass={"bars": (len(risk_state.df) if risk_state.df is not None else 0)},
+    ))
+    checks.append(_gate_subcheck(
+        "calendar_freshness",
+        block=check_calendar_freshness(
+            risk_state.calendar_freshness, require_fresh=risk_state.require_calendar_fresh
+        ),
+        computed=risk_state.require_calendar_fresh,
+        skipped_reason="require_calendar_fresh=False (offline backtest)",
+        threshold="status='fresh'",
+    ))
+    checks.append(_gate_subcheck(
+        "event_high",
+        block=check_high_impact_event(risk_state.events, now=risk_state.now),
+        computed=True,
+        skipped_reason="",
+        threshold="<= per-event window_h",
+        value_when_pass={"events_in_window": len(risk_state.events)},
+    ))
+    checks.append(_gate_subcheck(
+        "spread_abnormal",
+        block=check_spread(risk_state.spread_pct, require_spread=risk_state.require_spread),
+        computed=risk_state.spread_pct is not None or risk_state.require_spread,
+        skipped_reason="spread_pct is None in synthetic backtest",
+        threshold="<=0.05% (or non-None when require_spread)",
+    ))
+    checks.append(_gate_subcheck(
+        "daily_loss_cap",
+        block=(check_daily_loss_cap(risk_state.pnl_today, cap=risk_state.daily_loss_cap)
+               if risk_state.daily_loss_cap is not None else None),
+        computed=risk_state.daily_loss_cap is not None,
+        skipped_reason="daily_loss_cap not provided",
+        threshold=risk_state.daily_loss_cap,
+    ))
+    checks.append(_gate_subcheck(
+        "consecutive_losses",
+        block=check_consecutive_losses(
+            risk_state.consecutive_losses, cap=risk_state.consecutive_losses_cap
+        ),
+        computed=risk_state.consecutive_losses is not None,
+        skipped_reason="consecutive_losses input not provided",
+        threshold=risk_state.consecutive_losses_cap,
+    ))
+    checks.append(_gate_subcheck(
+        "rule_unverified",
+        block=check_rule_unverified(
+            risk_state.rule_version_age_hours, min_age_hours=risk_state.rule_min_age_hours
+        ),
+        computed=risk_state.rule_version_age_hours is not None,
+        skipped_reason="rule_version_age_hours not provided",
+        threshold=f">={risk_state.rule_min_age_hours}h",
+    ))
+    checks.append(_gate_subcheck(
+        "sentiment_spike",
+        block=check_sentiment_spike(risk_state.sentiment_snapshot),
+        computed=risk_state.sentiment_snapshot is not None,
+        skipped_reason="sentiment_snapshot not provided",
+        threshold="mention_count>=200 AND |velocity|>=0.6",
+    ))
+    return checks, gate_passed
+
+
+def build_rule_checks_full(
+    *,
+    risk_state: RiskState,
+    decision: Decision,
+    pattern: PatternResult | None,
+    higher_tf: str,
+    risk_reward: float,
+    min_risk_reward: float,
+    atr_value: float | None,
+    technical_only_action: str,
+    llm_signal_present: bool,
+    waveform_bias_present: bool,
+    bar_exit_event: bool,
+    bar_exit_reason: str | None,
+    had_open_position: bool,
+    bar_entry_executed: bool,
+    bar_entry_skipped_reason: str,
+    pos_low: float | None,
+    pos_high: float | None,
+    pos_stop: float | None,
+    pos_tp: float | None,
+    bars_held_after: int | None,
+    max_holding_bars: int,
+) -> tuple[RuleCheck, ...]:
+    """Compose all 19 RuleCheck entries for a normal (non-atr-skip) bar."""
+    checks, gate_passed = _build_gate_subchecks(risk_state, decision)
+
+    # 9: atr_available — pre-decision indicator availability
+    if atr_value is not None and atr_value > 0:
+        checks.append(RuleCheck(
+            canonical_rule_id="atr_available", rule_group=RULE_TAXONOMY["atr_available"],
+            result="PASS", computed=True, used_in_decision=True,
+            value=float(atr_value), threshold=">0",
+            evidence_ids=(), reason=f"ATR(14)={atr_value:.6f}",
+            source_chain_step="pre_decision",
+        ))
+    else:
+        checks.append(RuleCheck(
+            canonical_rule_id="atr_available", rule_group=RULE_TAXONOMY["atr_available"],
+            result="BLOCK", computed=True, used_in_decision=True,
+            value=atr_value, threshold=">0",
+            evidence_ids=(), reason="ATR(14) is NaN or non-positive",
+            source_chain_step="pre_decision",
+        ))
+
+    # 10: technical_directionality
+    # value MUST be the actual technical_only_action computed by
+    # indicators.technical_signal — never derive it from advisory or
+    # pattern. Pinned by test_technical_directionality_value_matches_action.
+    checks.append(_chain_check(
+        "technical_directionality",
+        gate_passed=gate_passed, chain_steps=tuple(decision.rule_chain),
+        computed=True,
+        value=technical_only_action,
+        threshold="BUY|SELL",
+        pass_reason=f"technical_only_action={technical_only_action}",
+    ))
+
+    # 11: pattern_check
+    checks.append(_chain_check(
+        "pattern_check",
+        gate_passed=gate_passed, chain_steps=tuple(decision.rule_chain),
+        computed=pattern is not None,
+        value=(pattern.detected_pattern if pattern is not None else None),
+        threshold=("neckline_broken=True for top/bottom" if pattern is not None else None),
+        pass_reason=("no pattern conflict" if pattern is None else
+                     f"pattern={pattern.detected_pattern}, neckline_broken={pattern.neckline_broken}"),
+    ))
+
+    # 12: higher_tf_alignment
+    checks.append(_chain_check(
+        "higher_tf_alignment",
+        gate_passed=gate_passed, chain_steps=tuple(decision.rule_chain),
+        computed=higher_tf is not None,
+        value=higher_tf, threshold="not against trend",
+        pass_reason=f"higher_tf={higher_tf}",
+    ))
+
+    # 13: risk_reward_floor
+    checks.append(_chain_check(
+        "risk_reward_floor",
+        gate_passed=gate_passed, chain_steps=tuple(decision.rule_chain),
+        computed=risk_reward is not None,
+        value=float(risk_reward), threshold=f">={min_risk_reward}",
+        pass_reason=f"RR={risk_reward:.3f}",
+    ))
+
+    # 14: llm_advisory
+    if not llm_signal_present:
+        checks.append(make_skipped_check(
+            "llm_advisory", "llm_signal_fn=None",
+            threshold=">=0.6 confidence and matching action",
+            source_chain_step="decision_chain",
+        ))
+    else:
+        checks.append(_chain_check(
+            "llm_advisory",
+            gate_passed=gate_passed, chain_steps=tuple(decision.rule_chain),
+            computed=True,
+            value=decision.advisory.get("llm_action"),
+            threshold=">=0.6 confidence and matching action",
+            pass_reason=f"LLM={decision.advisory.get('llm_action')}",
+        ))
+
+    # 15: waveform_advisory
+    if not waveform_bias_present:
+        checks.append(make_skipped_check(
+            "waveform_advisory", "waveform_bias=None",
+            threshold="non-disagreeing bias",
+            source_chain_step="decision_chain",
+        ))
+    else:
+        checks.append(_chain_check(
+            "waveform_advisory",
+            gate_passed=gate_passed, chain_steps=tuple(decision.rule_chain),
+            computed=True,
+            value=decision.advisory.get("waveform_bias"),
+            threshold="non-disagreeing bias",
+            pass_reason="waveform agrees or neutral",
+        ))
+
+    # 16: position_state — BLOCK only when the slot is still occupied at
+    # the moment decide() returned BUY/SELL. If an exit fired earlier on
+    # this bar the slot was cleared before the decision, so the new entry
+    # is permitted; recording BLOCK here would contradict
+    # entry_execution=PASS and entry_executed=True. Pinned by
+    # test_same_bar_exit_and_entry_records_both_trade_ids.
+    final_action = decision.action
+    slot_blocked = had_open_position and not bar_exit_event
+    if final_action in ("BUY", "SELL") and slot_blocked:
+        checks.append(RuleCheck(
+            canonical_rule_id="position_state", rule_group=RULE_TAXONOMY["position_state"],
+            result="BLOCK", computed=True, used_in_decision=True,
+            value="already_in_position", threshold="one_position_at_a_time",
+            evidence_ids=(),
+            reason=("Final action was directional but an existing position is open; "
+                    "no new entry"),
+            source_chain_step="post_decision",
+        ))
+    elif final_action in ("BUY", "SELL") and had_open_position and bar_exit_event:
+        checks.append(RuleCheck(
+            canonical_rule_id="position_state", rule_group=RULE_TAXONOMY["position_state"],
+            result="PASS", computed=True, used_in_decision=True,
+            value="exit_then_entry", threshold="one_position_at_a_time",
+            evidence_ids=(),
+            reason=("Existing position closed earlier in this bar; slot is "
+                    "free for new entry"),
+            source_chain_step="post_decision",
+        ))
+    elif final_action in ("BUY", "SELL"):
+        checks.append(RuleCheck(
+            canonical_rule_id="position_state", rule_group=RULE_TAXONOMY["position_state"],
+            result="PASS", computed=True, used_in_decision=True,
+            value="no_open_position", threshold="one_position_at_a_time",
+            evidence_ids=(),
+            reason="No existing position; new entry permitted",
+            source_chain_step="post_decision",
+        ))
+    else:
+        checks.append(RuleCheck(
+            canonical_rule_id="position_state", rule_group=RULE_TAXONOMY["position_state"],
+            result="INFO", computed=True, used_in_decision=True,
+            value=("has_open_position" if had_open_position else "no_open_position"),
+            threshold="one_position_at_a_time",
+            evidence_ids=(),
+            reason="final_action=HOLD; position_state is informational only",
+            source_chain_step="post_decision",
+        ))
+
+    # 17: entry_execution
+    if bar_entry_executed:
+        checks.append(RuleCheck(
+            canonical_rule_id="entry_execution", rule_group=RULE_TAXONOMY["entry_execution"],
+            result="PASS", computed=True, used_in_decision=True,
+            value={"entry_executed": True, "reason": bar_entry_skipped_reason},
+            threshold="decision in {BUY,SELL} AND no_open_position AND atr_available",
+            evidence_ids=(), reason="entry executed",
+            source_chain_step="post_decision",
+        ))
+    elif bar_entry_skipped_reason == "position_already_open":
+        checks.append(RuleCheck(
+            canonical_rule_id="entry_execution", rule_group=RULE_TAXONOMY["entry_execution"],
+            result="BLOCK", computed=True, used_in_decision=True,
+            value={"entry_executed": False, "reason": "position_already_open"},
+            threshold="decision in {BUY,SELL} AND no_open_position AND atr_available",
+            evidence_ids=(),
+            reason="Decision was BUY/SELL but existing position blocked entry",
+            source_chain_step="post_decision",
+        ))
+    else:
+        checks.append(RuleCheck(
+            canonical_rule_id="entry_execution", rule_group=RULE_TAXONOMY["entry_execution"],
+            result="SKIPPED", computed=True, used_in_decision=False,
+            value={"entry_executed": False, "reason": bar_entry_skipped_reason},
+            threshold="decision in {BUY,SELL} AND no_open_position AND atr_available",
+            evidence_ids=(),
+            reason=f"entry skipped: {bar_entry_skipped_reason}",
+            source_chain_step="post_decision",
+        ))
+
+    # 18: exit_check
+    if not had_open_position:
+        checks.append(make_skipped_check(
+            "exit_check", "no_position_to_check",
+            threshold="low<=stop OR high>=tp OR bars_held>=max_holding",
+            source_chain_step="pre_decision",
+        ))
+    elif bar_exit_event:
+        checks.append(RuleCheck(
+            canonical_rule_id="exit_check", rule_group=RULE_TAXONOMY["exit_check"],
+            result="PASS", computed=True, used_in_decision=True,
+            value={"exited": True, "exit_reason": bar_exit_reason,
+                   "low": pos_low, "high": pos_high,
+                   "stop": pos_stop, "tp": pos_tp,
+                   "bars_held": bars_held_after, "max_holding": max_holding_bars},
+            threshold="low<=stop OR high>=tp OR bars_held>=max_holding",
+            evidence_ids=(), reason=f"position exited via {bar_exit_reason}",
+            source_chain_step="pre_decision",
+        ))
+    else:
+        checks.append(RuleCheck(
+            canonical_rule_id="exit_check", rule_group=RULE_TAXONOMY["exit_check"],
+            result="PASS", computed=True, used_in_decision=True,
+            value={"exited": False, "low": pos_low, "high": pos_high,
+                   "stop": pos_stop, "tp": pos_tp,
+                   "bars_held": bars_held_after, "max_holding": max_holding_bars},
+            threshold="low<=stop OR high>=tp OR bars_held>=max_holding",
+            evidence_ids=(), reason="position remains open",
+            source_chain_step="pre_decision",
+        ))
+
+    # 19: final_decision (terminal — always PASS or BLOCK)
+    if decision.action == "HOLD":
+        checks.append(RuleCheck(
+            canonical_rule_id="final_decision", rule_group=RULE_TAXONOMY["final_decision"],
+            result="BLOCK", computed=True, used_in_decision=True,
+            value=decision.action, threshold=None, evidence_ids=(),
+            reason=decision.reason, source_chain_step="terminal",
+        ))
+    else:
+        checks.append(RuleCheck(
+            canonical_rule_id="final_decision", rule_group=RULE_TAXONOMY["final_decision"],
+            result="PASS", computed=True, used_in_decision=True,
+            value=decision.action, threshold=None, evidence_ids=(),
+            reason=decision.reason, source_chain_step="terminal",
+        ))
+
+    return tuple(checks)
+
+
+def build_atr_unavailable_trace(
+    *,
+    run_id: str,
+    df: pd.DataFrame,
+    i: int,
+    ts: pd.Timestamp,
+    symbol: str,
+    interval: str,
+    data_source: str,
+    events_tuple: tuple[Event, ...],
+    pos_after,           # EnginePosition | None
+    position_before: dict | None,
+    bars_held_before: int | None,
+    had_open_position: bool,
+    bar_exit_event: bool,
+    bar_exit_reason: str | None,
+    bar_exit_price: float | None,
+    bar_exit_trade_id: str | None,
+) -> BarDecisionTrace:
+    """Trace for a bar where ATR is NaN — engine bailed before decide()."""
+    from .backtest_engine import _position_dict  # local import to avoid cycle
+
+    market = market_slice(df, i, data_source)
+    technical = technical_slice(None, None, "HOLD", [])
+    waveform = waveform_slice(None, None, market.close)
+    higher_tf = higher_tf_slice(interval, "UNKNOWN", "HOLD", use_higher_tf=False)
+    fundamental = fundamental_slice(events_tuple, ts, blocked_codes=())
+    exec_assumption = execution_assumption_slice()
+    exec_trace = execution_trace_slice(
+        position_before=position_before,
+        position_after=_position_dict(pos_after),
+        had_open_position=had_open_position,
+        decision_action="HOLD",
+        bar_entry_executed=False,
+        bar_entry_price=None,
+        bar_entry_skipped_reason="atr_unavailable",
+        bar_exit_event=bar_exit_event,
+        bar_exit_reason=bar_exit_reason,
+        bar_exit_price=bar_exit_price,
+        bar_exit_trade_id=bar_exit_trade_id,
+        bars_held_before=bars_held_before,
+    )
+    # Compose 19 rule_checks: gates SKIPPED, atr_available BLOCK, chain
+    # NOT_REACHED, position_state INFO, entry_execution SKIPPED.
+    checks: list[RuleCheck] = []
+    for rid in (
+        "data_quality", "calendar_freshness", "event_high", "spread_abnormal",
+        "daily_loss_cap", "consecutive_losses", "rule_unverified", "sentiment_spike",
+    ):
+        checks.append(make_skipped_check(
+            rid, "engine bailed before risk_gate (atr_unavailable)",
+            source_chain_step="risk_gate",
+        ))
+    checks.append(RuleCheck(
+        canonical_rule_id="atr_available", rule_group=RULE_TAXONOMY["atr_available"],
+        result="BLOCK", computed=True, used_in_decision=True,
+        value=None, threshold=">0", evidence_ids=(),
+        reason="ATR(14) is NaN or non-positive; bar skipped",
+        source_chain_step="pre_decision",
+    ))
+    for rid in (
+        "technical_directionality", "pattern_check", "higher_tf_alignment",
+        "risk_reward_floor", "llm_advisory", "waveform_advisory",
+    ):
+        checks.append(make_not_reached_check(
+            rid, "engine bailed before decide() (atr_unavailable)",
+            computed=False,
+        ))
+    checks.append(RuleCheck(
+        canonical_rule_id="position_state", rule_group=RULE_TAXONOMY["position_state"],
+        result="INFO", computed=True, used_in_decision=False,
+        value=("has_open_position" if had_open_position else "no_open_position"),
+        threshold="one_position_at_a_time", evidence_ids=(),
+        reason="bar skipped (atr_unavailable); no entry attempted",
+        source_chain_step="post_decision",
+    ))
+    checks.append(make_skipped_check(
+        "entry_execution", "atr_unavailable",
+        threshold="decision in {BUY,SELL} AND no_open_position AND atr_available",
+        source_chain_step="post_decision",
+    ))
+    checks.append(RuleCheck(
+        canonical_rule_id="exit_check", rule_group=RULE_TAXONOMY["exit_check"],
+        result=("PASS" if had_open_position else "SKIPPED"),
+        computed=True, used_in_decision=had_open_position,
+        value={"exited": bar_exit_event, "exit_reason": bar_exit_reason},
+        threshold="low<=stop OR high>=tp OR bars_held>=max_holding",
+        evidence_ids=(), reason="exit logic ran with available OHLC",
+        source_chain_step="pre_decision",
+    ))
+    checks.append(RuleCheck(
+        canonical_rule_id="final_decision", rule_group=RULE_TAXONOMY["final_decision"],
+        result="BLOCK", computed=True, used_in_decision=True,
+        value="HOLD", threshold=None, evidence_ids=(),
+        reason="bar skipped because ATR not yet available",
+        source_chain_step="terminal",
+    ))
+
+    decision = DecisionSlice(
+        technical_only_action="HOLD",
+        final_action="HOLD",
+        action_changed_by_engine=False,
+        blocked_by=("atr_unavailable",),
+        rule_chain=(),
+        confidence=0.0,
+        reason="ATR(14) unavailable; engine could not run decide()",
+        advisory={},
+    )
+
+    return BarDecisionTrace(
+        run_id=run_id,
+        trace_schema_version=TRACE_SCHEMA_VERSION,
+        bar_id=f"{symbol}_{interval}_{ts.isoformat()}",
+        timestamp=ts.isoformat(),
+        symbol=symbol, timeframe=interval, bar_index=i,
+        market=market, technical=technical, waveform=waveform,
+        higher_timeframe=higher_tf, fundamental=fundamental,
+        execution_assumption=exec_assumption, execution_trace=exec_trace,
+        rule_checks=tuple(checks),
+        decision=decision,
+        future_outcome=None,
+    )
+
+
+def build_full_trace(
+    *,
+    run_id: str,
+    df: pd.DataFrame,
+    i: int,
+    ts: pd.Timestamp,
+    symbol: str,
+    interval: str,
+    data_source: str,
+    events_tuple: tuple[Event, ...],
+    snap: Snapshot,
+    atr_value: float,
+    tech: str,
+    tech_reason_codes: list[str],
+    pattern: PatternResult,
+    higher_tf: str,
+    use_higher_tf: bool,
+    risk_state: RiskState,
+    llm_signal,
+    decision: Decision,
+    risk_reward: float,
+    stop_atr_mult: float,
+    tp_atr_mult: float,
+    max_holding_bars: int,
+    position_before: dict | None,
+    position_after: dict | None,
+    bars_held_before: int | None,
+    had_open_position: bool,
+    bar_entry_executed: bool,
+    bar_entry_price: float | None,
+    bar_entry_skipped_reason: str,
+    bar_exit_event: bool,
+    bar_exit_reason: str | None,
+    bar_exit_price: float | None,
+    bar_exit_trade_id: str | None,
+) -> BarDecisionTrace:
+    """Full trace for a normally processed bar."""
+    market = market_slice(df, i, data_source)
+    technical = technical_slice(snap, atr_value, tech, tech_reason_codes)
+    waveform = waveform_slice(pattern, atr_value, market.close)
+    higher_tf_s = higher_tf_slice(interval, higher_tf, tech, use_higher_tf)
+    fundamental = fundamental_slice(
+        risk_state.events, ts, blocked_codes=tuple(decision.blocked_by)
+    )
+    exec_assumption = execution_assumption_slice()
+    exec_trace = execution_trace_slice(
+        position_before=position_before,
+        position_after=position_after,
+        had_open_position=had_open_position,
+        decision_action=decision.action,
+        bar_entry_executed=bar_entry_executed,
+        bar_entry_price=bar_entry_price,
+        bar_entry_skipped_reason=bar_entry_skipped_reason,
+        bar_exit_event=bar_exit_event,
+        bar_exit_reason=bar_exit_reason,
+        bar_exit_price=bar_exit_price,
+        bar_exit_trade_id=bar_exit_trade_id,
+        bars_held_before=bars_held_before,
+    )
+    pos_low = float(df["low"].iloc[i]) if had_open_position else None
+    pos_high = float(df["high"].iloc[i]) if had_open_position else None
+    pos_stop = (position_before or {}).get("stop") if had_open_position else None
+    pos_tp = (position_before or {}).get("take_profit") if had_open_position else None
+    bars_held_after = (
+        position_after.get("bars_held") if position_after is not None
+        else (bars_held_before + 1 if bars_held_before is not None else None)
+    )
+
+    rule_checks = build_rule_checks_full(
+        risk_state=risk_state, decision=decision, pattern=pattern,
+        higher_tf=higher_tf, risk_reward=risk_reward,
+        min_risk_reward=1.5, atr_value=atr_value,
+        technical_only_action=tech,
+        llm_signal_present=llm_signal is not None,
+        waveform_bias_present=False,
+        bar_exit_event=bar_exit_event, bar_exit_reason=bar_exit_reason,
+        had_open_position=had_open_position,
+        bar_entry_executed=bar_entry_executed,
+        bar_entry_skipped_reason=bar_entry_skipped_reason,
+        pos_low=pos_low, pos_high=pos_high,
+        pos_stop=pos_stop, pos_tp=pos_tp,
+        bars_held_after=bars_held_after,
+        max_holding_bars=max_holding_bars,
+    )
+
+    decision_s = decision_slice(decision, technical_only_action=tech)
+
+    return BarDecisionTrace(
+        run_id=run_id,
+        trace_schema_version=TRACE_SCHEMA_VERSION,
+        bar_id=f"{symbol}_{interval}_{ts.isoformat()}",
+        timestamp=ts.isoformat(),
+        symbol=symbol, timeframe=interval, bar_index=i,
+        market=market, technical=technical, waveform=waveform,
+        higher_timeframe=higher_tf_s, fundamental=fundamental,
+        execution_assumption=exec_assumption, execution_trace=exec_trace,
+        rule_checks=rule_checks,
+        decision=decision_s,
+        future_outcome=None,
+    )
+
+
+def _simulate_hypothetical_trade(
+    df: pd.DataFrame, i: int, action: str,
+    atr_value: float, stop_atr_mult: float, tp_atr_mult: float,
+    max_holding_bars: int,
+) -> tuple[str, float, int, float] | tuple[None, None, None, None]:
+    """Walk forward from bar i with technical_only_action; same stop/tp/max as engine.
+
+    Returns (exit_reason, exit_price, bars_held, return_pct). All None for
+    HOLD or invalid action. Verification-only — never read by decide().
+    """
+    if action not in ("BUY", "SELL"):
+        return (None, None, None, None)
+    if atr_value is None or atr_value <= 0:
+        return (None, None, None, None)
+    entry_price = float(df["close"].iloc[i])
+    if entry_price <= 0:
+        return (None, None, None, None)
+    offset = stop_atr_mult * atr_value
+    tp_offset = tp_atr_mult * atr_value
+    if action == "BUY":
+        stop = entry_price - offset
+        tp = entry_price + tp_offset
+    else:
+        stop = entry_price + offset
+        tp = entry_price - tp_offset
+    end = min(i + 1 + max_holding_bars, len(df))
+    direction = 1 if action == "BUY" else -1
+    for j in range(i + 1, end):
+        high = float(df["high"].iloc[j])
+        low = float(df["low"].iloc[j])
+        if action == "BUY":
+            if low <= stop:
+                exit_price = stop
+                ret = 100 * (exit_price - entry_price) / entry_price * direction
+                return ("stop", exit_price, j - i, ret)
+            if high >= tp:
+                exit_price = tp
+                ret = 100 * (exit_price - entry_price) / entry_price * direction
+                return ("take_profit", exit_price, j - i, ret)
+        else:
+            if high >= stop:
+                exit_price = stop
+                ret = 100 * (exit_price - entry_price) / entry_price * direction
+                return ("stop", exit_price, j - i, ret)
+            if low <= tp:
+                exit_price = tp
+                ret = 100 * (exit_price - entry_price) / entry_price * direction
+                return ("take_profit", exit_price, j - i, ret)
+    # Force-close at the last walked bar.
+    if end - 1 >= i + 1:
+        last_close = float(df["close"].iloc[end - 1])
+        ret = 100 * (last_close - entry_price) / entry_price * direction
+        reason = "max_holding" if (end - 1 - i) >= max_holding_bars else "end_of_data"
+        return (reason, last_close, end - 1 - i, ret)
+    return (None, None, None, None)
+
+
+def populate_future_outcomes(
+    *,
+    traces: list[BarDecisionTrace],
+    df: pd.DataFrame,
+    interval: str,
+    stop_atr_mult: float,
+    tp_atr_mult: float,
+    max_holding_bars: int,
+    atr_series: pd.Series,
+) -> None:
+    """Second-pass: fill FutureOutcomeSlice on every trace.
+
+    Decision pipeline never reaches this function; it runs after the bar
+    loop completes. Pinned by test_future_outcome_does_not_affect_decisions.
+    """
+    horizons = HORIZON_BARS_TABLE.get(interval, {"1h": None, "4h": None, "24h": None})
+    closes = df["close"].to_numpy(dtype=float)
+    highs = df["high"].to_numpy(dtype=float)
+    lows = df["low"].to_numpy(dtype=float)
+    n = len(df)
+
+    for trace in traces:
+        i = trace.bar_index
+        close_i = closes[i]
+        # Per-horizon returns
+        future_buy: dict[str, float | None] = {"1h": None, "4h": None, "24h": None}
+        future_sell: dict[str, float | None] = {"1h": None, "4h": None, "24h": None}
+        available: list[str] = []
+        unavailable: dict[str, str] = {}
+        for hname, hbars in horizons.items():
+            if hbars is None:
+                unavailable[hname] = "interval coarser than horizon"
+                continue
+            if i + hbars >= n:
+                unavailable[hname] = "horizon exceeds remaining bars"
+                continue
+            target_close = closes[i + hbars]
+            ret_buy = 100.0 * (target_close - close_i) / close_i if close_i else None
+            ret_sell = -ret_buy if ret_buy is not None else None
+            future_buy[hname] = ret_buy
+            future_sell[hname] = ret_sell
+            available.append(hname)
+
+        # MFE/MAE over 24h horizon (or shortest available)
+        mfe_buy = mae_buy = mfe_sell = mae_sell = None
+        h24 = horizons.get("24h")
+        if h24 is not None and i + h24 < n:
+            window_high = highs[i + 1: i + h24 + 1]
+            window_low = lows[i + 1: i + h24 + 1]
+            if len(window_high):
+                mfe_buy = 100.0 * (float(window_high.max()) - close_i) / close_i
+                mae_buy = 100.0 * (float(window_low.min()) - close_i) / close_i
+                mfe_sell = -mae_buy
+                mae_sell = -mfe_buy
+
+        # Hypothetical trade in technical_only_action direction
+        atr_at_i = float(atr_series.iloc[i]) if i < len(atr_series) else float("nan")
+        hyp_reason, hyp_price, hyp_bars, hyp_ret = _simulate_hypothetical_trade(
+            df, i, trace.decision.technical_only_action,
+            atr_at_i if not np.isnan(atr_at_i) else 0.0,
+            stop_atr_mult, tp_atr_mult, max_holding_bars,
+        )
+
+        # outcome / gate_effect classification
+        if hyp_ret is None:
+            outcome = "N/A"
+        elif hyp_ret > 0:
+            outcome = "WIN"
+        elif hyp_ret < 0:
+            outcome = "LOSS"
+        else:
+            outcome = "FLAT"
+
+        tech_action = trace.decision.technical_only_action
+        final_action = trace.decision.final_action
+        if tech_action == final_action:
+            gate_effect = "NO_CHANGE"
+        elif tech_action in ("BUY", "SELL") and final_action == "HOLD":
+            if outcome == "LOSS":
+                gate_effect = "PROTECTED"
+                outcome = "LOSS_AVOIDED"
+            elif outcome == "WIN":
+                gate_effect = "COST_OPPORTUNITY"
+                outcome = "WIN_MISSED"
+            else:
+                gate_effect = "NO_CHANGE"
+        else:
+            gate_effect = "NO_CHANGE"
+
+        trace.future_outcome = FutureOutcomeSlice(
+            horizons_bars={k: int(v) if v is not None else None for k, v in horizons.items()},
+            future_return_1h_if_buy_pct=future_buy["1h"],
+            future_return_4h_if_buy_pct=future_buy["4h"],
+            future_return_24h_if_buy_pct=future_buy["24h"],
+            future_return_1h_if_sell_pct=future_sell["1h"],
+            future_return_4h_if_sell_pct=future_sell["4h"],
+            future_return_24h_if_sell_pct=future_sell["24h"],
+            mfe_24h_if_buy_pct=mfe_buy,
+            mae_24h_if_buy_pct=mae_buy,
+            mfe_24h_if_sell_pct=mfe_sell,
+            mae_24h_if_sell_pct=mae_sell,
+            available_horizons=tuple(available),
+            unavailable_horizons=unavailable,
+            outcome_if_technical_action_taken=outcome,
+            gate_effect=gate_effect,
+            hypothetical_technical_trade_exit_reason=hyp_reason,
+            hypothetical_technical_trade_exit_price=hyp_price,
+            hypothetical_technical_trade_bars_held=hyp_bars,
+            hypothetical_technical_trade_return_pct=hyp_ret,
+        )
