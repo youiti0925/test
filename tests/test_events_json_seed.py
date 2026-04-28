@@ -424,3 +424,127 @@ def test_known_event_dates_pinned(
         f"{expected_currency} containing {title_keyword!r}\n"
         f"Source: {source_note}"
     )
+
+
+# ─── 2025 BLS revised release dates (post-shutdown) ─────────────────────────
+# Source: https://www.bls.gov/bls/2025-lapse-revised-release-dates.htm
+# The 2025 US government shutdown (Oct 1 → Nov 12, 2025) delayed multiple
+# BLS releases and CANCELED others. events.json must reflect actual market
+# events, not the original schedule.
+
+
+@pytest.mark.parametrize(
+    "expected_when_iso,expected_currency,title_keyword,source_note",
+    [
+        # --- Pre-shutdown releases (no change) ---
+        ("2025-09-05T12:30:00+00:00", "USD", "Non-Farm Payrolls",
+         "BLS Employment Situation — Aug 2025 data, first Friday Sep 5 2025 "
+         "(was 2025-09-04 in PR #9 v2; corrected to first-Friday convention)"),
+        ("2025-09-11T12:30:00+00:00", "USD", "CPI",
+         "BLS CPI — Aug 2025 data on 2025-09-11 (no shutdown impact)"),
+
+        # --- Shutdown-delayed releases ---
+        ("2025-10-24T12:30:00+00:00", "USD", "CPI",
+         "BLS CPI for Sep 2025 — ORIGINAL 2025-10-15, REVISED 2025-10-24 "
+         "due to 2025 government shutdown. Source: bls.gov/bls/092025-cpi-reschedule-notice.htm"),
+        ("2025-11-20T13:30:00+00:00", "USD", "Non-Farm Payrolls",
+         "BLS Employment Situation for Sep 2025 — ORIGINAL 2025-10-03, "
+         "REVISED 2025-11-20 due to shutdown. Source: "
+         "bls.gov/bls/2025-lapse-revised-release-dates.htm + "
+         "bls.gov/news.release/archives/empsit_11202025.htm"),
+        ("2025-12-16T13:30:00+00:00", "USD", "Non-Farm Payrolls",
+         "BLS Employment Situation for Nov 2025 (combined with Oct est. data) "
+         "— ORIGINAL 2025-12-05, REVISED 2025-12-16 due to shutdown. "
+         "Source: bls.gov/news.release/archives/empsit_12162025.htm"),
+        ("2025-12-18T13:30:00+00:00", "USD", "CPI",
+         "BLS CPI for Nov 2025 — ORIGINAL 2025-12-10, REVISED 2025-12-18 "
+         "due to shutdown."),
+    ],
+)
+def test_bls_2025_shutdown_revised_dates_pinned(
+    expected_when_iso, expected_currency, title_keyword, source_note
+):
+    """Pin the 2025 BLS revised release dates that resulted from the
+    2025 US government shutdown. These dates are when the market actually
+    saw the data, NOT the originally scheduled dates."""
+    from datetime import datetime
+    expected_when = datetime.fromisoformat(expected_when_iso)
+    events = load_events(EVENTS_JSON)
+    matches = [
+        e for e in events
+        if e.when == expected_when
+        and e.currency == expected_currency
+        and title_keyword.upper() in e.title.upper()
+    ]
+    assert matches, (
+        f"events.json missing required revised-date event: "
+        f"{expected_when_iso} {expected_currency} {title_keyword!r}\n"
+        f"Source: {source_note}"
+    )
+
+
+def test_canceled_oct_2025_nfp_not_in_events_json():
+    """The October 2025 Employment Situation was CANCELED due to the
+    shutdown — the household survey data could not be retroactively
+    collected. events.json must NOT contain a 2025-11-07 NFP entry,
+    which would have been the original release date.
+
+    Source: https://www.bls.gov/bls/2025-lapse-revised-release-dates.htm
+    """
+    from datetime import datetime
+    events = load_events(EVENTS_JSON)
+    forbidden = datetime.fromisoformat("2025-11-07T13:30:00+00:00")
+    matches = [
+        e for e in events
+        if e.when == forbidden
+        and "PAYROLL" in e.title.upper()
+    ]
+    assert not matches, (
+        f"events.json must NOT carry 2025-11-07 NFP — that release was "
+        f"CANCELED by BLS due to the shutdown. Found: "
+        f"{[e.title for e in matches]}"
+    )
+
+
+def test_canceled_oct_2025_cpi_not_in_events_json():
+    """The October 2025 CPI release was CANCELED due to the shutdown
+    (BLS could not collect October reference period survey data).
+    events.json must NOT contain a 2025-11-13 CPI entry.
+
+    Source: https://www.bls.gov/bls/2025-lapse-revised-release-dates.htm
+            https://www.bls.gov/cpi/additional-resources/2025-federal-government-shutdown-impact-cpi.htm
+    """
+    from datetime import datetime
+    events = load_events(EVENTS_JSON)
+    forbidden = datetime.fromisoformat("2025-11-13T13:30:00+00:00")
+    matches = [
+        e for e in events
+        if e.when == forbidden
+        and "CPI" in e.title.upper()
+    ]
+    assert not matches, (
+        f"events.json must NOT carry 2025-11-13 CPI — that release was "
+        f"CANCELED by BLS due to the shutdown. Found: "
+        f"{[e.title for e in matches]}"
+    )
+
+
+def test_canceled_oct_nov_releases_not_present_full_check():
+    """All originally scheduled but canceled BLS dates from the shutdown
+    must NOT appear in events.json (full check, including any dates that
+    would correspond to first-Friday/standard CPI patterns)."""
+    from datetime import datetime
+    events = load_events(EVENTS_JSON)
+
+    # Original (canceled) NFP date for Oct 2025 data
+    forbidden_dates_iso = [
+        "2025-11-07",   # Oct 2025 NFP — canceled
+        "2025-11-13",   # Oct 2025 CPI — canceled
+    ]
+    for d in forbidden_dates_iso:
+        # Match by date prefix only (any HH:MM:SS).
+        bad = [e for e in events if e.when.date().isoformat() == d]
+        assert not bad, (
+            f"events.json contains forbidden canceled BLS release on {d}: "
+            f"{[(e.title, e.when) for e in bad]}"
+        )
