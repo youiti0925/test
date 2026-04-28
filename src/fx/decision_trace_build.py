@@ -376,22 +376,36 @@ def macro_context_slice(
     if macro is None:
         return None
 
+    # yfinance's daily series come back tz-naive; the engine's bar ts is
+    # tz-aware (UTC). Series.asof raises TypeError on mixed-tz compare,
+    # which MacroSnapshot.value_at swallows as None — i.e., every slot
+    # silently looks "missing" even when the snapshot is fully populated.
+    # Normalize ts once, here, to match the snapshot's index timezone.
+    ts_lookup = ts
+    for series in macro.series.values():
+        idx_tz = getattr(series.index, "tz", None)
+        if idx_tz is None and ts.tzinfo is not None:
+            ts_lookup = ts.tz_localize(None)
+        elif idx_tz is not None and ts.tzinfo is None:
+            ts_lookup = ts.tz_localize(idx_tz)
+        break
+
     levels: dict[str, float | None] = {}
     available: list[str] = []
     missing: list[str] = []
     for slot in _MACRO_LEVEL_SLOTS:
-        v = macro.value_at(slot, ts)
+        v = macro.value_at(slot, ts_lookup)
         levels[slot] = v
         if v is None:
             missing.append(slot)
         else:
             available.append(slot)
 
-    yield_spread = macro.yield_spread_long_short(ts)
+    yield_spread = macro.yield_spread_long_short(ts_lookup)
 
     def _pct_change(slot: str, delta: pd.Timedelta) -> float | None:
-        now = macro.value_at(slot, ts)
-        prev = macro.value_at(slot, ts - delta)
+        now = macro.value_at(slot, ts_lookup)
+        prev = macro.value_at(slot, ts_lookup - delta)
         if now is None or prev is None or prev == 0 or not np.isfinite(prev):
             return None
         v = 100.0 * (now - prev) / prev
@@ -399,16 +413,16 @@ def macro_context_slice(
 
     def _abs_change(slot: str, delta: pd.Timedelta) -> float | None:
         """For yields — return the percentage-point change (≈ basis-points/100)."""
-        now = macro.value_at(slot, ts)
-        prev = macro.value_at(slot, ts - delta)
+        now = macro.value_at(slot, ts_lookup)
+        prev = macro.value_at(slot, ts_lookup - delta)
         if now is None or prev is None:
             return None
         v = float(now) - float(prev)
         return v if np.isfinite(v) else None
 
     def _spread_change(delta: pd.Timedelta) -> float | None:
-        now = macro.yield_spread_long_short(ts)
-        prev = macro.yield_spread_long_short(ts - delta)
+        now = macro.yield_spread_long_short(ts_lookup)
+        prev = macro.yield_spread_long_short(ts_lookup - delta)
         if now is None or prev is None:
             return None
         v = float(now) - float(prev)

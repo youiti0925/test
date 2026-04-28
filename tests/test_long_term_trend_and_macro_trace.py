@@ -224,6 +224,41 @@ def test_macro_context_5d_delta_uses_value_5d_back():
     assert s.dxy_change_5d_pct == pytest.approx(100.0 * (now - prev) / prev, abs=1e-6)
 
 
+def test_macro_context_handles_tz_naive_macro_series():
+    """yfinance's daily macro series are tz-naive; the engine's bar ts
+    is tz-aware (UTC). Series.asof raises TypeError on mixed-tz compare,
+    which would otherwise silently turn every slot into None. The slice
+    must internally normalise ts so a tz-naive snapshot still resolves
+    real values."""
+    df = _ohlcv(24 * 30, start="2025-01-01")
+    # Build naive macro series — exactly what yfinance gives us.
+    naive_idx = pd.date_range("2024-11-01", periods=200, freq="1D")  # naive
+    series = {
+        "dxy": pd.Series(
+            np.linspace(100.0, 105.0, 200), index=naive_idx, name="dxy"
+        ),
+        "us10y": pd.Series(
+            np.linspace(4.20, 4.50, 200), index=naive_idx, name="us10y"
+        ),
+        "vix": pd.Series(
+            np.linspace(13.0, 22.0, 200), index=naive_idx, name="vix"
+        ),
+    }
+    macro = MacroSnapshot(
+        base_index=df.index, series=series, fetch_errors={},
+    )
+    ts_aware = df.index[24 * 15]  # UTC-aware
+    assert ts_aware.tzinfo is not None
+    s = macro_context_slice(macro, ts_aware)
+    assert s is not None
+    assert s.dxy is not None, (
+        "tz-naive macro series should still resolve via macro_context_slice"
+    )
+    assert s.us10y is not None
+    assert s.vix is not None
+    assert "dxy" in s.available_slots
+
+
 # ---------------------------------------------------------------------------
 # backtest_engine plumbing
 # ---------------------------------------------------------------------------
