@@ -1161,3 +1161,266 @@ def populate_future_outcomes(
             hypothetical_technical_trade_bars_held=hyp_bars,
             hypothetical_technical_trade_return_pct=hyp_ret,
         )
+
+
+# ---------------------------------------------------------------------------
+# Live-trade trace builders (PR #12)
+# ---------------------------------------------------------------------------
+#
+# `cmd_trade` produces one BarDecisionTrace per invocation (one bar = one
+# trade attempt), regardless of whether the action was BUY / SELL / HOLD.
+# These helpers re-use the existing slice builders so the schema stays
+# identical to backtest traces — only the metadata + execution_trace
+# slice carry the live-specific knobs.
+#
+# Constraints
+# - decision_trace.py schema is NOT changed.
+# - backtest_engine.py entry/exit logic is NOT pulled in.
+# - future_outcome stays None — live can't compute future returns
+#   on the same bar; that's an offline-only enrichment.
+
+
+# Synthetic bar_index used for live traces. Live runs do not have a
+# numeric bar_index from a sweep loop; this constant makes downstream
+# tools (trace-stats etc.) see a stable integer.
+_LIVE_BAR_INDEX = 0
+
+
+def build_live_run_metadata(
+    *,
+    run_id: str,
+    symbol: str,
+    interval: str,
+    broker_label: str,
+    dry_run: bool,
+    config_payload: dict[str, Any] | None = None,
+) -> "object":
+    """Construct a RunMetadata for one live cmd_trade invocation.
+
+    `broker_label` is one of "paper" / "oanda" / etc. — passed through to
+    `RunMetadata.input_data_source` so trace-stats users can tell live
+    runs apart from backtest runs.
+
+    `execution_mode` reflects dry-run-vs-live-trade so the analyst can
+    filter out dry-run traces when computing fill-aware metrics. Allowed
+    values: "live_dry_run", "live_paper", "live_oanda".
+    """
+    from .decision_trace import (
+        RunMetadata,
+        TRACE_SCHEMA_VERSION,
+        compute_strategy_config_hash,
+        get_commit_sha,
+    )
+
+    if dry_run:
+        execution_mode = "live_dry_run"
+    else:
+        execution_mode = f"live_{broker_label}"
+
+    sha, sha_status = get_commit_sha()
+    payload = config_payload or {}
+    return RunMetadata(
+        run_id=run_id,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        symbol=symbol,
+        timeframe=interval,
+        bar_range={"start": None, "end": None, "n_bars": 1, "warmup": 0},
+        trace_schema_version=TRACE_SCHEMA_VERSION,
+        strategy_config_hash=compute_strategy_config_hash(payload),
+        # Live runs have no static dataframe to hash; record the broker
+        # label so the trace makes its provenance obvious downstream.
+        data_snapshot_hash=f"live:{broker_label}:{symbol}",
+        input_data_source=broker_label,
+        input_data_retrieved_at=datetime.now(timezone.utc).isoformat(),
+        # Live still uses synthetic execution semantics for the analyst
+        # path (PaperBroker / dry-run). For real OANDA fills the engine
+        # already populates fill audit fields on the trades table; the
+        # decision_trace itself just records the same intent.
+        synthetic_execution=True,
+        commit_sha=sha,
+        commit_sha_status=sha_status,
+        execution_mode=execution_mode,
+        engine_version="cli.cmd_trade",
+        timezone_name="UTC",
+    )
+
+
+def build_live_decision_trace(
+    *,
+    run_id: str,
+    df: pd.DataFrame,
+    ts: pd.Timestamp,
+    symbol: str,
+    interval: str,
+    snap: Snapshot,
+    atr_value: float | None,
+    technical_action: str,
+    pattern: PatternResult,
+    higher_tf: str,
+    use_higher_tf: bool,
+    risk_state: RiskState,
+    llm_signal,
+    decision: Decision,
+    risk_reward: float,
+    broker_label: str,
+    dry_run: bool,
+    order_placed: bool,
+    fill: "object | None" = None,
+) -> BarDecisionTrace:
+    """Build one BarDecisionTrace for a live cmd_trade invocation.
+
+    Reuses the same slice builders as backtest. The differences are:
+    - `bar_index` is fixed at 0 (live = single-bar invocation).
+    - `execution_trace.entry_signal` reflects the engine decision; the
+      `entry_executed` / `exit_event` / `entry_price` fields encode
+      whether an order actually went out (False for dry-run / HOLD).
+    - `future_outcome` stays `None` — live cannot peek at future bars.
+    - `decision.advisory` carries the broker label and dry-run flag so
+      downstream filters can split live from paper from dry-run without
+      changing the schema.
+    """
+    # Slice 1: market — last bar of df
+    i_last = len(df) - 1
+    market = market_slice(df, i_last, data_source=broker_label)
+
+    # Slice 2: technical — derive reason codes from the same shared helper
+    from .indicators import technical_signal_reasons
+    _, tech_reason_codes = technical_signal_reasons(snap)
+    technical = technical_slice(snap, atr_value, technical_action, tech_reason_codes)
+
+    # Slice 3: waveform
+    wave = waveform_slice(pattern, atr_value, market.close)
+
+    # Slice 4: higher_tf
+    higher_tf_s = higher_tf_slice(interval, higher_tf, technical_action, use_higher_tf)
+
+    # Slice 5: fundamental — use whichever events the gate already saw
+    fundamental = fundamental_slice(
+        risk_state.events, ts, blocked_codes=tuple(decision.blocked_by)
+    )
+
+    # Slice 6: execution_assumption — re-use the schema-pinned helper. The
+    # broker / dry-run distinction is carried via run_metadata.execution_mode
+    # and decision.advisory; we don't bend execution_assumption fields.
+    exec_assumption = execution_assumption_slice()
+
+    # Slice 7: execution_trace — live-specific bookkeeping. The five
+    # values in `decision_trace.ENTRY_SKIPPED_REASONS` are a CLOSED
+    # taxonomy from the backtest world, so live cases must map to one of
+    # them. We pick the closest taxonomy value and keep the live-specific
+    # disposition (dry_run / order_not_placed / entry_executed / hold)
+    # in `decision.advisory.live_execution_status` so callers can split
+    # those cases without adding to the schema. Test pin:
+    # tests/test_decision_trace.py::test_entry_skipped_reason_in_fixed_candidates
+    # would fail if a live trace ever wrote a non-taxonomy value here.
+    entry_executed = bool(order_placed)
+    if decision.action == "HOLD":
+        # Engine decided HOLD — straightforward map to the existing value.
+        skipped_reason = "decision_was_HOLD"
+        live_execution_status = "hold"
+        entry_price = None
+        trade_id = None
+    else:
+        # Engine decided BUY/SELL — the engine path was clean; whether
+        # the broker actually filled is a wrapper-layer concern. We use
+        # the "entry_executed" sentinel ("no engine-level skip occurred")
+        # for all of: real fill, dry-run, broker-no-fill. The discriminator
+        # lives in advisory below.
+        skipped_reason = "entry_executed"
+        if dry_run:
+            live_execution_status = "dry_run"
+            entry_price = None
+            trade_id = None
+        elif not order_placed:
+            live_execution_status = "order_not_placed"
+            entry_price = None
+            trade_id = None
+        else:
+            live_execution_status = "entry_executed"
+            entry_price = float(getattr(fill, "actual_fill_price", None) or 0.0) or None
+            trade_id = getattr(fill, "broker_order_id", None) or None
+
+    exec_trace = ExecutionTraceSlice(
+        position_before=None,
+        position_after=None,
+        had_open_position=False,
+        entry_signal=decision.action,
+        entry_executed=entry_executed,
+        entry_price=entry_price,
+        entry_skipped_reason=skipped_reason,
+        exit_event=False,
+        exit_reason=None,
+        exit_price=None,
+        entry_trade_id=trade_id if entry_executed else None,
+        exit_trade_id=None,
+        trade_id=trade_id,
+        bars_held_before=None,
+        bars_held_after=None,
+    )
+
+    # Decoration on decision.advisory: stamp broker label + live execution
+    # status WITHOUT mutating the original decision (frozen dataclass).
+    # `live_execution_status` carries the live-specific disposition that
+    # cannot be expressed via the closed `entry_skipped_reason` taxonomy.
+    enriched_advisory = dict(decision.advisory)
+    enriched_advisory.setdefault("live_broker", broker_label)
+    enriched_advisory.setdefault("live_dry_run", dry_run)
+    enriched_advisory.setdefault("live_order_placed", entry_executed)
+    enriched_advisory.setdefault("live_execution_status", live_execution_status)
+
+    decision_s = DecisionSlice(
+        technical_only_action=technical_action,
+        final_action=decision.action,
+        action_changed_by_engine=(decision.action != technical_action),
+        blocked_by=tuple(decision.blocked_by),
+        rule_chain=tuple(decision.rule_chain),
+        confidence=float(decision.confidence),
+        reason=decision.reason,
+        advisory=enriched_advisory,
+    )
+
+    # Rule checks — re-use the full builder. Live and backtest share the
+    # same rule chain so this should yield identical PASS / NOT_REACHED
+    # patterns for the same inputs.
+    pos_low = pos_high = pos_stop = pos_tp = None
+    rule_checks = build_rule_checks_full(
+        risk_state=risk_state,
+        decision=decision,
+        pattern=pattern,
+        higher_tf=higher_tf,
+        risk_reward=risk_reward,
+        min_risk_reward=1.5,
+        atr_value=atr_value,
+        technical_only_action=technical_action,
+        llm_signal_present=llm_signal is not None,
+        waveform_bias_present=False,
+        bar_exit_event=False,
+        bar_exit_reason=None,
+        had_open_position=False,
+        bar_entry_executed=entry_executed,
+        bar_entry_skipped_reason=skipped_reason,
+        pos_low=pos_low, pos_high=pos_high,
+        pos_stop=pos_stop, pos_tp=pos_tp,
+        bars_held_after=None,
+        max_holding_bars=0,
+    )
+
+    return BarDecisionTrace(
+        run_id=run_id,
+        trace_schema_version=TRACE_SCHEMA_VERSION,
+        bar_id=f"{symbol}_{interval}_{ts.isoformat()}",
+        timestamp=ts.isoformat(),
+        symbol=symbol,
+        timeframe=interval,
+        bar_index=_LIVE_BAR_INDEX,
+        market=market,
+        technical=technical,
+        waveform=wave,
+        higher_timeframe=higher_tf_s,
+        fundamental=fundamental,
+        execution_assumption=exec_assumption,
+        execution_trace=exec_trace,
+        rule_checks=rule_checks,
+        decision=decision_s,
+        future_outcome=None,
+    )

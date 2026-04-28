@@ -429,20 +429,56 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
     ctx = _gather_inputs(args, cfg, storage)
     snap, decision, atr_value = ctx["snapshot"], ctx["decision"], ctx["atr"]
 
+    # Live trace plumbing — single helper that the three exit branches
+    # (HOLD / dry-run / live order) all call so every cmd_trade invocation
+    # produces exactly one BarDecisionTrace. When --trace-out / --trace-out-default
+    # is given but export fails, we surface the error to the caller via
+    # `trace_export_error` and the exit branches return code 2 — silent
+    # success on a requested-but-failed export would be dangerous.
+    trace_export_paths: dict[str, str] | None = None
+    trace_export_error: str | None = None
+
+    def _emit_live_trace(*, order_placed: bool, fill_obj: object | None) -> None:
+        nonlocal trace_export_paths, trace_export_error
+        out_dir = _resolve_live_trace_out_dir(args, ctx)
+        if out_dir is None:
+            return
+        try:
+            trace_export_paths = _write_live_trace(
+                ctx=ctx,
+                args=args,
+                broker_label=args.broker,
+                dry_run=bool(getattr(args, "dry_run", False)),
+                order_placed=order_placed,
+                fill_obj=fill_obj,
+                out_dir=out_dir,
+                overwrite=bool(getattr(args, "overwrite", False)),
+            )
+        except (FileExistsError, ValueError, OSError) as exc:
+            trace_export_error = f"{type(exc).__name__}: {exc}"
+            print(
+                f"[error] live trace export failed: {trace_export_error}",
+                file=sys.stderr,
+            )
+
     if decision.action == "HOLD":
-        _print(
-            {
-                "action": "HOLD",
-                "reason": decision.reason,
-                "blocked_by": list(decision.blocked_by),
-                "spread_pct": spread_pct,
-                "calendar": (
-                    ctx["calendar_freshness"].to_dict()
-                    if ctx.get("calendar_freshness") else None
-                ),
-            }
-        )
-        return 0
+        _emit_live_trace(order_placed=False, fill_obj=None)
+        payload_hold = {
+            "action": "HOLD",
+            "reason": decision.reason,
+            "blocked_by": list(decision.blocked_by),
+            "spread_pct": spread_pct,
+            "calendar": (
+                ctx["calendar_freshness"].to_dict()
+                if ctx.get("calendar_freshness") else None
+            ),
+        }
+        if trace_export_paths:
+            payload_hold["trace_export"] = trace_export_paths
+        if trace_export_error:
+            payload_hold["trace_export_error"] = trace_export_error
+        _print(payload_hold)
+        return 2 if trace_export_error else 0
 
     if atr_value <= 0:
         print("[warn] ATR is non-positive; cannot size trade.", file=sys.stderr)
@@ -473,21 +509,25 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
     )
 
     if args.dry_run:
-        _print(
-            {
-                "mode": "dry-run",
-                "symbol": args.symbol,
-                "decision": {
-                    "action": decision.action,
-                    "confidence": decision.confidence,
-                    "reason": decision.reason,
-                },
-                "plan": plan.to_dict(),
-                "spread_pct": spread_pct,
-                "would_place_order": True,
-            }
-        )
-        return 0
+        _emit_live_trace(order_placed=False, fill_obj=None)
+        payload_dry = {
+            "mode": "dry-run",
+            "symbol": args.symbol,
+            "decision": {
+                "action": decision.action,
+                "confidence": decision.confidence,
+                "reason": decision.reason,
+            },
+            "plan": plan.to_dict(),
+            "spread_pct": spread_pct,
+            "would_place_order": True,
+        }
+        if trace_export_paths:
+            payload_dry["trace_export"] = trace_export_paths
+        if trace_export_error:
+            payload_dry["trace_export_error"] = trace_export_error
+        _print(payload_dry)
+        return 2 if trace_export_error else 0
 
     pos = broker.place_order(
         symbol=args.symbol,
@@ -523,25 +563,163 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
         fill_time=fill.fill_time if fill else None,
         execution_latency_ms=fill.execution_latency_ms if fill else None,
     )
-    _print(
-        {
-            "mode": "live",
-            "broker": args.broker,
-            "trade_id": trade_id,
-            "position": {
-                "id": pos.id,
-                "symbol": pos.symbol,
-                "side": pos.side,
-                "entry": pos.entry,
-                "size": pos.size,
-                "stop": pos.stop,
-                "take_profit": pos.take_profit,
-            },
-            "fill": fill.to_dict() if fill else None,
-            "plan": plan.to_dict(),
-        }
+    _emit_live_trace(order_placed=True, fill_obj=fill)
+    payload_live = {
+        "mode": "live",
+        "broker": args.broker,
+        "trade_id": trade_id,
+        "position": {
+            "id": pos.id,
+            "symbol": pos.symbol,
+            "side": pos.side,
+            "entry": pos.entry,
+            "size": pos.size,
+            "stop": pos.stop,
+            "take_profit": pos.take_profit,
+        },
+        "fill": fill.to_dict() if fill else None,
+        "plan": plan.to_dict(),
+    }
+    if trace_export_paths:
+        payload_live["trace_export"] = trace_export_paths
+    if trace_export_error:
+        payload_live["trace_export_error"] = trace_export_error
+    _print(payload_live)
+    return 2 if trace_export_error else 0
+
+
+def _resolve_live_trace_out_dir(args, ctx) -> "Path | None":
+    """Decide the live trace output directory based on CLI flags.
+
+    --trace-out wins over --trace-out-default. When --trace-out-default is
+    on but the run_id helper has not yet been generated, we mint one here
+    so the directory name is deterministic for the rest of the call.
+    """
+    if getattr(args, "trace_out", None):
+        return Path(args.trace_out)
+    if getattr(args, "trace_out_default", False):
+        from .decision_trace_build import build_run_id
+        if "_live_run_id" not in ctx:
+            ctx["_live_run_id"] = build_run_id(args.symbol)
+        return Path("runs") / "live" / ctx["_live_run_id"]
+    return None
+
+
+def _write_live_trace(
+    *,
+    ctx: dict,
+    args,
+    broker_label: str,
+    dry_run: bool,
+    order_placed: bool,
+    fill_obj,
+    out_dir: "Path",
+    overwrite: bool,
+) -> dict[str, str]:
+    """Write run_metadata.json + decision_traces.jsonl for one cmd_trade run.
+
+    `decision_traces.jsonl` carries exactly one line (one bar) — live
+    invocations are single-bar by definition. Returns the resolved file
+    paths so the CLI can echo them in the JSON payload.
+    """
+    from .decision_trace_build import (
+        build_live_decision_trace,
+        build_live_run_metadata,
+        build_run_id,
     )
-    return 0
+
+    run_id = ctx.get("_live_run_id") or build_run_id(args.symbol)
+    df = ctx["df"]
+    ts = df.index[-1]
+    snap = ctx["snapshot"]
+    pattern = ctx["pattern"]
+    technical_action = ctx["technical"]
+    higher_tf = ctx["higher_tf"]
+    decision = ctx["decision"]
+    atr_value = ctx["atr"]
+
+    # Re-derive the same RiskState the engine saw — _gather_inputs builds
+    # it inline and discards it; re-build with the same inputs to feed
+    # rule_checks_full. This matches the values used by decide_action.
+    from datetime import timezone as _tz
+    from .risk_gate import RiskState as _RiskState
+    cal_health = ctx.get("calendar_freshness")
+    risk_state = _RiskState(
+        df=df,
+        events=tuple(ctx.get("events", [])),
+        spread_pct=getattr(args, "_spread_pct_override", None),
+        sentiment_snapshot=ctx.get("sentiment"),
+        calendar_freshness=cal_health,
+        require_calendar_fresh=bool(getattr(args, "require_fresh_calendar", False)),
+        require_spread=bool(getattr(args, "require_spread", False)),
+        now=ts.to_pydatetime() if ts.tzinfo else ts.tz_localize(_tz.utc).to_pydatetime(),
+    )
+
+    risk_reward = ctx.get("context").risk_reward if ctx.get("context") else None
+    if risk_reward is None:
+        risk_reward = 0.0
+
+    trace = build_live_decision_trace(
+        run_id=run_id,
+        df=df,
+        ts=ts,
+        symbol=args.symbol,
+        interval=args.interval,
+        snap=snap,
+        atr_value=atr_value if atr_value and atr_value > 0 else None,
+        technical_action=technical_action,
+        pattern=pattern,
+        higher_tf=higher_tf,
+        use_higher_tf=not bool(getattr(args, "no_higher_tf", False)),
+        risk_state=risk_state,
+        llm_signal=ctx.get("llm"),
+        decision=decision,
+        risk_reward=float(risk_reward),
+        broker_label=broker_label,
+        dry_run=dry_run,
+        order_placed=order_placed,
+        fill=fill_obj,
+    )
+
+    run_metadata = build_live_run_metadata(
+        run_id=run_id,
+        symbol=args.symbol,
+        interval=args.interval,
+        broker_label=broker_label,
+        dry_run=dry_run,
+        config_payload={
+            "broker": broker_label,
+            "dry_run": dry_run,
+            "interval": args.interval,
+        },
+    )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = out_dir / "run_metadata.json"
+    traces_path = out_dir / "decision_traces.jsonl"
+
+    if not overwrite:
+        existing = [p for p in (metadata_path, traces_path) if p.exists()]
+        if existing:
+            names = ", ".join(p.name for p in existing)
+            raise FileExistsError(
+                f"_write_live_trace: refusing to overwrite existing file(s) "
+                f"in {out_dir}: {names}. Pass --overwrite to replace."
+            )
+
+    metadata_path.write_text(
+        json.dumps(run_metadata.to_dict(), ensure_ascii=False,
+                   default=str, indent=2),
+        encoding="utf-8",
+    )
+    with traces_path.open("w", encoding="utf-8") as fp:
+        fp.write(json.dumps(trace.to_dict(), ensure_ascii=False, default=str))
+        fp.write("\n")
+
+    return {
+        "run_metadata": str(metadata_path.resolve()),
+        "decision_traces": str(traces_path.resolve()),
+    }
 
 
 def _build_broker(args) -> Broker:
@@ -1461,6 +1639,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Print the plan but do not place the order")
     t.add_argument("--confirm-demo", action="store_true",
                    help="Required for OANDA broker; acknowledges demo-only use")
+    t.add_argument("--trace-out", default=None,
+                   help="Directory to write run_metadata.json and "
+                        "decision_traces.jsonl (one line for this trade). "
+                        "Skip the flag to disable live trace export.")
+    t.add_argument("--trace-out-default", action="store_true",
+                   help="When --trace-out is omitted, write the live trace "
+                        "to runs/live/<run_id>/. --trace-out wins if both.")
+    t.add_argument("--overwrite", action="store_true",
+                   help="Allow live trace export to overwrite existing "
+                        "files in the target dir.")
     t.set_defaults(func=cmd_trade)
 
     b = sub.add_parser("backtest", help="Backtest technical strategy")
