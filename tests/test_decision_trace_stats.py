@@ -404,6 +404,18 @@ def test_cross_stats_top_level_key_present(tmp_path):
         "gate_effect_by_technical_action",
         "final_action_by_outcome",
         "blocked_by_outcome",
+        # PR-A: long-term trend + macro context crosses
+        "daily_trend_outcome",
+        "weekly_trend_outcome",
+        "monthly_trend_outcome",
+        "close_vs_sma_200d_outcome",
+        "weekly_return_outcome",
+        "monthly_return_outcome",
+        "dxy_trend_outcome",
+        "us10y_trend_outcome",
+        "yield_spread_outcome",
+        "vix_regime_outcome",
+        "long_term_macro_outcome",
     }
 
 
@@ -1394,14 +1406,27 @@ def test_aggregate_many_pools_blocked_by_outcome(tmp_path):
 
 
 def test_existing_cross_stats_keys_unchanged_by_blocked_by_outcome(tmp_path):
-    """PR #10 must not perturb the three existing cross_stats sections."""
+    """PR #10 + PR-A: cross_stats includes the original three sections,
+    PR #10's blocked_by_outcome, and PR-A's long-term/macro crosses."""
     p = _write_jsonl(tmp_path, [_build_synthetic_record()])
     cs = aggregate_stats(p)["cross_stats"]
     assert {
         "hold_reason_outcome",
         "gate_effect_by_technical_action",
         "final_action_by_outcome",
-        "blocked_by_outcome",        # new
+        "blocked_by_outcome",        # PR #10
+        # PR-A long-term trend + macro context crosses
+        "daily_trend_outcome",
+        "weekly_trend_outcome",
+        "monthly_trend_outcome",
+        "close_vs_sma_200d_outcome",
+        "weekly_return_outcome",
+        "monthly_return_outcome",
+        "dxy_trend_outcome",
+        "us10y_trend_outcome",
+        "yield_spread_outcome",
+        "vix_regime_outcome",
+        "long_term_macro_outcome",
     } == set(cs.keys())
 
 
