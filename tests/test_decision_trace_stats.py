@@ -1049,3 +1049,112 @@ def test_aggregate_many_does_not_change_aggregate_stats_behaviour(tmp_path):
     # Re-call single — must be byte-identical (no global state mutation).
     single_again = aggregate_stats(p)
     assert single == single_again
+
+
+def test_top_hold_reasons_pooled_includes_globally_ranked_reason(tmp_path):
+    """Regression for a pooling bug: per-run top_hold_reasons is truncated
+    to top-N by aggregate_stats(). If aggregate_many() folded those
+    truncated lists into the global top, a reason that was #N+1 in every
+    run but #2 globally would silently disappear.
+
+    Build 3 runs each with:
+      rA=10  (per-run #1)
+      rB=8   (per-run #2)
+      rGLOBAL=3   (per-run #3 — drops out of any per-run top-2)
+
+    Globally: rA=30 / rB=24 / rGLOBAL=9. Asking for global top-3 must
+    return all three; rGLOBAL must NOT be silently dropped.
+    """
+    from src.fx.decision_trace_stats import aggregate_many
+
+    def make_run(run_id: str, day: int) -> Path:
+        recs: list[dict] = []
+        i = 0
+        for _ in range(10):
+            recs.append(_build_synthetic_record(
+                run_id=run_id, reason="rA",
+                timestamp=f"2025-01-{day:02d}T{i:02d}:00:00+00:00",
+                bar_index=i,
+            ))
+            i += 1
+        for _ in range(8):
+            recs.append(_build_synthetic_record(
+                run_id=run_id, reason="rB",
+                timestamp=f"2025-01-{day:02d}T{i:02d}:00:00+00:00",
+                bar_index=i,
+            ))
+            i += 1
+        for _ in range(3):
+            recs.append(_build_synthetic_record(
+                run_id=run_id, reason="rGLOBAL",
+                timestamp=f"2025-01-{day:02d}T{i:02d}:00:00+00:00",
+                bar_index=i,
+            ))
+            i += 1
+        return _write_run_dir(tmp_path, run_id, records=recs)
+
+    paths = [make_run("r0", 1), make_run("r1", 2), make_run("r2", 3)]
+
+    # Sanity: per-run top-2 truncates rGLOBAL out of every run.
+    for p in paths:
+        per_run = aggregate_stats(p, top_n_hold_reasons=2)
+        per_run_reasons = {x["reason"] for x in per_run["top_hold_reasons"]}
+        assert per_run_reasons == {"rA", "rB"}, (
+            f"per-run setup wrong: {per_run_reasons!r}"
+        )
+
+    out = aggregate_many(paths, top_n_hold_reasons=3)
+    global_pairs = [
+        (entry["reason"], entry["count"])
+        for entry in out["global"]["top_hold_reasons"]
+    ]
+    assert ("rA", 30) in global_pairs
+    assert ("rB", 24) in global_pairs
+    assert ("rGLOBAL", 9) in global_pairs, (
+        f"BUG: rGLOBAL missing from global top despite being #3 globally; "
+        f"got {global_pairs!r}. This regression means aggregate_many() is "
+        f"summing per-run top-N lists instead of recomputing from the "
+        f"full hold_reason_pool."
+    )
+
+    # The same reason must also be present in cross_stats.hold_reason_outcome
+    # (no truncation applies there at all).
+    hro = out["global"]["cross_stats"]["hold_reason_outcome"]
+    assert hro["rGLOBAL"]["n"] == 9
+
+
+def test_top_hold_reasons_global_is_derived_from_hold_reason_pool(tmp_path):
+    """Top hold reasons must equal `most_common(N)` over the full
+    hold_reason_pool, NOT over per-run truncated lists."""
+    from src.fx.decision_trace_stats import aggregate_many
+
+    p1 = _write_run_dir(tmp_path, "r1", records=[
+        _build_synthetic_record(run_id="r1", reason="rX",
+                                timestamp="2025-01-01T00:00:00+00:00",
+                                bar_index=0),
+        _build_synthetic_record(run_id="r1", reason="rX",
+                                timestamp="2025-01-01T01:00:00+00:00",
+                                bar_index=1),
+        _build_synthetic_record(run_id="r1", reason="rY",
+                                timestamp="2025-01-01T02:00:00+00:00",
+                                bar_index=2),
+    ])
+    p2 = _write_run_dir(tmp_path, "r2", records=[
+        _build_synthetic_record(run_id="r2", reason="rY",
+                                timestamp="2025-01-02T00:00:00+00:00",
+                                bar_index=0),
+        _build_synthetic_record(run_id="r2", reason="rY",
+                                timestamp="2025-01-02T01:00:00+00:00",
+                                bar_index=1),
+        _build_synthetic_record(run_id="r2", reason="rY",
+                                timestamp="2025-01-02T02:00:00+00:00",
+                                bar_index=2),
+    ])
+    out = aggregate_many([p1, p2])
+    hro = out["global"]["cross_stats"]["hold_reason_outcome"]
+    assert hro["rX"]["n"] == 2 and hro["rY"]["n"] == 4
+    # global top must reflect hro counts exactly (rY=4 then rX=2).
+    pairs = [(e["reason"], e["count"])
+             for e in out["global"]["top_hold_reasons"]]
+    assert pairs[0] == ("rY", 4)
+    assert pairs[1] == ("rX", 2)

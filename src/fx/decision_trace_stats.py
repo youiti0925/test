@@ -644,7 +644,9 @@ def aggregate_many(
     g_exit_event_true = 0
     g_exit_event_false = 0
     g_exit_reason: dict[str, int] = {}
-    g_top_hold: dict[str, int] = {}      # reason -> count, then most_common(N)
+    # global top_hold_reasons is derived from g_hold_reason_pool below —
+    # NOT from per-run top_hold_reasons (which is truncated to top-N and
+    # would silently drop reasons #N+1 in every run that are #2 globally).
     g_hold_reason_pool: dict[str, dict[str, Any]] = {}
     g_gate_by_tech: dict[str, dict[str, int]] = {}
     g_final_by_outcome: dict[str, dict[str, int]] = {}
@@ -725,13 +727,12 @@ def aggregate_many(
         g_exit_event_false += int(eed.get("exit_event_false") or 0)
         _add_counters(g_exit_reason, eed.get("exit_reason", {}))
 
-        # top_hold_reasons — turn the per-run list back into a counter
-        # so we can re-take most_common(N) globally.
-        for entry in stats["top_hold_reasons"]:
-            r = entry.get("reason")
-            c = entry.get("count")
-            if isinstance(r, str) and isinstance(c, int):
-                g_top_hold[r] = g_top_hold.get(r, 0) + c
+        # NOTE: per-run `stats["top_hold_reasons"]` is already truncated
+        # to top-N at the per-run aggregator. Folding those truncated
+        # lists into a global counter would silently drop reasons that
+        # were #N+1 in every run but #2 globally. Skip it here — the
+        # global top is rebuilt from `g_hold_reason_pool` (which has the
+        # full per-reason count) after the loop.
 
         # cross_stats
         cs = stats["cross_stats"]
@@ -782,9 +783,16 @@ def aggregate_many(
         "last_timestamp": g_last_ts,
     }
 
-    # Top hold reasons globally
+    # Top hold reasons globally — derived from the *full* hold_reason_pool
+    # (which has the precise count of every distinct decision.reason
+    # across all HOLD bars in all runs). Re-deriving here is the only
+    # way to be correct: per-run top-N truncation would silently drop
+    # reasons that ranked just below the cut-off in each run but
+    # cumulatively rank near the top globally. Pinned by
+    # test_top_hold_reasons_pooled_includes_globally_ranked_reason.
     top_pairs = sorted(
-        g_top_hold.items(), key=lambda kv: (-kv[1], kv[0])
+        ((reason, row["n"]) for reason, row in g_hold_reason_pool.items()),
+        key=lambda kv: (-kv[1], kv[0]),
     )[:top_n_hold_reasons]
 
     global_section = {
