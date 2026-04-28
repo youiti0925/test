@@ -26,6 +26,8 @@ from .decision_trace import (
     FutureOutcomeSlice,
     HORIZON_BARS_TABLE,
     HigherTimeframeSlice,
+    LongTermTrendSlice,
+    MacroContextSlice,
     MarketSlice,
     RULE_TAXONOMY,
     RuleCheck,
@@ -37,7 +39,8 @@ from .decision_trace import (
     make_skipped_check,
 )
 from .indicators import Snapshot
-from .patterns import PatternResult
+from .macro import MacroSnapshot
+from .patterns import PatternResult, analyse as analyse_patterns
 from .risk_gate import (
     RiskState,
     check_calendar_freshness,
@@ -230,6 +233,211 @@ def higher_tf_slice(
     else:
         align = "NEUTRAL"
     return HigherTimeframeSlice(source_interval=rule, trend=trend, alignment=align)
+
+
+def _resample_trend(df_window: pd.DataFrame, rule: str, *, min_bars: int = 10) -> str:
+    """Resample df_window to `rule` and run patterns.analyse on the result.
+
+    Returns "UNKNOWN" when there isn't enough resampled history yet —
+    same convention as the existing higher_tf logic.
+    """
+    if len(df_window) < 30:
+        return "UNKNOWN"
+    try:
+        higher = df_window.resample(rule).agg({
+            "open": "first", "high": "max", "low": "min",
+            "close": "last", "volume": "sum",
+        }).dropna()
+    except Exception:  # noqa: BLE001
+        return "UNKNOWN"
+    if len(higher) < min_bars:
+        return "UNKNOWN"
+    return analyse_patterns(higher).trend_state.value
+
+
+def long_term_trend_slice(df: pd.DataFrame, i: int) -> LongTermTrendSlice:
+    """Multi-timeframe long-term trend / SMA / return slice.
+
+    Reads ONLY `df.iloc[: i + 1]`. SMA / return windows are sliced by
+    timestamp so weekend gaps in FX data don't confuse the bar-count.
+    Trend labels are RANGE / UPTREND / DOWNTREND / VOLATILE / UNKNOWN
+    (UNKNOWN until enough resampled bars exist).
+    """
+    window = df.iloc[: i + 1]
+    n_bars = len(window)
+    closes = window["close"].astype(float)
+    ts_now = window.index[-1]
+    close_now = float(closes.iloc[-1])
+
+    unavailable: dict[str, str] = {}
+
+    # SMAs by timestamp window — handles FX weekend gaps cleanly.
+    # We REQUIRE that the dataframe's earliest bar predates the cutoff,
+    # otherwise the slice is just "everything we have" and would label a
+    # too-short mean as an N-day SMA. Mark as unavailable explicitly.
+    df_first_ts = closes.index[0]
+
+    def _sma_back(days: int) -> float | None:
+        cutoff = ts_now - pd.Timedelta(days=days)
+        if df_first_ts > cutoff:
+            spanned = (ts_now - df_first_ts).total_seconds() / 86400.0
+            unavailable[f"sma_{days}d"] = (
+                f"history spans {spanned:.1f}d (need ≥{days}d back)"
+            )
+            return None
+        sub = closes.loc[closes.index >= cutoff]
+        if len(sub) < 5:
+            unavailable[f"sma_{days}d"] = (
+                f"only {len(sub)} bars in last {days}d (need ≥5)"
+            )
+            return None
+        v = float(sub.mean())
+        if not np.isfinite(v):
+            unavailable[f"sma_{days}d"] = "non-finite mean"
+            return None
+        return v
+
+    sma30 = _sma_back(30)
+    sma90 = _sma_back(90)
+    sma200 = _sma_back(200)
+
+    def _close_vs_sma(sma: float | None) -> float | None:
+        if sma is None or sma == 0 or not np.isfinite(sma):
+            return None
+        return 100.0 * (close_now - sma) / sma
+
+    # N-day returns: take the most recent close at-or-before ts_now − N.
+    def _ret_back(days: int) -> float | None:
+        cutoff = ts_now - pd.Timedelta(days=days)
+        sub = closes.loc[closes.index <= cutoff]
+        if sub.empty:
+            unavailable[f"return_{days}d"] = (
+                f"no bars on or before {days}d ago"
+            )
+            return None
+        ref = float(sub.iloc[-1])
+        if ref == 0 or not np.isfinite(ref):
+            unavailable[f"return_{days}d"] = "ref close zero/non-finite"
+            return None
+        v = 100.0 * (close_now - ref) / ref
+        if not np.isfinite(v):
+            return None
+        return v
+
+    weekly_ret = _ret_back(7)
+    monthly_ret = _ret_back(30)
+    quarterly_ret = _ret_back(90)
+
+    daily_trend = _resample_trend(window, "1D")
+    weekly_trend = _resample_trend(window, "1W")
+    # Pandas accepts "1MS" (month start) for monthly resample.
+    monthly_trend = _resample_trend(window, "1MS")
+
+    return LongTermTrendSlice(
+        daily_trend=daily_trend,
+        weekly_trend=weekly_trend,
+        monthly_trend=monthly_trend,
+        sma_30d=sma30,
+        sma_90d=sma90,
+        sma_200d=sma200,
+        close_vs_sma_30d_pct=_close_vs_sma(sma30),
+        close_vs_sma_90d_pct=_close_vs_sma(sma90),
+        close_vs_sma_200d_pct=_close_vs_sma(sma200),
+        weekly_return_pct=weekly_ret,
+        monthly_return_pct=monthly_ret,
+        quarterly_return_pct=quarterly_ret,
+        bars_available=n_bars,
+        unavailable_reasons=dict(unavailable),
+    )
+
+
+# Macro slots we expose in the trace. Order is the canonical export order.
+_MACRO_LEVEL_SLOTS: tuple[str, ...] = (
+    "us10y", "us_short_yield_proxy", "dxy", "vix",
+    "sp500", "nasdaq", "nikkei",
+)
+
+
+def macro_context_slice(
+    macro: MacroSnapshot | None,
+    ts: pd.Timestamp,
+) -> MacroContextSlice | None:
+    """Snapshot the macro / market context at this bar.
+
+    `MacroSnapshot.value_at(slot, ts)` uses Series.asof — strictly
+    past-only, so this is point-in-time safe. Deltas are computed by
+    calling `value_at(slot, ts - delta)` for the earlier reference.
+
+    Returns None when `macro` is None (caller chose not to fetch macro
+    or fetch failed entirely). When `macro` is non-None but a particular
+    slot has no data covering this ts, that slot is None and listed in
+    `missing_slots`.
+    """
+    if macro is None:
+        return None
+
+    levels: dict[str, float | None] = {}
+    available: list[str] = []
+    missing: list[str] = []
+    for slot in _MACRO_LEVEL_SLOTS:
+        v = macro.value_at(slot, ts)
+        levels[slot] = v
+        if v is None:
+            missing.append(slot)
+        else:
+            available.append(slot)
+
+    yield_spread = macro.yield_spread_long_short(ts)
+
+    def _pct_change(slot: str, delta: pd.Timedelta) -> float | None:
+        now = macro.value_at(slot, ts)
+        prev = macro.value_at(slot, ts - delta)
+        if now is None or prev is None or prev == 0 or not np.isfinite(prev):
+            return None
+        v = 100.0 * (now - prev) / prev
+        return float(v) if np.isfinite(v) else None
+
+    def _abs_change(slot: str, delta: pd.Timedelta) -> float | None:
+        """For yields — return the percentage-point change (≈ basis-points/100)."""
+        now = macro.value_at(slot, ts)
+        prev = macro.value_at(slot, ts - delta)
+        if now is None or prev is None:
+            return None
+        v = float(now) - float(prev)
+        return v if np.isfinite(v) else None
+
+    def _spread_change(delta: pd.Timedelta) -> float | None:
+        now = macro.yield_spread_long_short(ts)
+        prev = macro.yield_spread_long_short(ts - delta)
+        if now is None or prev is None:
+            return None
+        v = float(now) - float(prev)
+        return v if np.isfinite(v) else None
+
+    one_day = pd.Timedelta(days=1)
+    five_days = pd.Timedelta(days=5)
+
+    return MacroContextSlice(
+        us10y=levels["us10y"],
+        us_short_yield_proxy=levels["us_short_yield_proxy"],
+        yield_spread_long_short=yield_spread,
+        dxy=levels["dxy"],
+        vix=levels["vix"],
+        sp500=levels["sp500"],
+        nasdaq=levels["nasdaq"],
+        nikkei=levels["nikkei"],
+        dxy_change_24h_pct=_pct_change("dxy", one_day),
+        dxy_change_5d_pct=_pct_change("dxy", five_days),
+        us10y_change_24h=_abs_change("us10y", one_day),
+        us10y_change_5d=_abs_change("us10y", five_days),
+        yield_spread_change_5d=_spread_change(five_days),
+        vix_change_24h_pct=_pct_change("vix", one_day),
+        sp500_change_24h_pct=_pct_change("sp500", one_day),
+        nasdaq_change_24h_pct=_pct_change("nasdaq", one_day),
+        available_slots=tuple(available),
+        missing_slots=tuple(missing),
+        fetch_errors=dict(macro.fetch_errors),
+    )
 
 
 def fundamental_slice(
@@ -786,6 +994,7 @@ def build_atr_unavailable_trace(
     bar_exit_reason: str | None,
     bar_exit_price: float | None,
     bar_exit_trade_id: str | None,
+    macro: MacroSnapshot | None = None,
 ) -> BarDecisionTrace:
     """Trace for a bar where ATR is NaN — engine bailed before decide()."""
     from .backtest_engine import _position_dict  # local import to avoid cycle
@@ -889,6 +1098,8 @@ def build_atr_unavailable_trace(
         rule_checks=tuple(checks),
         decision=decision,
         future_outcome=None,
+        long_term_trend=long_term_trend_slice(df, i),
+        macro_context=macro_context_slice(macro, ts),
     )
 
 
@@ -927,12 +1138,15 @@ def build_full_trace(
     bar_exit_reason: str | None,
     bar_exit_price: float | None,
     bar_exit_trade_id: str | None,
+    macro: MacroSnapshot | None = None,
 ) -> BarDecisionTrace:
     """Full trace for a normally processed bar."""
     market = market_slice(df, i, data_source)
     technical = technical_slice(snap, atr_value, tech, tech_reason_codes)
     waveform = waveform_slice(pattern, atr_value, market.close)
     higher_tf_s = higher_tf_slice(interval, higher_tf, tech, use_higher_tf)
+    long_term = long_term_trend_slice(df, i)
+    macro_ctx = macro_context_slice(macro, ts)
     fundamental = fundamental_slice(
         risk_state.events, ts, blocked_codes=tuple(decision.blocked_by)
     )
@@ -991,6 +1205,8 @@ def build_full_trace(
         rule_checks=rule_checks,
         decision=decision_s,
         future_outcome=None,
+        long_term_trend=long_term,
+        macro_context=macro_ctx,
     )
 
 

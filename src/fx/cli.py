@@ -810,6 +810,24 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
                 file=sys.stderr,
             )
 
+    # Macro context (DXY / US10Y / VIX / indices). Fetched once per run
+    # and attached to the engine; build_full_trace samples each slot
+    # point-in-time per bar via Series.asof. Failure is non-fatal —
+    # backtest still produces the trace, macro_context just stays None.
+    macro = None
+    if not getattr(args, "no_macro", False):
+        try:
+            macro_period = getattr(args, "macro_period", None) or "2y"
+            macro = fetch_macro_snapshot(
+                df.index, interval="1d", period=macro_period,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[warn] macro fetch failed: {e} — trace will have "
+                "macro_context=null",
+                file=sys.stderr,
+            )
+
     result = run_engine_backtest(
         df,
         symbol=args.symbol,
@@ -820,6 +838,7 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
         max_holding_bars=args.max_holding_bars,
         events=events,
         use_higher_tf=not args.no_higher_tf,
+        macro=macro,
     )
     metrics = result.metrics()
     start_date = str(df.index[0])
@@ -1835,6 +1854,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Ignore data/events.json (skip macro-event gate)")
     be.add_argument("--no-higher-tf", action="store_true",
                     help="Skip higher-timeframe alignment check")
+    be.add_argument("--no-macro", action="store_true",
+                    help="Do not fetch / attach the macro snapshot (DXY, "
+                         "US10Y, VIX, indices). trace.macro_context will "
+                         "be null. Decision logic is unchanged either way "
+                         "— this only affects what's recorded.")
+    be.add_argument("--macro-period", default="2y",
+                    help="yfinance period for the macro snapshot fetch "
+                         "(default 2y). Must comfortably cover --period.")
     be.add_argument("--trace-out", default=None,
                     help="Directory to write run_metadata.json / "
                          "decision_traces.jsonl / summary.json. Skip the "

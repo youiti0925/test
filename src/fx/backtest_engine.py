@@ -41,6 +41,7 @@ import pandas as pd
 
 from .calendar import Event
 from .decision_engine import Decision, decide as decide_action
+from .macro import MacroSnapshot
 from .decision_trace import (
     BarDecisionTrace,
     RunMetadata,
@@ -294,6 +295,7 @@ def run_engine_backtest(
     compute_future_outcome: bool = True,
     data_source: str = "unknown",
     data_retrieved_at: datetime | None = None,
+    macro: MacroSnapshot | None = None,
 ) -> EngineBacktestResult:
     """Run a Decision Engine-driven backtest over `df`.
 
@@ -366,6 +368,10 @@ def run_engine_backtest(
             "use_higher_tf": use_higher_tf,
             "n_events": len(events_tuple),
             "llm_signal_fn_used": llm_signal_fn is not None,
+            "macro_attached": macro is not None,
+            "macro_slots": (
+                sorted(macro.series.keys()) if macro is not None else []
+            ),
         }
         sha, sha_status = get_commit_sha()
         run_metadata = RunMetadata(
@@ -482,6 +488,7 @@ def run_engine_backtest(
                     bar_exit_reason=bar_exit_reason,
                     bar_exit_price=bar_exit_price,
                     bar_exit_trade_id=bar_exit_trade_id,
+                    macro=macro,
                 )
                 result.decision_traces.append(trace)
             continue
@@ -610,6 +617,7 @@ def run_engine_backtest(
                 bar_exit_reason=bar_exit_reason,
                 bar_exit_price=bar_exit_price,
                 bar_exit_trade_id=bar_exit_trade_id,
+                macro=macro,
             )
             result.decision_traces.append(trace)
 

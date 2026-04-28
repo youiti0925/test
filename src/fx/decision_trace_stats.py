@@ -87,6 +87,132 @@ _RULE_RESULT_BUCKETS: tuple[str, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Long-term / macro-regime bucketers (PR-A)
+#
+# Each bucket function maps a numeric value (or None for unavailable) to a
+# stable string label so the cross-stat accumulators key by category, not by
+# raw float. Thresholds are conservative defensive defaults — they exist to
+# *partition* observations for descriptive aggregation, NOT to define
+# decision rules. No code outside this module's stats consumes these
+# labels.
+# ---------------------------------------------------------------------------
+
+
+def _bucket_close_vs_sma(pct: float | None) -> str:
+    if pct is None:
+        return "unknown"
+    if pct < -5.0:
+        return "<-5%"
+    if pct < -1.0:
+        return "-5..-1%"
+    if pct <= 1.0:
+        return "-1..1%"
+    if pct <= 5.0:
+        return "1..5%"
+    return ">5%"
+
+
+def _bucket_pct_5d(pct: float | None) -> str:
+    """Bucket a 5-day percent change for DXY-style series."""
+    if pct is None:
+        return "unknown"
+    if pct < -1.0:
+        return "down>1%"
+    if pct < -0.2:
+        return "down"
+    if pct <= 0.2:
+        return "flat"
+    if pct <= 1.0:
+        return "up"
+    return "up>1%"
+
+
+def _bucket_yield_5d(pp: float | None) -> str:
+    """Bucket a 5-day yield change in percentage points (1% = 100 bp)."""
+    if pp is None:
+        return "unknown"
+    if pp < -0.10:
+        return "down>10bp"
+    if pp < -0.02:
+        return "down"
+    if pp <= 0.02:
+        return "flat"
+    if pp <= 0.10:
+        return "up"
+    return "up>10bp"
+
+
+def _bucket_yield_spread_level(level: float | None) -> str:
+    if level is None:
+        return "unknown"
+    if level < -0.50:
+        return "deep_inverted"
+    if level < 0.0:
+        return "inverted"
+    if level < 0.50:
+        return "near_zero"
+    if level <= 1.50:
+        return "normal"
+    return "steep"
+
+
+def _bucket_vix_level(level: float | None) -> str:
+    if level is None:
+        return "unknown"
+    if level < 14.0:
+        return "low"
+    if level < 20.0:
+        return "mid"
+    if level < 30.0:
+        return "high"
+    return "extreme"
+
+
+def _new_two_way_row() -> dict[str, Any]:
+    """Counter row keyed by final_action, tracking outcome breakdown.
+
+    Shape: {final_action: {"n": int, "outcome": Counter}}
+    Used by the long_term / macro-regime cross_stats added in PR-A.
+    """
+    return {}
+
+
+def _bump_two_way(
+    target: dict[str, dict[str, Any]],
+    final_action: str | None,
+    outcome: str | None,
+) -> None:
+    if not isinstance(final_action, str):
+        return
+    leaf = target.setdefault(
+        final_action, {"n": 0, "outcome": Counter()}
+    )
+    leaf["n"] += 1
+    if isinstance(outcome, str):
+        leaf["outcome"][outcome] += 1
+
+
+def _finalise_two_way(target: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {
+        action: {"n": leaf["n"], "outcome": dict(leaf["outcome"])}
+        for action, leaf in target.items()
+    }
+
+
+def _finalise_pooled_two_way(
+    pool: dict[str, dict[str, dict[str, Any]]],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Multi-run version: bucket → final_action → {n, outcome}."""
+    return {
+        bucket: {
+            action: {"n": leaf["n"], "outcome": dict(leaf["outcome"])}
+            for action, leaf in by_action.items()
+        }
+        for bucket, by_action in pool.items()
+    }
+
+
 def _open_jsonl(path: Path) -> IO[str]:
     """Transparent open for `.jsonl` and `.jsonl.gz` (UTF-8 text mode)."""
     if path.suffix == ".gz":
@@ -174,6 +300,24 @@ def aggregate_stats(
     # pooling helpers can be reused. A single trace with multiple
     # blocked_by codes contributes once to EACH key (additive semantics).
     blocked_by_outcome_aggregates: dict[str, dict[str, Any]] = {}
+
+    # ── Cross-stats accumulators (PR-A) ──────────────────────────────────
+    # Long-term-trend / macro-regime crosses, all keyed by a string bucket
+    # → final_action → {n, outcome counter}. Bars without the source slice
+    # (older traces, or runs without macro fetch) are bucketed under
+    # "unknown" rather than dropped — visibility-by-default.
+    daily_trend_outcome: dict[str, dict[str, Any]] = {}
+    weekly_trend_outcome: dict[str, dict[str, Any]] = {}
+    monthly_trend_outcome: dict[str, dict[str, Any]] = {}
+    close_vs_sma_200d_outcome: dict[str, dict[str, Any]] = {}
+    weekly_return_outcome: dict[str, dict[str, Any]] = {}
+    monthly_return_outcome: dict[str, dict[str, Any]] = {}
+    dxy_trend_outcome: dict[str, dict[str, Any]] = {}
+    us10y_trend_outcome: dict[str, dict[str, Any]] = {}
+    yield_spread_outcome: dict[str, dict[str, Any]] = {}
+    vix_regime_outcome: dict[str, dict[str, Any]] = {}
+    # Joint cross: monthly_trend × dxy_5d_trend
+    long_term_macro_outcome: dict[str, dict[str, Any]] = {}
 
     # Metadata accumulators
     schema_versions: set[str] = set()
@@ -391,6 +535,101 @@ def aggregate_stats(
                     if row["_return_max"] is None or rv > row["_return_max"]:
                         row["_return_max"] = rv
 
+            # ── Long-term / macro cross-stats (PR-A) ──────────────────
+            # Read the optional slices once. Older traces may lack the
+            # keys entirely; that's fine — every bucketer maps None to
+            # "unknown" and the counts surface that as a regular bucket.
+            ltt = rec.get("long_term_trend") if isinstance(
+                rec.get("long_term_trend"), dict
+            ) else {}
+            mc = rec.get("macro_context") if isinstance(
+                rec.get("macro_context"), dict
+            ) else {}
+
+            daily_trend_label = ltt.get("daily_trend") or "unknown"
+            weekly_trend_label = ltt.get("weekly_trend") or "unknown"
+            monthly_trend_label = ltt.get("monthly_trend") or "unknown"
+            sma200_bucket = _bucket_close_vs_sma(
+                ltt.get("close_vs_sma_200d_pct")
+            )
+            weekly_ret_bucket = _bucket_pct_5d(ltt.get("weekly_return_pct"))
+            monthly_ret_bucket = _bucket_pct_5d(ltt.get("monthly_return_pct"))
+
+            dxy_bucket = _bucket_pct_5d(mc.get("dxy_change_5d_pct"))
+            us10y_bucket = _bucket_yield_5d(mc.get("us10y_change_5d"))
+            spread_bucket = _bucket_yield_spread_level(
+                mc.get("yield_spread_long_short")
+            )
+            vix_bucket = _bucket_vix_level(mc.get("vix"))
+
+            _bump_two_way(
+                daily_trend_outcome.setdefault(
+                    daily_trend_label, _new_two_way_row()
+                ),
+                final_action, outcome_value,
+            )
+            _bump_two_way(
+                weekly_trend_outcome.setdefault(
+                    weekly_trend_label, _new_two_way_row()
+                ),
+                final_action, outcome_value,
+            )
+            _bump_two_way(
+                monthly_trend_outcome.setdefault(
+                    monthly_trend_label, _new_two_way_row()
+                ),
+                final_action, outcome_value,
+            )
+            _bump_two_way(
+                close_vs_sma_200d_outcome.setdefault(
+                    sma200_bucket, _new_two_way_row()
+                ),
+                final_action, outcome_value,
+            )
+            _bump_two_way(
+                weekly_return_outcome.setdefault(
+                    weekly_ret_bucket, _new_two_way_row()
+                ),
+                final_action, outcome_value,
+            )
+            _bump_two_way(
+                monthly_return_outcome.setdefault(
+                    monthly_ret_bucket, _new_two_way_row()
+                ),
+                final_action, outcome_value,
+            )
+            _bump_two_way(
+                dxy_trend_outcome.setdefault(
+                    dxy_bucket, _new_two_way_row()
+                ),
+                final_action, outcome_value,
+            )
+            _bump_two_way(
+                us10y_trend_outcome.setdefault(
+                    us10y_bucket, _new_two_way_row()
+                ),
+                final_action, outcome_value,
+            )
+            _bump_two_way(
+                yield_spread_outcome.setdefault(
+                    spread_bucket, _new_two_way_row()
+                ),
+                final_action, outcome_value,
+            )
+            _bump_two_way(
+                vix_regime_outcome.setdefault(
+                    vix_bucket, _new_two_way_row()
+                ),
+                final_action, outcome_value,
+            )
+            joint_key = f"{monthly_trend_label}|dxy_5d={dxy_bucket}"
+            _bump_two_way(
+                long_term_macro_outcome.setdefault(
+                    joint_key, _new_two_way_row()
+                ),
+                final_action, outcome_value,
+            )
+
             # ── Execution trace distributions ────────────────────────
             et = rec.get("execution_trace") or {}
             if isinstance(et.get("entry_executed"), bool):
@@ -502,6 +741,49 @@ def aggregate_stats(
             "blocked_by_outcome": {
                 code: _finalise_hold_reason_row(row)
                 for code, row in blocked_by_outcome_aggregates.items()
+            },
+            # PR-A — long-term / macro regime crosses. Keys are stable
+            # bucket labels; "unknown" means the slice was absent or
+            # could not be computed at that bar.
+            "daily_trend_outcome": {
+                k: _finalise_two_way(v) for k, v in daily_trend_outcome.items()
+            },
+            "weekly_trend_outcome": {
+                k: _finalise_two_way(v) for k, v in weekly_trend_outcome.items()
+            },
+            "monthly_trend_outcome": {
+                k: _finalise_two_way(v) for k, v in monthly_trend_outcome.items()
+            },
+            "close_vs_sma_200d_outcome": {
+                k: _finalise_two_way(v)
+                for k, v in close_vs_sma_200d_outcome.items()
+            },
+            "weekly_return_outcome": {
+                k: _finalise_two_way(v)
+                for k, v in weekly_return_outcome.items()
+            },
+            "monthly_return_outcome": {
+                k: _finalise_two_way(v)
+                for k, v in monthly_return_outcome.items()
+            },
+            "dxy_trend_outcome": {
+                k: _finalise_two_way(v) for k, v in dxy_trend_outcome.items()
+            },
+            "us10y_trend_outcome": {
+                k: _finalise_two_way(v)
+                for k, v in us10y_trend_outcome.items()
+            },
+            "yield_spread_outcome": {
+                k: _finalise_two_way(v)
+                for k, v in yield_spread_outcome.items()
+            },
+            "vix_regime_outcome": {
+                k: _finalise_two_way(v)
+                for k, v in vix_regime_outcome.items()
+            },
+            "long_term_macro_outcome": {
+                k: _finalise_two_way(v)
+                for k, v in long_term_macro_outcome.items()
             },
         },
         "consistency_checks": consistency_checks,
@@ -700,6 +982,20 @@ def aggregate_many(
     # g_hold_reason_pool, so the same finaliser applies.
     g_blocked_by_outcome_pool: dict[str, dict[str, Any]] = {}
 
+    # PR-A: long-term / macro-regime pools.
+    # Each is bucket → final_action → {n, outcome counter}.
+    g_daily_trend_outcome: dict[str, dict[str, dict[str, Any]]] = {}
+    g_weekly_trend_outcome: dict[str, dict[str, dict[str, Any]]] = {}
+    g_monthly_trend_outcome: dict[str, dict[str, dict[str, Any]]] = {}
+    g_close_vs_sma_200d_outcome: dict[str, dict[str, dict[str, Any]]] = {}
+    g_weekly_return_outcome: dict[str, dict[str, dict[str, Any]]] = {}
+    g_monthly_return_outcome: dict[str, dict[str, dict[str, Any]]] = {}
+    g_dxy_trend_outcome: dict[str, dict[str, dict[str, Any]]] = {}
+    g_us10y_trend_outcome: dict[str, dict[str, dict[str, Any]]] = {}
+    g_yield_spread_outcome: dict[str, dict[str, dict[str, Any]]] = {}
+    g_vix_regime_outcome: dict[str, dict[str, dict[str, Any]]] = {}
+    g_long_term_macro_outcome: dict[str, dict[str, dict[str, Any]]] = {}
+
     # Global metadata accumulators
     g_run_ids: list[str] = []                    # preserve order, dedup at end
     g_schema_versions: set[str] = set()
@@ -806,6 +1102,52 @@ def aggregate_many(
             )
             _pool_hold_reason_row(pooled, row)
 
+        # PR-A: pool the long-term / macro-regime two-way crosses.
+        # Each per-run cell shape is bucket → final_action → {n, outcome}.
+        # Pooling sums n and the per-outcome counts cell-by-cell.
+        def _pool_two_way(
+            target: dict[str, dict[str, dict[str, Any]]],
+            run_section: dict[str, Any],
+        ) -> None:
+            for bucket, by_action in run_section.items():
+                if not isinstance(by_action, dict):
+                    continue
+                tgt_bucket = target.setdefault(bucket, {})
+                for action, leaf in by_action.items():
+                    if not isinstance(leaf, dict):
+                        continue
+                    tgt_leaf = tgt_bucket.setdefault(
+                        action, {"n": 0, "outcome": Counter()}
+                    )
+                    tgt_leaf["n"] += int(leaf.get("n", 0))
+                    out = leaf.get("outcome") or {}
+                    if isinstance(out, dict):
+                        for k, v in out.items():
+                            tgt_leaf["outcome"][k] += int(v)
+
+        _pool_two_way(g_daily_trend_outcome,
+                      cs.get("daily_trend_outcome", {}))
+        _pool_two_way(g_weekly_trend_outcome,
+                      cs.get("weekly_trend_outcome", {}))
+        _pool_two_way(g_monthly_trend_outcome,
+                      cs.get("monthly_trend_outcome", {}))
+        _pool_two_way(g_close_vs_sma_200d_outcome,
+                      cs.get("close_vs_sma_200d_outcome", {}))
+        _pool_two_way(g_weekly_return_outcome,
+                      cs.get("weekly_return_outcome", {}))
+        _pool_two_way(g_monthly_return_outcome,
+                      cs.get("monthly_return_outcome", {}))
+        _pool_two_way(g_dxy_trend_outcome,
+                      cs.get("dxy_trend_outcome", {}))
+        _pool_two_way(g_us10y_trend_outcome,
+                      cs.get("us10y_trend_outcome", {}))
+        _pool_two_way(g_yield_spread_outcome,
+                      cs.get("yield_spread_outcome", {}))
+        _pool_two_way(g_vix_regime_outcome,
+                      cs.get("vix_regime_outcome", {}))
+        _pool_two_way(g_long_term_macro_outcome,
+                      cs.get("long_term_macro_outcome", {}))
+
     # All runs failed -> ValueError
     if not per_run:
         raise ValueError(
@@ -888,6 +1230,40 @@ def aggregate_many(
                 code: _finalise_pooled_hold_reason_row(row)
                 for code, row in g_blocked_by_outcome_pool.items()
             },
+            # PR-A — pooled long-term / macro-regime crosses.
+            "daily_trend_outcome": _finalise_pooled_two_way(
+                g_daily_trend_outcome
+            ),
+            "weekly_trend_outcome": _finalise_pooled_two_way(
+                g_weekly_trend_outcome
+            ),
+            "monthly_trend_outcome": _finalise_pooled_two_way(
+                g_monthly_trend_outcome
+            ),
+            "close_vs_sma_200d_outcome": _finalise_pooled_two_way(
+                g_close_vs_sma_200d_outcome
+            ),
+            "weekly_return_outcome": _finalise_pooled_two_way(
+                g_weekly_return_outcome
+            ),
+            "monthly_return_outcome": _finalise_pooled_two_way(
+                g_monthly_return_outcome
+            ),
+            "dxy_trend_outcome": _finalise_pooled_two_way(
+                g_dxy_trend_outcome
+            ),
+            "us10y_trend_outcome": _finalise_pooled_two_way(
+                g_us10y_trend_outcome
+            ),
+            "yield_spread_outcome": _finalise_pooled_two_way(
+                g_yield_spread_outcome
+            ),
+            "vix_regime_outcome": _finalise_pooled_two_way(
+                g_vix_regime_outcome
+            ),
+            "long_term_macro_outcome": _finalise_pooled_two_way(
+                g_long_term_macro_outcome
+            ),
         },
     }
 
