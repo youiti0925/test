@@ -327,3 +327,100 @@ def test_backtest_engine_event_high_routes_to_blocked_by_distribution():
     rrd = stats["rule_result_distribution"]["event_high"]
     assert rrd["BLOCK"] >= 1
     assert rrd["PASS"] >= 1
+
+
+# ─── Date pinning against official sources ─────────────────────────────────
+# Each pinned date below is sourced from the central bank / agency's
+# official calendar at the time of seeding (April 2026). Sources are
+# documented in the PR body. Update this list and the corresponding
+# events.json entry only when the official source itself changes.
+
+
+@pytest.mark.parametrize(
+    "expected_when_iso,expected_currency,title_keyword,source_note",
+    [
+        # --- FOMC (Fed FOMC calendar, 2:00 PM ET = 18:00/19:00 UTC) ---
+        ("2025-09-17T18:00:00+00:00", "USD", "FOMC",
+         "Fed FOMC calendar — Sep 16-17 2025, statement released 14:00 ET (EDT)"),
+        ("2025-12-10T19:00:00+00:00", "USD", "FOMC",
+         "Fed FOMC calendar — Dec 9-10 2025, 14:00 ET (EST after DST end Nov 2)"),
+        ("2026-01-28T19:00:00+00:00", "USD", "FOMC",
+         "Fed FOMC calendar — Jan 27-28 2026, 14:00 ET (EST)"),
+        ("2026-03-18T18:00:00+00:00", "USD", "FOMC",
+         "Fed FOMC calendar — Mar 17-18 2026, 14:00 ET (EDT after DST start Mar 8)"),
+        ("2026-04-29T18:00:00+00:00", "USD", "FOMC",
+         "Fed FOMC calendar — Apr 28-29 2026, 14:00 ET (EDT)"),
+
+        # --- BLS CPI (8:30 AM ET) ---
+        ("2026-01-13T13:30:00+00:00", "USD", "CPI",
+         "BLS CPI release schedule — Dec 2025 CPI on Jan 13 2026 (EST)"),
+        ("2026-02-13T13:30:00+00:00", "USD", "CPI",
+         "BLS CPI release schedule — Jan 2026 CPI on Feb 13 2026 (EST)"),
+        ("2026-03-11T12:30:00+00:00", "USD", "CPI",
+         "BLS CPI release schedule — Feb 2026 CPI on Mar 11 2026 (EDT after Mar 8)"),
+        ("2026-04-10T12:30:00+00:00", "USD", "CPI",
+         "BLS CPI release schedule — Mar 2026 CPI on Apr 10 2026 (EDT)"),
+        ("2026-05-12T12:30:00+00:00", "USD", "CPI",
+         "BLS CPI release schedule — Apr 2026 CPI on May 12 2026 (EDT)"),
+
+        # --- BLS Employment Situation (NFP) (8:30 AM ET) ---
+        ("2026-02-11T13:30:00+00:00", "USD", "Non-Farm Payrolls",
+         "BLS Employment Situation — Jan 2026 Employment Situation on Feb 11 2026 "
+         "(NOT Feb 6; PR #9 review correction)"),
+        ("2026-04-03T12:30:00+00:00", "USD", "Non-Farm Payrolls",
+         "BLS Employment Situation — Mar 2026 Employment Situation on Apr 3 2026 (EDT)"),
+        ("2026-05-08T12:30:00+00:00", "USD", "Non-Farm Payrolls",
+         "BLS Employment Situation — Apr 2026 Employment Situation on May 8 2026 (EDT)"),
+
+        # --- BoE MPC (12:00 noon UK time) ---
+        ("2026-02-05T12:00:00+00:00", "GBP", "BoE",
+         "BoE MPC dates 2026 — Feb 5 2026 (GMT)"),
+        ("2026-03-19T12:00:00+00:00", "GBP", "BoE",
+         "BoE MPC dates 2026 — Mar 19 2026 (GMT, BST starts Mar 29)"),
+        ("2026-04-30T11:00:00+00:00", "GBP", "BoE",
+         "BoE MPC dates 2026 — Apr 30 2026 (BST after Mar 29). PR #9 review: "
+         "removed incorrect 2026-05-07 — BoE 2026 schedule is 4/30 then 6/18."),
+
+        # --- ECB Governing Council (~13:15 CET / ~14:15 CEST = 12:15 UTC) ---
+        ("2026-02-05T12:15:00+00:00", "EUR", "ECB",
+         "ECB monetary policy decisions — Feb 5 2026 "
+         "(NOT Jan 29 — Jan 29 was not an ECB rate decision date)"),
+        ("2026-03-19T12:15:00+00:00", "EUR", "ECB",
+         "ECB monetary policy decisions — Mar 19 2026 "
+         "(URL slug mp260319 confirms)"),
+        ("2026-04-30T12:15:00+00:00", "EUR", "ECB",
+         "ECB monetary policy meeting calendar — Apr 29-30 2026 "
+         "(Day 2 = press conference; PR #9 review correction from 2026-04-09)"),
+
+        # --- BOJ Monetary Policy Meeting (lunch JST, ~03:00 UTC) ---
+        ("2026-04-28T03:00:00+00:00", "JPY", "BOJ",
+         "BOJ MPM schedule — Apr 27-28 2026, decision Day 2"),
+        ("2026-03-19T03:00:00+00:00", "JPY", "BOJ",
+         "BOJ MPM schedule — Mar 18-19 2026, decision Day 2"),
+        ("2026-01-23T03:00:00+00:00", "JPY", "BOJ",
+         "BOJ MPM schedule — Jan 22-23 2026, decision Day 2"),
+    ],
+)
+def test_known_event_dates_pinned(
+    expected_when_iso, expected_currency, title_keyword, source_note
+):
+    """Hard-pin specific (date, currency, title-keyword) tuples that were
+    confirmed from official calendars during PR #9 review.
+
+    `source_note` is the human-readable provenance for this row — keep it
+    in sync with the PR body's source list whenever this list changes.
+    """
+    from datetime import datetime
+    expected_when = datetime.fromisoformat(expected_when_iso)
+    events = load_events(EVENTS_JSON)
+    matches = [
+        e for e in events
+        if e.when == expected_when
+        and e.currency == expected_currency
+        and title_keyword.upper() in e.title.upper()
+    ]
+    assert matches, (
+        f"events.json missing required pinned event: {expected_when_iso} "
+        f"{expected_currency} containing {title_keyword!r}\n"
+        f"Source: {source_note}"
+    )
