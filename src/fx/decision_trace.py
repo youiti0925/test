@@ -340,6 +340,145 @@ class HigherTimeframeSlice:
 
 
 @dataclass(frozen=True)
+class LongTermTrendSlice:
+    """Multi-timeframe long-term context observable at this bar.
+
+    All values are computed from `df.iloc[: i + 1]` only — never reach
+    forward. Trend labels reuse `patterns.analyse` on resampled data.
+
+    SMA convention (canonical "N-day SMA"):
+      `sma_30d` / `sma_90d` / `sma_200d` are the **mean of the last N
+      *daily* closes**. Hourly bars are first resampled to one close per
+      calendar day (the day's last bar, weekends dropped), then the SMA
+      is the simple mean of the trailing N daily closes. This matches
+      market convention so that "200-day SMA" reads the way a chartist
+      expects (≈ 200 trading-day average), independent of base interval.
+      `unavailable_reasons` reports `"only K daily closes (need ≥N)"`
+      whenever fewer than N daily closes exist yet.
+
+    N-day return convention:
+      `weekly_return_pct` / `monthly_return_pct` / `quarterly_return_pct`
+      are `(close[ts] / close[ts − N days] − 1) × 100`. The reference
+      close is the most recent close at-or-before `ts − N days`, so
+      weekend gaps fall back to the prior trading day automatically.
+
+    `unavailable_reasons` is populated when a value cannot be computed
+    yet (warmup, sparse history). Consumers MUST treat None as "unknown",
+    not as zero.
+    """
+
+    daily_trend: str
+    weekly_trend: str
+    monthly_trend: str
+
+    sma_30d: float | None
+    sma_90d: float | None
+    sma_200d: float | None
+
+    close_vs_sma_30d_pct: float | None
+    close_vs_sma_90d_pct: float | None
+    close_vs_sma_200d_pct: float | None
+
+    weekly_return_pct: float | None
+    monthly_return_pct: float | None
+    quarterly_return_pct: float | None
+
+    bars_available: int
+    unavailable_reasons: dict
+
+    def to_dict(self) -> dict:
+        return {
+            "daily_trend": self.daily_trend,
+            "weekly_trend": self.weekly_trend,
+            "monthly_trend": self.monthly_trend,
+            "sma_30d": self.sma_30d,
+            "sma_90d": self.sma_90d,
+            "sma_200d": self.sma_200d,
+            "close_vs_sma_30d_pct": self.close_vs_sma_30d_pct,
+            "close_vs_sma_90d_pct": self.close_vs_sma_90d_pct,
+            "close_vs_sma_200d_pct": self.close_vs_sma_200d_pct,
+            "weekly_return_pct": self.weekly_return_pct,
+            "monthly_return_pct": self.monthly_return_pct,
+            "quarterly_return_pct": self.quarterly_return_pct,
+            "bars_available": self.bars_available,
+            "unavailable_reasons": dict(self.unavailable_reasons),
+        }
+
+
+@dataclass(frozen=True)
+class MacroContextSlice:
+    """Point-in-time macro / market context observable at this bar.
+
+    Levels come from `MacroSnapshot.value_at(slot, ts)` (which uses
+    Series.asof — strictly past-only). Deltas are computed against
+    earlier `value_at(slot, ts - delta)` calls and are also strictly
+    past-only.
+
+    Units (single source of truth — fields are named to match):
+      * `*_pct` fields are percent change (e.g. `dxy_change_5d_pct = -1.5`
+        means DXY fell 1.5 % over the prior 5 days).
+      * `*_bp` fields are **basis points** (1 bp = 0.01 percentage point).
+        So `us10y_change_24h_bp = 10` means the 10-year yield rose by
+        10 basis points (i.e. 0.10 percentage points). Yield deltas are
+        always reported in bp to match market convention; do not mix.
+
+    Every field is optional because:
+      * the macro fetch may have failed at backtest start,
+      * a particular slot's history may not cover this bar's timestamp,
+      * deltas may not exist if the earlier reference point lacks data.
+    Consumers MUST treat None as "unknown", not as zero.
+    """
+
+    # Levels at ts (point-in-time)
+    us10y: float | None
+    us_short_yield_proxy: float | None
+    yield_spread_long_short: float | None
+    dxy: float | None
+    vix: float | None
+    sp500: float | None
+    nasdaq: float | None
+    nikkei: float | None
+
+    # Deltas — yields in basis points (bp), prices in percent (pct)
+    dxy_change_24h_pct: float | None
+    dxy_change_5d_pct: float | None
+    us10y_change_24h_bp: float | None
+    us10y_change_5d_bp: float | None
+    yield_spread_change_5d_bp: float | None
+    vix_change_24h_pct: float | None
+    sp500_change_24h_pct: float | None
+    nasdaq_change_24h_pct: float | None
+
+    # Provenance
+    available_slots: tuple[str, ...]
+    missing_slots: tuple[str, ...]
+    fetch_errors: dict
+
+    def to_dict(self) -> dict:
+        return {
+            "us10y": self.us10y,
+            "us_short_yield_proxy": self.us_short_yield_proxy,
+            "yield_spread_long_short": self.yield_spread_long_short,
+            "dxy": self.dxy,
+            "vix": self.vix,
+            "sp500": self.sp500,
+            "nasdaq": self.nasdaq,
+            "nikkei": self.nikkei,
+            "dxy_change_24h_pct": self.dxy_change_24h_pct,
+            "dxy_change_5d_pct": self.dxy_change_5d_pct,
+            "us10y_change_24h_bp": self.us10y_change_24h_bp,
+            "us10y_change_5d_bp": self.us10y_change_5d_bp,
+            "yield_spread_change_5d_bp": self.yield_spread_change_5d_bp,
+            "vix_change_24h_pct": self.vix_change_24h_pct,
+            "sp500_change_24h_pct": self.sp500_change_24h_pct,
+            "nasdaq_change_24h_pct": self.nasdaq_change_24h_pct,
+            "available_slots": list(self.available_slots),
+            "missing_slots": list(self.missing_slots),
+            "fetch_errors": dict(self.fetch_errors),
+        }
+
+
+@dataclass(frozen=True)
 class FundamentalSlice:
     nearby_events: tuple[dict, ...]
     blocking_events: tuple[dict, ...]
@@ -528,6 +667,13 @@ class BarDecisionTrace:
     decision: DecisionSlice
     # Filled in second pass; never read by the decision pipeline.
     future_outcome: FutureOutcomeSlice | None = None
+    # Optional multi-timeframe long-term context. Optional so older trace
+    # JSONL files (pre-PR-A) still parse cleanly.
+    long_term_trend: LongTermTrendSlice | None = None
+    # Optional macro / market-context block (DXY, US10Y, VIX, indices).
+    # Populated when backtest_engine receives a MacroSnapshot. Optional
+    # for backward compat and for runs where macro fetch failed.
+    macro_context: MacroContextSlice | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -542,6 +688,12 @@ class BarDecisionTrace:
             "technical": self.technical.to_dict(),
             "waveform": self.waveform.to_dict(),
             "higher_timeframe": self.higher_timeframe.to_dict(),
+            "long_term_trend": (
+                self.long_term_trend.to_dict() if self.long_term_trend else None
+            ),
+            "macro_context": (
+                self.macro_context.to_dict() if self.macro_context else None
+            ),
             "fundamental": self.fundamental.to_dict(),
             "execution_assumption": self.execution_assumption.to_dict(),
             "execution_trace": self.execution_trace.to_dict(),
@@ -618,6 +770,8 @@ __all__ = [
     "TechnicalSlice",
     "WaveformSlice",
     "HigherTimeframeSlice",
+    "LongTermTrendSlice",
+    "MacroContextSlice",
     "FundamentalSlice",
     "ExecutionAssumptionSlice",
     "ExecutionTraceSlice",
