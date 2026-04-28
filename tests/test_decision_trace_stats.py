@@ -416,6 +416,9 @@ def test_cross_stats_top_level_key_present(tmp_path):
         "yield_spread_outcome",
         "vix_regime_outcome",
         "long_term_macro_outcome",
+        # PR-A v2: USD-exposure normalised + per-symbol DXY cuts
+        "dxy_trend_by_usd_exposure_outcome",
+        "symbol_dxy_trend_outcome",
     }
 
 
@@ -1406,8 +1409,9 @@ def test_aggregate_many_pools_blocked_by_outcome(tmp_path):
 
 
 def test_existing_cross_stats_keys_unchanged_by_blocked_by_outcome(tmp_path):
-    """PR #10 + PR-A: cross_stats includes the original three sections,
-    PR #10's blocked_by_outcome, and PR-A's long-term/macro crosses."""
+    """PR #10 + PR-A + PR-A v2: cross_stats includes the original three
+    sections, PR #10's blocked_by_outcome, PR-A's long-term/macro
+    crosses, and PR-A v2's USD-direction-normalised + per-symbol cuts."""
     p = _write_jsonl(tmp_path, [_build_synthetic_record()])
     cs = aggregate_stats(p)["cross_stats"]
     assert {
@@ -1427,6 +1431,9 @@ def test_existing_cross_stats_keys_unchanged_by_blocked_by_outcome(tmp_path):
         "yield_spread_outcome",
         "vix_regime_outcome",
         "long_term_macro_outcome",
+        # PR-A v2: USD-exposure normalised + per-symbol DXY cuts
+        "dxy_trend_by_usd_exposure_outcome",
+        "symbol_dxy_trend_outcome",
     } == set(cs.keys())
 
 
