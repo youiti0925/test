@@ -49,6 +49,9 @@ CREATE TABLE IF NOT EXISTS trades (
     order_response_time TEXT,
     fill_time TEXT,
     execution_latency_ms REAL,
+    -- Path to the live decision_trace JSONL produced by cmd_trade
+    -- when --trace-out / --trace-out-default is in effect.
+    trace_jsonl_path TEXT,
     FOREIGN KEY (analysis_id) REFERENCES analyses(id)
 );
 
@@ -194,6 +197,7 @@ class Storage:
                 ("order_response_time", "TEXT"),
                 ("fill_time", "TEXT"),
                 ("execution_latency_ms", "REAL"),
+                ("trace_jsonl_path", "TEXT"),
             ],
             "predictions": [
                 ("spread_at_entry", "REAL"),
@@ -292,6 +296,7 @@ class Storage:
         order_response_time: datetime | None = None,
         fill_time: datetime | None = None,
         execution_latency_ms: float | None = None,
+        trace_jsonl_path: str | None = None,
     ) -> int:
         with self._conn() as conn:
             cur = conn.execute(
@@ -300,8 +305,8 @@ class Storage:
                     broker, expected_entry_price, actual_fill_price, slippage,
                     bid_at_entry, ask_at_entry, spread_pct_at_entry,
                     broker_order_id, order_request_time, order_response_time,
-                    fill_time, execution_latency_ms)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    fill_time, execution_latency_ms, trace_jsonl_path)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     opened_at.isoformat(), symbol, side, entry, size,
                     analysis_id, note, broker,
@@ -312,6 +317,7 @@ class Storage:
                     order_response_time.isoformat() if order_response_time else None,
                     fill_time.isoformat() if fill_time else None,
                     execution_latency_ms,
+                    trace_jsonl_path,
                 ),
             )
             return cur.lastrowid

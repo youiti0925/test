@@ -542,6 +542,17 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
     # object is None for old broker implementations that haven't been
     # upgraded — we still save the trade, just without the audit.
     fill = broker.last_execution_fill()
+    # Emit the live trace BEFORE persisting the trade so save_trade() can
+    # record the resolved decision_traces.jsonl path. If trace export is
+    # not requested (no --trace-out / --trace-out-default), trace_export_paths
+    # stays None and the trade row gets NULL for trace_jsonl_path. If trace
+    # export is requested but fails, we still persist the trade (the order
+    # was already placed by the broker) with NULL path, and exit code 2 is
+    # surfaced via trace_export_error below.
+    _emit_live_trace(order_placed=True, fill_obj=fill)
+    trace_jsonl_path = (
+        trace_export_paths.get("decision_traces") if trace_export_paths else None
+    )
     trade_id = storage.save_trade(
         symbol=args.symbol,
         side=plan.side,
@@ -562,8 +573,8 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
         order_response_time=fill.order_response_time if fill else None,
         fill_time=fill.fill_time if fill else None,
         execution_latency_ms=fill.execution_latency_ms if fill else None,
+        trace_jsonl_path=trace_jsonl_path,
     )
-    _emit_live_trace(order_placed=True, fill_obj=fill)
     payload_live = {
         "mode": "live",
         "broker": args.broker,
