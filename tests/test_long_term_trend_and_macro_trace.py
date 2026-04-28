@@ -429,7 +429,7 @@ def test_aggregate_stats_with_new_slices(tmp_path):
         },
         "macro_context": {
             "dxy_change_5d_pct": -1.5,
-            "us10y_change_5d": -0.12,
+            "us10y_change_5d_bp": -12.0,  # 12 bp drop
             "yield_spread_long_short": 0.6,
             "vix": 22.0,
         },
@@ -445,7 +445,7 @@ def test_aggregate_stats_with_new_slices(tmp_path):
     assert "1..5%" in cs["close_vs_sma_200d_outcome"]
     # dxy_change_5d_pct=-1.5 → bucket "down>1%"
     assert "down>1%" in cs["dxy_trend_outcome"]
-    # us10y_change_5d=-0.12 → bucket "down>10bp"
+    # us10y_change_5d_bp=-12 → bucket "down>10bp"
     assert "down>10bp" in cs["us10y_trend_outcome"]
     # vix=22 → "high"
     assert "high" in cs["vix_regime_outcome"]
@@ -497,3 +497,220 @@ def test_aggregate_many_pools_long_term_macro_buckets(tmp_path):
     key = "UPTREND|dxy_5d=down>1%"
     assert key in joint
     assert joint[key]["HOLD"]["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# PR-A v2: USD-direction normalisation + per-symbol DXY cuts
+# ---------------------------------------------------------------------------
+
+
+def test_usd_exposure_normalization_table():
+    """USDJPY BUY = LONG_USD; EURUSD BUY = SHORT_USD; HOLD = HOLD;
+    unknown symbol = UNKNOWN_OR_NON_USD. The mapping is the linchpin
+    of dxy_trend_by_usd_exposure_outcome — if it's wrong the cross is
+    meaningless."""
+    from src.fx.decision_trace_stats import usd_exposure_for as f
+    # USD-base pairs: USD/JPY etc. — BUY is long USD.
+    assert f("USDJPY=X", "BUY") == "LONG_USD"
+    assert f("USDJPY=X", "SELL") == "SHORT_USD"
+    # USD-quote pairs: EUR/USD etc. — BUY is short USD.
+    assert f("EURUSD=X", "BUY") == "SHORT_USD"
+    assert f("EURUSD=X", "SELL") == "LONG_USD"
+    assert f("GBPUSD=X", "BUY") == "SHORT_USD"
+    assert f("GBPUSD=X", "SELL") == "LONG_USD"
+    assert f("AUDUSD=X", "BUY") == "SHORT_USD"
+    assert f("AUDUSD=X", "SELL") == "LONG_USD"
+    # HOLD bars carry no exposure regardless of symbol.
+    assert f("USDJPY=X", "HOLD") == "HOLD"
+    assert f("EURUSD=X", "HOLD") == "HOLD"
+    # Symbols not in the table — non-USD or unknown.
+    assert f("BTC-USD", "BUY") == "UNKNOWN_OR_NON_USD"
+    assert f("EURJPY=X", "BUY") == "UNKNOWN_OR_NON_USD"
+    # None / non-string inputs — UNKNOWN_OR_NON_USD or HOLD.
+    assert f(None, "BUY") == "UNKNOWN_OR_NON_USD"
+    assert f("USDJPY=X", None) == "UNKNOWN_OR_NON_USD"
+    assert f(None, "HOLD") == "HOLD"
+
+
+def _trace_record(symbol: str, action: str, dxy_5d_pct: float) -> dict:
+    """Helper: minimal trace record sufficient for aggregate_stats."""
+    return {
+        "run_id": "r", "trace_schema_version": "decision_trace_v1",
+        "bar_id": f"{symbol}_1h_2025-01-01T00:00:00+00:00",
+        "timestamp": "2025-01-01T00:00:00+00:00",
+        "symbol": symbol, "timeframe": "1h", "bar_index": 0,
+        "market": {}, "technical": {}, "waveform": {},
+        "higher_timeframe": {}, "fundamental": {},
+        "execution_assumption": {},
+        "execution_trace": {"entry_executed": action != "HOLD"},
+        "rule_checks": [],
+        "decision": {
+            "final_action": action,
+            "technical_only_action": action,
+            "blocked_by": [],
+            "rule_chain": [],
+            "reason": "x",
+        },
+        "future_outcome": {
+            "gate_effect": "NO_CHANGE",
+            "outcome_if_technical_action_taken": "WIN",
+        },
+        "long_term_trend": {
+            "daily_trend": "UPTREND", "weekly_trend": "UPTREND",
+            "monthly_trend": "UPTREND",
+        },
+        "macro_context": {"dxy_change_5d_pct": dxy_5d_pct},
+    }
+
+
+def test_dxy_trend_by_usd_exposure_outcome_buckets_by_normalised_label(tmp_path):
+    """USDJPY BUY (long USD) and EURUSD SELL (also long USD) under
+    dxy_5d up should bucket into the SAME LONG_USD leaf. Conversely,
+    USDJPY SELL and EURUSD BUY (both short USD) should share the
+    SHORT_USD leaf. Without this normalisation the raw `BUY`/`SELL`
+    counters conflate the two pair conventions."""
+    p = tmp_path / "d.jsonl"
+    p.write_text(
+        "\n".join(
+            json.dumps(r) for r in [
+                _trace_record("USDJPY=X", "BUY", 0.5),    # LONG_USD, dxy=up
+                _trace_record("EURUSD=X", "SELL", 0.5),   # LONG_USD, dxy=up
+                _trace_record("USDJPY=X", "SELL", 0.5),   # SHORT_USD, dxy=up
+                _trace_record("EURUSD=X", "BUY", 0.5),    # SHORT_USD, dxy=up
+            ]
+        ) + "\n",
+        encoding="utf-8",
+    )
+    s = aggregate_stats(p)
+    cs = s["cross_stats"]["dxy_trend_by_usd_exposure_outcome"]
+    assert "up" in cs
+    assert cs["up"]["LONG_USD"]["n"] == 2
+    assert cs["up"]["SHORT_USD"]["n"] == 2
+    # Outcomes inherit raw final_outcome — both LONG_USD entries said WIN.
+    assert cs["up"]["LONG_USD"]["outcome"]["WIN"] == 2
+
+
+def test_symbol_dxy_trend_outcome_keys_carry_symbol(tmp_path):
+    """The per-symbol cross must keep symbols separated even when
+    dxy_5d bucket and final_action match across symbols."""
+    p = tmp_path / "d.jsonl"
+    p.write_text(
+        "\n".join(
+            json.dumps(r) for r in [
+                _trace_record("USDJPY=X", "BUY", 0.5),
+                _trace_record("EURUSD=X", "BUY", 0.5),
+            ]
+        ) + "\n",
+        encoding="utf-8",
+    )
+    s = aggregate_stats(p)
+    sd = s["cross_stats"]["symbol_dxy_trend_outcome"]
+    assert "USDJPY=X|dxy_5d=up" in sd
+    assert "EURUSD=X|dxy_5d=up" in sd
+    assert sd["USDJPY=X|dxy_5d=up"]["BUY"]["n"] == 1
+    assert sd["EURUSD=X|dxy_5d=up"]["BUY"]["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# PR-A v2: SMA = daily-resample SMA (canonical reading)
+# ---------------------------------------------------------------------------
+
+
+def test_sma_uses_daily_resample_not_hourly_mean():
+    """sma_30d must be the mean of the last 30 *daily* closes, not the
+    mean of every 1h close in the last 30 days. We verify by hand.
+
+    For the synthetic series this is enough samples for sma_30d but
+    short of sma_200d.
+    """
+    df = _ohlcv(24 * 60, start="2024-01-01")  # 60 days
+    s = long_term_trend_slice(df, len(df) - 1)
+    daily = df["close"].resample("1D").last().dropna()
+    expected_sma_30 = float(daily.iloc[-30:].mean())
+    assert s.sma_30d == pytest.approx(expected_sma_30, abs=1e-9)
+    # 60 days < 200 days → sma_200d remains unavailable.
+    assert s.sma_200d is None
+    assert "sma_200d" in s.unavailable_reasons
+
+
+def test_sma_unavailable_when_fewer_than_n_daily_closes():
+    df = _ohlcv(24 * 5, start="2024-01-01")  # 5 days only
+    s = long_term_trend_slice(df, len(df) - 1)
+    assert s.sma_30d is None
+    assert "sma_30d" in s.unavailable_reasons
+    # The reason must mention daily-close shortage, not the old
+    # "history spans Md" text — pinning the canonical SMA convention.
+    assert "daily closes" in s.unavailable_reasons["sma_30d"]
+
+
+# ---------------------------------------------------------------------------
+# PR-A v2: yield deltas reported in basis points
+# ---------------------------------------------------------------------------
+
+
+def test_us10y_change_24h_bp_is_basis_points():
+    """A 0.10 percentage-point yield rise becomes 10 bp in the slice."""
+    df = _ohlcv(24 * 30, start="2025-01-01")
+    # Build a daily series where us10y is 4.30 through 2025-01-30 and
+    # rises to 4.40 starting 2025-01-31. asof(2025-01-31) sees 4.40;
+    # asof(2025-01-30) = 4.30. 24h delta = +10 bp.
+    daily_idx = pd.date_range("2024-12-01", periods=80, freq="1D")
+    us10y_vals = np.full(80, 4.30)
+    step_idx = list(daily_idx).index(pd.Timestamp("2025-01-31"))
+    us10y_vals[step_idx:] = 4.40
+    series = {
+        "us10y": pd.Series(us10y_vals, index=daily_idx, name="us10y"),
+        "us_short_yield_proxy": pd.Series(
+            np.full(80, 4.10), index=daily_idx, name="us_short_yield_proxy",
+        ),
+    }
+    macro = MacroSnapshot(
+        base_index=df.index, series=series, fetch_errors={},
+    )
+    ts = pd.Timestamp("2025-01-31", tz="UTC")
+    s = macro_context_slice(macro, ts)
+    assert s is not None
+    # 24h: 4.40 (today) − 4.30 (yesterday) = 0.10 pp = 10 bp
+    assert s.us10y_change_24h_bp == pytest.approx(10.0, abs=0.5)
+    # 5d: 4.40 − 4.30 = 10 bp (same since flat before step)
+    assert s.us10y_change_5d_bp == pytest.approx(10.0, abs=0.5)
+
+
+# ---------------------------------------------------------------------------
+# PR-A v2: macro no-future-leak — mutate future and confirm ts-time stable
+# ---------------------------------------------------------------------------
+
+
+def test_macro_context_unaffected_by_future_spike():
+    """Snapshot a slice at ts. Then inject a huge spike into the
+    *future* portion of every macro series and recompute the slice at
+    the same ts. Every value must be identical — Series.asof reads the
+    last value at-or-before ts and never reaches forward, but a future
+    refactor could regress; this test pins the contract."""
+    df = _ohlcv(24 * 60, start="2025-01-01")
+    macro_before = _macro_series(df.index)
+    ts = df.index[24 * 30]  # mid-period
+
+    s_before = macro_context_slice(macro_before, ts)
+
+    # Inject a 9999 spike into every series past ts. Compare timestamps
+    # in the series's own tz convention (the fixture builds aware UTC).
+    new_series = {}
+    for slot, ser in macro_before.series.items():
+        cp = ser.copy()
+        ts_for_compare = ts if cp.index.tz is not None else ts.tz_localize(None)
+        future_mask = cp.index > ts_for_compare
+        cp.loc[future_mask] = 9999.0
+        new_series[slot] = cp
+    macro_after = MacroSnapshot(
+        base_index=df.index, series=new_series, fetch_errors={},
+    )
+    s_after = macro_context_slice(macro_after, ts)
+
+    assert s_before is not None and s_after is not None
+    assert s_before.dxy == s_after.dxy
+    assert s_before.us10y == s_after.us10y
+    assert s_before.vix == s_after.vix
+    assert s_before.dxy_change_5d_pct == s_after.dxy_change_5d_pct
+    assert s_before.us10y_change_5d_bp == s_after.us10y_change_5d_bp
+    assert s_before.yield_spread_change_5d_bp == s_after.yield_spread_change_5d_bp

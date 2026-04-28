@@ -128,17 +128,17 @@ def _bucket_pct_5d(pct: float | None) -> str:
     return "up>1%"
 
 
-def _bucket_yield_5d(pp: float | None) -> str:
-    """Bucket a 5-day yield change in percentage points (1% = 100 bp)."""
-    if pp is None:
+def _bucket_yield_5d_bp(bp: float | None) -> str:
+    """Bucket a 5-day yield change reported in basis points (1 bp = 0.01 pp)."""
+    if bp is None:
         return "unknown"
-    if pp < -0.10:
+    if bp < -10.0:
         return "down>10bp"
-    if pp < -0.02:
+    if bp < -2.0:
         return "down"
-    if pp <= 0.02:
+    if bp <= 2.0:
         return "flat"
-    if pp <= 0.10:
+    if bp <= 10.0:
         return "up"
     return "up>10bp"
 
@@ -155,6 +155,36 @@ def _bucket_yield_spread_level(level: float | None) -> str:
     if level <= 1.50:
         return "normal"
     return "steep"
+
+
+def usd_exposure_for(symbol: str | None, final_action: str | None) -> str:
+    """Map (symbol, BUY/SELL/HOLD) to a USD-direction-normalised label.
+
+    A BUY of `USDJPY=X` is long USD (you're buying USD against JPY); a
+    BUY of `EURUSD=X` is short USD (you're buying EUR by selling USD).
+    Without this normalisation, a `dxy × side` cross conflates the two
+    pair conventions and the resulting "DXY up + SELL = bad" reading is
+    incorrect — for USD-quote pairs the exposures cancel.
+
+    Closed taxonomy:
+      LONG_USD             — bar net-long USD (USDJPY BUY, EURUSD SELL, ...)
+      SHORT_USD            — bar net-short USD
+      HOLD                 — no entry intended
+      UNKNOWN_OR_NON_USD   — symbol not in the USD-pair table or input is None
+    """
+    if final_action == "HOLD":
+        return "HOLD"
+    if not isinstance(symbol, str) or not isinstance(final_action, str):
+        return "UNKNOWN_OR_NON_USD"
+    if final_action not in ("BUY", "SELL"):
+        return "UNKNOWN_OR_NON_USD"
+    # USD-base (USD/XXX): BUY = long USD, SELL = short USD.
+    if symbol in ("USDJPY=X", "USDCHF=X", "USDCAD=X"):
+        return "LONG_USD" if final_action == "BUY" else "SHORT_USD"
+    # USD-quote (XXX/USD): BUY = short USD, SELL = long USD.
+    if symbol in ("EURUSD=X", "GBPUSD=X", "AUDUSD=X", "NZDUSD=X"):
+        return "SHORT_USD" if final_action == "BUY" else "LONG_USD"
+    return "UNKNOWN_OR_NON_USD"
 
 
 def _bucket_vix_level(level: float | None) -> str:
@@ -318,6 +348,11 @@ def aggregate_stats(
     vix_regime_outcome: dict[str, dict[str, Any]] = {}
     # Joint cross: monthly_trend × dxy_5d_trend
     long_term_macro_outcome: dict[str, dict[str, Any]] = {}
+    # PR-A v2: DXY × USD-direction-normalised exposure. Avoids conflating
+    # USDJPY BUY (long USD) with EURUSD BUY (short USD).
+    dxy_trend_by_usd_exposure_outcome: dict[str, dict[str, Any]] = {}
+    # Per-symbol DXY × raw final_action breakdown — for symbol-aware reads.
+    symbol_dxy_trend_outcome: dict[str, dict[str, Any]] = {}
 
     # Metadata accumulators
     schema_versions: set[str] = set()
@@ -556,11 +591,13 @@ def aggregate_stats(
             monthly_ret_bucket = _bucket_pct_5d(ltt.get("monthly_return_pct"))
 
             dxy_bucket = _bucket_pct_5d(mc.get("dxy_change_5d_pct"))
-            us10y_bucket = _bucket_yield_5d(mc.get("us10y_change_5d"))
+            us10y_bucket = _bucket_yield_5d_bp(mc.get("us10y_change_5d_bp"))
             spread_bucket = _bucket_yield_spread_level(
                 mc.get("yield_spread_long_short")
             )
             vix_bucket = _bucket_vix_level(mc.get("vix"))
+            symbol_for_norm = rec.get("symbol")
+            usd_exposure = usd_exposure_for(symbol_for_norm, final_action)
 
             _bump_two_way(
                 daily_trend_outcome.setdefault(
@@ -626,6 +663,29 @@ def aggregate_stats(
             _bump_two_way(
                 long_term_macro_outcome.setdefault(
                     joint_key, _new_two_way_row()
+                ),
+                final_action, outcome_value,
+            )
+
+            # PR-A v2: DXY × USD-direction-normalised exposure.
+            # The leaf is keyed by the normalised label (LONG_USD /
+            # SHORT_USD / HOLD / UNKNOWN_OR_NON_USD) so DXY-up rows can
+            # be read coherently across USD-base and USD-quote pairs.
+            _bump_two_way(
+                dxy_trend_by_usd_exposure_outcome.setdefault(
+                    dxy_bucket, _new_two_way_row()
+                ),
+                usd_exposure, outcome_value,
+            )
+
+            # PR-A v2: per-symbol DXY × raw final_action. Keyed by
+            # f"{symbol}|dxy_5d={bucket}" so each symbol's DXY-regime
+            # behaviour is independently inspectable.
+            sym_label = symbol_for_norm if isinstance(symbol_for_norm, str) else "?"
+            sym_dxy_key = f"{sym_label}|dxy_5d={dxy_bucket}"
+            _bump_two_way(
+                symbol_dxy_trend_outcome.setdefault(
+                    sym_dxy_key, _new_two_way_row()
                 ),
                 final_action, outcome_value,
             )
@@ -784,6 +844,15 @@ def aggregate_stats(
             "long_term_macro_outcome": {
                 k: _finalise_two_way(v)
                 for k, v in long_term_macro_outcome.items()
+            },
+            # PR-A v2 — USD-direction-normalised + per-symbol cuts.
+            "dxy_trend_by_usd_exposure_outcome": {
+                k: _finalise_two_way(v)
+                for k, v in dxy_trend_by_usd_exposure_outcome.items()
+            },
+            "symbol_dxy_trend_outcome": {
+                k: _finalise_two_way(v)
+                for k, v in symbol_dxy_trend_outcome.items()
             },
         },
         "consistency_checks": consistency_checks,
@@ -995,6 +1064,8 @@ def aggregate_many(
     g_yield_spread_outcome: dict[str, dict[str, dict[str, Any]]] = {}
     g_vix_regime_outcome: dict[str, dict[str, dict[str, Any]]] = {}
     g_long_term_macro_outcome: dict[str, dict[str, dict[str, Any]]] = {}
+    g_dxy_trend_by_usd_exposure_outcome: dict[str, dict[str, dict[str, Any]]] = {}
+    g_symbol_dxy_trend_outcome: dict[str, dict[str, dict[str, Any]]] = {}
 
     # Global metadata accumulators
     g_run_ids: list[str] = []                    # preserve order, dedup at end
@@ -1147,6 +1218,10 @@ def aggregate_many(
                       cs.get("vix_regime_outcome", {}))
         _pool_two_way(g_long_term_macro_outcome,
                       cs.get("long_term_macro_outcome", {}))
+        _pool_two_way(g_dxy_trend_by_usd_exposure_outcome,
+                      cs.get("dxy_trend_by_usd_exposure_outcome", {}))
+        _pool_two_way(g_symbol_dxy_trend_outcome,
+                      cs.get("symbol_dxy_trend_outcome", {}))
 
     # All runs failed -> ValueError
     if not per_run:
@@ -1263,6 +1338,12 @@ def aggregate_many(
             ),
             "long_term_macro_outcome": _finalise_pooled_two_way(
                 g_long_term_macro_outcome
+            ),
+            "dxy_trend_by_usd_exposure_outcome": _finalise_pooled_two_way(
+                g_dxy_trend_by_usd_exposure_outcome
+            ),
+            "symbol_dxy_trend_outcome": _finalise_pooled_two_way(
+                g_symbol_dxy_trend_outcome
             ),
         },
     }

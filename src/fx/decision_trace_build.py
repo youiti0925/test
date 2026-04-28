@@ -258,10 +258,16 @@ def _resample_trend(df_window: pd.DataFrame, rule: str, *, min_bars: int = 10) -
 def long_term_trend_slice(df: pd.DataFrame, i: int) -> LongTermTrendSlice:
     """Multi-timeframe long-term trend / SMA / return slice.
 
-    Reads ONLY `df.iloc[: i + 1]`. SMA / return windows are sliced by
-    timestamp so weekend gaps in FX data don't confuse the bar-count.
-    Trend labels are RANGE / UPTREND / DOWNTREND / VOLATILE / UNKNOWN
-    (UNKNOWN until enough resampled bars exist).
+    Reads ONLY `df.iloc[: i + 1]`. Trend labels are
+    RANGE / UPTREND / DOWNTREND / VOLATILE / UNKNOWN (UNKNOWN until
+    enough resampled bars exist). N-day return windows are sliced by
+    timestamp so FX weekend gaps fall back to the prior trading day.
+
+    SMA convention: canonical "N-day SMA" — resample to one close per
+    calendar day (last bar of the day, weekends drop out), then mean of
+    the trailing N daily closes. This matches the chartist reading of
+    "200-day SMA" regardless of base interval and is robust to weekend
+    gaps without weighting weekday hours.
     """
     window = df.iloc[: i + 1]
     n_bars = len(window)
@@ -271,35 +277,29 @@ def long_term_trend_slice(df: pd.DataFrame, i: int) -> LongTermTrendSlice:
 
     unavailable: dict[str, str] = {}
 
-    # SMAs by timestamp window — handles FX weekend gaps cleanly.
-    # We REQUIRE that the dataframe's earliest bar predates the cutoff,
-    # otherwise the slice is just "everything we have" and would label a
-    # too-short mean as an N-day SMA. Mark as unavailable explicitly.
-    df_first_ts = closes.index[0]
+    # Resample to one close per calendar day (weekends naturally drop out
+    # because there are no FX bars on weekends). `last()` picks the last
+    # bar of each day, then `dropna()` removes empty days.
+    try:
+        daily_closes = closes.resample("1D").last().dropna()
+    except Exception:  # noqa: BLE001
+        daily_closes = pd.Series(dtype=float)
 
-    def _sma_back(days: int) -> float | None:
-        cutoff = ts_now - pd.Timedelta(days=days)
-        if df_first_ts > cutoff:
-            spanned = (ts_now - df_first_ts).total_seconds() / 86400.0
+    def _sma_daily(days: int) -> float | None:
+        if len(daily_closes) < days:
             unavailable[f"sma_{days}d"] = (
-                f"history spans {spanned:.1f}d (need ≥{days}d back)"
+                f"only {len(daily_closes)} daily closes (need ≥{days})"
             )
             return None
-        sub = closes.loc[closes.index >= cutoff]
-        if len(sub) < 5:
-            unavailable[f"sma_{days}d"] = (
-                f"only {len(sub)} bars in last {days}d (need ≥5)"
-            )
-            return None
-        v = float(sub.mean())
+        v = float(daily_closes.iloc[-days:].mean())
         if not np.isfinite(v):
             unavailable[f"sma_{days}d"] = "non-finite mean"
             return None
         return v
 
-    sma30 = _sma_back(30)
-    sma90 = _sma_back(90)
-    sma200 = _sma_back(200)
+    sma30 = _sma_daily(30)
+    sma90 = _sma_daily(90)
+    sma200 = _sma_daily(200)
 
     def _close_vs_sma(sma: float | None) -> float | None:
         if sma is None or sma == 0 or not np.isfinite(sma):
@@ -411,21 +411,28 @@ def macro_context_slice(
         v = 100.0 * (now - prev) / prev
         return float(v) if np.isfinite(v) else None
 
-    def _abs_change(slot: str, delta: pd.Timedelta) -> float | None:
-        """For yields — return the percentage-point change (≈ basis-points/100)."""
+    def _bp_change(slot: str, delta: pd.Timedelta) -> float | None:
+        """Yield-level delta reported in basis points (1 bp = 0.01 pp).
+
+        `MacroSnapshot` stores yield slots in percent (e.g. 4.50). The
+        difference between two such values is in percentage points; we
+        multiply by 100 to convert to basis points so callers and stats
+        all read in bp uniformly.
+        """
         now = macro.value_at(slot, ts_lookup)
         prev = macro.value_at(slot, ts_lookup - delta)
         if now is None or prev is None:
             return None
-        v = float(now) - float(prev)
+        v = (float(now) - float(prev)) * 100.0
         return v if np.isfinite(v) else None
 
-    def _spread_change(delta: pd.Timedelta) -> float | None:
+    def _spread_change_bp(delta: pd.Timedelta) -> float | None:
+        """Yield spread is yields(pp) − yields(pp); delta in basis points."""
         now = macro.yield_spread_long_short(ts_lookup)
         prev = macro.yield_spread_long_short(ts_lookup - delta)
         if now is None or prev is None:
             return None
-        v = float(now) - float(prev)
+        v = (float(now) - float(prev)) * 100.0
         return v if np.isfinite(v) else None
 
     one_day = pd.Timedelta(days=1)
@@ -442,9 +449,9 @@ def macro_context_slice(
         nikkei=levels["nikkei"],
         dxy_change_24h_pct=_pct_change("dxy", one_day),
         dxy_change_5d_pct=_pct_change("dxy", five_days),
-        us10y_change_24h=_abs_change("us10y", one_day),
-        us10y_change_5d=_abs_change("us10y", five_days),
-        yield_spread_change_5d=_spread_change(five_days),
+        us10y_change_24h_bp=_bp_change("us10y", one_day),
+        us10y_change_5d_bp=_bp_change("us10y", five_days),
+        yield_spread_change_5d_bp=_spread_change_bp(five_days),
         vix_change_24h_pct=_pct_change("vix", one_day),
         sp500_change_24h_pct=_pct_change("sp500", one_day),
         nasdaq_change_24h_pct=_pct_change("nasdaq", one_day),

@@ -344,9 +344,23 @@ class LongTermTrendSlice:
     """Multi-timeframe long-term context observable at this bar.
 
     All values are computed from `df.iloc[: i + 1]` only — never reach
-    forward. Trend labels reuse `patterns.analyse` on resampled data; SMA
-    and N-day return windows are sliced by timestamp so weekend gaps are
-    handled correctly.
+    forward. Trend labels reuse `patterns.analyse` on resampled data.
+
+    SMA convention (canonical "N-day SMA"):
+      `sma_30d` / `sma_90d` / `sma_200d` are the **mean of the last N
+      *daily* closes**. Hourly bars are first resampled to one close per
+      calendar day (the day's last bar, weekends dropped), then the SMA
+      is the simple mean of the trailing N daily closes. This matches
+      market convention so that "200-day SMA" reads the way a chartist
+      expects (≈ 200 trading-day average), independent of base interval.
+      `unavailable_reasons` reports `"only K daily closes (need ≥N)"`
+      whenever fewer than N daily closes exist yet.
+
+    N-day return convention:
+      `weekly_return_pct` / `monthly_return_pct` / `quarterly_return_pct`
+      are `(close[ts] / close[ts − N days] − 1) × 100`. The reference
+      close is the most recent close at-or-before `ts − N days`, so
+      weekend gaps fall back to the prior trading day automatically.
 
     `unavailable_reasons` is populated when a value cannot be computed
     yet (warmup, sparse history). Consumers MUST treat None as "unknown",
@@ -400,6 +414,14 @@ class MacroContextSlice:
     earlier `value_at(slot, ts - delta)` calls and are also strictly
     past-only.
 
+    Units (single source of truth — fields are named to match):
+      * `*_pct` fields are percent change (e.g. `dxy_change_5d_pct = -1.5`
+        means DXY fell 1.5 % over the prior 5 days).
+      * `*_bp` fields are **basis points** (1 bp = 0.01 percentage point).
+        So `us10y_change_24h_bp = 10` means the 10-year yield rose by
+        10 basis points (i.e. 0.10 percentage points). Yield deltas are
+        always reported in bp to match market convention; do not mix.
+
     Every field is optional because:
       * the macro fetch may have failed at backtest start,
       * a particular slot's history may not cover this bar's timestamp,
@@ -417,12 +439,12 @@ class MacroContextSlice:
     nasdaq: float | None
     nikkei: float | None
 
-    # Deltas — yield deltas in basis points, others percent
+    # Deltas — yields in basis points (bp), prices in percent (pct)
     dxy_change_24h_pct: float | None
     dxy_change_5d_pct: float | None
-    us10y_change_24h: float | None
-    us10y_change_5d: float | None
-    yield_spread_change_5d: float | None
+    us10y_change_24h_bp: float | None
+    us10y_change_5d_bp: float | None
+    yield_spread_change_5d_bp: float | None
     vix_change_24h_pct: float | None
     sp500_change_24h_pct: float | None
     nasdaq_change_24h_pct: float | None
@@ -444,9 +466,9 @@ class MacroContextSlice:
             "nikkei": self.nikkei,
             "dxy_change_24h_pct": self.dxy_change_24h_pct,
             "dxy_change_5d_pct": self.dxy_change_5d_pct,
-            "us10y_change_24h": self.us10y_change_24h,
-            "us10y_change_5d": self.us10y_change_5d,
-            "yield_spread_change_5d": self.yield_spread_change_5d,
+            "us10y_change_24h_bp": self.us10y_change_24h_bp,
+            "us10y_change_5d_bp": self.us10y_change_5d_bp,
+            "yield_spread_change_5d_bp": self.yield_spread_change_5d_bp,
             "vix_change_24h_pct": self.vix_change_24h_pct,
             "sp500_change_24h_pct": self.sp500_change_24h_pct,
             "nasdaq_change_24h_pct": self.nasdaq_change_24h_pct,
