@@ -1110,6 +1110,45 @@ def cmd_trace_stats(args, cfg: Config, storage: Storage) -> int:
     return 0
 
 
+def cmd_trace_stats_multi(args, cfg: Config, storage: Storage) -> int:
+    """Aggregate multiple `decision_traces.jsonl` files at once.
+
+    Per-run stats and a global pooled aggregate are emitted as a single
+    JSON document. Failure semantics:
+      * A `ValueError` from `aggregate_many` (no input paths or every
+        path failed) is printed to stderr and the command exits 2.
+      * If at least one path succeeded but `consistency_checks.errors_total`
+        is non-zero (per-run errors or failed_runs), the JSON is still
+        written to stdout AND the command exits 2 so the caller can
+        detect the partial read.
+    """
+    from .decision_trace_stats import aggregate_many
+    try:
+        stats = aggregate_many(
+            list(args.paths),
+            top_n_hold_reasons=args.top_hold_reasons,
+        )
+    except ValueError as exc:
+        print(f"[error] trace-stats-multi: {exc}", file=sys.stderr)
+        return 2
+
+    if args.pretty:
+        out = json.dumps(stats, indent=2, ensure_ascii=False, default=str)
+    else:
+        out = json.dumps(stats, ensure_ascii=False, default=str)
+    print(out)
+
+    errors_total = stats["consistency_checks"]["errors_total"]
+    if errors_total > 0:
+        print(
+            f"[warn] trace-stats-multi: {errors_total} error(s) recorded; "
+            f"see consistency_checks.errors / failed_runs",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
+
+
 def cmd_review(args, cfg: Config, storage: Storage) -> int:
     if not cfg.anthropic_api_key:
         print("ANTHROPIC_API_KEY not set; cannot run review.", file=sys.stderr)
@@ -1627,6 +1666,20 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Number of (reason, count) pairs to surface in "
                          "top_hold_reasons (default 10).")
     ts.set_defaults(func=cmd_trace_stats)
+
+    tsm = sub.add_parser(
+        "trace-stats-multi",
+        help="Aggregate multiple decision_traces.jsonl files (per-run + global)",
+    )
+    tsm.add_argument("paths", nargs="+",
+                     help="Paths to one or more decision_traces.jsonl(.gz). "
+                          "Globs expand via the shell.")
+    tsm.add_argument("--pretty", action="store_true",
+                     help="Pretty-print the output JSON (indent=2).")
+    tsm.add_argument("--top-hold-reasons", type=int, default=10,
+                     help="Number of (reason, count) pairs to surface in "
+                          "global.top_hold_reasons (default 10).")
+    tsm.set_defaults(func=cmd_trace_stats_multi)
 
     r = sub.add_parser("review", help="Weekly self-review via Claude")
     r.add_argument("--limit", type=int, default=50)
