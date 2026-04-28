@@ -187,6 +187,41 @@ def usd_exposure_for(symbol: str | None, final_action: str | None) -> str:
     return "UNKNOWN_OR_NON_USD"
 
 
+def _bucket_waveform_confidence(c: float | None) -> str:
+    """Bucket WaveformBias.confidence into low / mid / high / unknown."""
+    if c is None:
+        return "unknown"
+    if c < 0.3:
+        return "low<0.3"
+    if c < 0.6:
+        return "mid_0.3..0.6"
+    return "high>=0.6"
+
+
+def _bucket_top_similarity(s: float | None) -> str:
+    """Bucket the top match similarity score into weak / medium / strong."""
+    if s is None:
+        return "unknown"
+    if s < 0.6:
+        return "weak<0.6"
+    if s < 0.75:
+        return "medium_0.6..0.75"
+    return "strong>=0.75"
+
+
+def _bucket_matched_count(n: int | None) -> str:
+    """Bucket the number of similar past windows used by the bias."""
+    if n is None:
+        return "unknown"
+    if n == 0:
+        return "0"
+    if n < 10:
+        return "1-9"
+    if n < 30:
+        return "10-29"
+    return "30+"
+
+
 def _bucket_vix_level(level: float | None) -> str:
     if level is None:
         return "unknown"
@@ -353,6 +388,17 @@ def aggregate_stats(
     dxy_trend_by_usd_exposure_outcome: dict[str, dict[str, Any]] = {}
     # Per-symbol DXY × raw final_action breakdown — for symbol-aware reads.
     symbol_dxy_trend_outcome: dict[str, dict[str, Any]] = {}
+
+    # PR #15: waveform-match cross-stats. All keyed by a deterministic
+    # bucket label derived from trace.waveform.waveform_bias; bars
+    # without a bias dict (None or pre-PR-#15 traces) bucket as
+    # "unknown" for visibility-by-default.
+    waveform_bias_direction_outcome: dict[str, dict[str, Any]] = {}
+    waveform_confidence_bucket_outcome: dict[str, dict[str, Any]] = {}
+    top_similarity_bucket_outcome: dict[str, dict[str, Any]] = {}
+    matched_count_bucket_outcome: dict[str, dict[str, Any]] = {}
+    waveform_bias_by_technical_action_outcome: dict[str, dict[str, Any]] = {}
+    symbol_waveform_bias_outcome: dict[str, dict[str, Any]] = {}
 
     # Metadata accumulators
     schema_versions: set[str] = set()
@@ -690,6 +736,69 @@ def aggregate_stats(
                 final_action, outcome_value,
             )
 
+            # ── PR #15: waveform-match cross-stats ───────────────────
+            # waveform_bias is the dict produced by waveform_bias_dict()
+            # in decision_trace_build; it can also be None (pre-PR-#15
+            # traces or library not attached). Every bucket falls back
+            # to "unknown" for visibility-by-default.
+            wf_section = (rec.get("waveform") or {}).get("waveform_bias")
+            wf_dict = wf_section if isinstance(wf_section, dict) else {}
+            wf_action = wf_dict.get("action") or wf_dict.get("expected_direction")
+            if not isinstance(wf_action, str):
+                wf_action = "unknown"
+            wf_conf = wf_dict.get("confidence")
+            if not isinstance(wf_conf, (int, float)):
+                wf_conf = None
+            wf_top = wf_dict.get("top_similarity")
+            if not isinstance(wf_top, (int, float)):
+                wf_top = None
+            wf_matched = wf_dict.get("matched_count")
+            if wf_matched is None:
+                wf_matched = wf_dict.get("sample_count")
+            if not isinstance(wf_matched, int):
+                wf_matched = None
+
+            _bump_two_way(
+                waveform_bias_direction_outcome.setdefault(
+                    wf_action, _new_two_way_row()
+                ),
+                final_action, outcome_value,
+            )
+            _bump_two_way(
+                waveform_confidence_bucket_outcome.setdefault(
+                    _bucket_waveform_confidence(wf_conf), _new_two_way_row()
+                ),
+                final_action, outcome_value,
+            )
+            _bump_two_way(
+                top_similarity_bucket_outcome.setdefault(
+                    _bucket_top_similarity(wf_top), _new_two_way_row()
+                ),
+                final_action, outcome_value,
+            )
+            _bump_two_way(
+                matched_count_bucket_outcome.setdefault(
+                    _bucket_matched_count(wf_matched), _new_two_way_row()
+                ),
+                final_action, outcome_value,
+            )
+            # bias direction × technical_only_action — separate cross to
+            # see whether bias agreed with the technical signal.
+            _bump_two_way(
+                waveform_bias_by_technical_action_outcome.setdefault(
+                    wf_action, _new_two_way_row()
+                ),
+                tech_action if isinstance(tech_action, str) else None,
+                outcome_value,
+            )
+            sym_wf_key = f"{sym_label}|wf_bias={wf_action}"
+            _bump_two_way(
+                symbol_waveform_bias_outcome.setdefault(
+                    sym_wf_key, _new_two_way_row()
+                ),
+                final_action, outcome_value,
+            )
+
             # ── Execution trace distributions ────────────────────────
             et = rec.get("execution_trace") or {}
             if isinstance(et.get("entry_executed"), bool):
@@ -853,6 +962,31 @@ def aggregate_stats(
             "symbol_dxy_trend_outcome": {
                 k: _finalise_two_way(v)
                 for k, v in symbol_dxy_trend_outcome.items()
+            },
+            # PR #15 — waveform-match crosses.
+            "waveform_bias_direction_outcome": {
+                k: _finalise_two_way(v)
+                for k, v in waveform_bias_direction_outcome.items()
+            },
+            "waveform_confidence_bucket_outcome": {
+                k: _finalise_two_way(v)
+                for k, v in waveform_confidence_bucket_outcome.items()
+            },
+            "top_similarity_bucket_outcome": {
+                k: _finalise_two_way(v)
+                for k, v in top_similarity_bucket_outcome.items()
+            },
+            "matched_count_bucket_outcome": {
+                k: _finalise_two_way(v)
+                for k, v in matched_count_bucket_outcome.items()
+            },
+            "waveform_bias_by_technical_action_outcome": {
+                k: _finalise_two_way(v)
+                for k, v in waveform_bias_by_technical_action_outcome.items()
+            },
+            "symbol_waveform_bias_outcome": {
+                k: _finalise_two_way(v)
+                for k, v in symbol_waveform_bias_outcome.items()
             },
         },
         "consistency_checks": consistency_checks,
@@ -1066,6 +1200,12 @@ def aggregate_many(
     g_long_term_macro_outcome: dict[str, dict[str, dict[str, Any]]] = {}
     g_dxy_trend_by_usd_exposure_outcome: dict[str, dict[str, dict[str, Any]]] = {}
     g_symbol_dxy_trend_outcome: dict[str, dict[str, dict[str, Any]]] = {}
+    g_waveform_bias_direction_outcome: dict[str, dict[str, dict[str, Any]]] = {}
+    g_waveform_confidence_bucket_outcome: dict[str, dict[str, dict[str, Any]]] = {}
+    g_top_similarity_bucket_outcome: dict[str, dict[str, dict[str, Any]]] = {}
+    g_matched_count_bucket_outcome: dict[str, dict[str, dict[str, Any]]] = {}
+    g_waveform_bias_by_technical_action_outcome: dict[str, dict[str, dict[str, Any]]] = {}
+    g_symbol_waveform_bias_outcome: dict[str, dict[str, dict[str, Any]]] = {}
 
     # Global metadata accumulators
     g_run_ids: list[str] = []                    # preserve order, dedup at end
@@ -1222,6 +1362,18 @@ def aggregate_many(
                       cs.get("dxy_trend_by_usd_exposure_outcome", {}))
         _pool_two_way(g_symbol_dxy_trend_outcome,
                       cs.get("symbol_dxy_trend_outcome", {}))
+        _pool_two_way(g_waveform_bias_direction_outcome,
+                      cs.get("waveform_bias_direction_outcome", {}))
+        _pool_two_way(g_waveform_confidence_bucket_outcome,
+                      cs.get("waveform_confidence_bucket_outcome", {}))
+        _pool_two_way(g_top_similarity_bucket_outcome,
+                      cs.get("top_similarity_bucket_outcome", {}))
+        _pool_two_way(g_matched_count_bucket_outcome,
+                      cs.get("matched_count_bucket_outcome", {}))
+        _pool_two_way(g_waveform_bias_by_technical_action_outcome,
+                      cs.get("waveform_bias_by_technical_action_outcome", {}))
+        _pool_two_way(g_symbol_waveform_bias_outcome,
+                      cs.get("symbol_waveform_bias_outcome", {}))
 
     # All runs failed -> ValueError
     if not per_run:
@@ -1344,6 +1496,24 @@ def aggregate_many(
             ),
             "symbol_dxy_trend_outcome": _finalise_pooled_two_way(
                 g_symbol_dxy_trend_outcome
+            ),
+            "waveform_bias_direction_outcome": _finalise_pooled_two_way(
+                g_waveform_bias_direction_outcome
+            ),
+            "waveform_confidence_bucket_outcome": _finalise_pooled_two_way(
+                g_waveform_confidence_bucket_outcome
+            ),
+            "top_similarity_bucket_outcome": _finalise_pooled_two_way(
+                g_top_similarity_bucket_outcome
+            ),
+            "matched_count_bucket_outcome": _finalise_pooled_two_way(
+                g_matched_count_bucket_outcome
+            ),
+            "waveform_bias_by_technical_action_outcome": _finalise_pooled_two_way(
+                g_waveform_bias_by_technical_action_outcome
+            ),
+            "symbol_waveform_bias_outcome": _finalise_pooled_two_way(
+                g_symbol_waveform_bias_outcome
             ),
         },
     }

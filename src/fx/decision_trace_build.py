@@ -41,6 +41,9 @@ from .decision_trace import (
 from .indicators import Snapshot
 from .macro import MacroSnapshot
 from .patterns import PatternResult, analyse as analyse_patterns
+from .waveform_backtest import waveform_lookup
+from .waveform_library import WaveformSample
+from .waveform_matcher import compute_signature
 from .risk_gate import (
     RiskState,
     check_calendar_freshness,
@@ -173,8 +176,16 @@ def technical_slice(
 
 
 def waveform_slice(
-    pattern: PatternResult | None, atr_value: float | None, close: float
+    pattern: PatternResult | None,
+    atr_value: float | None,
+    close: float,
+    *,
+    waveform_bias: dict | None = None,
 ) -> WaveformSlice:
+    """Build the waveform slice. `waveform_bias` (PR #15) is the dict
+    produced by `waveform_bias_dict()` — None means waveform lookup
+    was not requested at all (vs an `{"unavailable_reason": ...}` dict
+    which means it was requested but could not run)."""
     if pattern is None:
         return WaveformSlice(
             trend_state="UNKNOWN",
@@ -182,7 +193,7 @@ def waveform_slice(
             neckline=None, neckline_broken=False,
             distance_to_neckline_atr=None,
             rsi_divergence=False, macd_momentum_weakening=False,
-            swing_points_recent=(), waveform_bias=None,
+            swing_points_recent=(), waveform_bias=waveform_bias,
             waveform_reason_codes=(),
         )
     distance = None
@@ -205,7 +216,7 @@ def waveform_slice(
         rsi_divergence=bool(pattern.rsi_divergence),
         macd_momentum_weakening=bool(pattern.macd_momentum_weakening),
         swing_points_recent=tuple(recent),
-        waveform_bias=None,
+        waveform_bias=waveform_bias,
         waveform_reason_codes=(),
     )
 
@@ -459,6 +470,221 @@ def macro_context_slice(
         missing_slots=tuple(missing),
         fetch_errors=dict(macro.fetch_errors),
     )
+
+
+# ---------------------------------------------------------------------------
+# Waveform-match context (PR #15)
+# ---------------------------------------------------------------------------
+# Bars-per-interval used for the horizon-aware look-ahead filter. We import
+# the canonical table from decision_trace where it's already maintained for
+# future_outcome bookkeeping; do NOT duplicate the table here.
+
+from .decision_trace import _INTERVAL_MINUTES as _INTERVAL_MINUTES_TABLE
+
+
+def _horizon_duration(
+    interval: str, horizon_bars: int
+) -> "pd.Timedelta | None":
+    """Convert (interval, horizon_bars) to a wall-clock duration.
+
+    Returns None when the interval string is not recognised; the caller
+    must then disable waveform lookup (recording an unavailable_reason)
+    rather than guess. PR-#15 spec mandates safe-side behaviour: never
+    apply a filter weaker than what the horizon requires.
+    """
+    minutes = _INTERVAL_MINUTES_TABLE.get(interval)
+    if minutes is None or horizon_bars <= 0:
+        return None
+    return pd.Timedelta(minutes=minutes * horizon_bars)
+
+
+def _filter_library_no_lookahead(
+    library: list[WaveformSample],
+    bar_ts: pd.Timestamp,
+    horizon_dur: pd.Timedelta,
+) -> list[WaveformSample]:
+    """Keep only samples whose forward-return label is fully realised by bar_ts.
+
+    A sample's `forward_returns_pct[horizon_bars]` is computed from
+    `closes[end + horizon]`, so it is only knowable AT that future
+    timestamp. To match against the sample's labels at bar_ts without
+    leaking future information, we require:
+
+        sample.end_ts + horizon_dur <= bar_ts
+
+    Stricter than `sample.end_ts < bar_ts`. Samples whose horizon
+    straddles bar_ts are excluded — those labels were not yet fully
+    realised at the moment the engine would have queried.
+    """
+    cutoff = bar_ts - horizon_dur
+    out: list[WaveformSample] = []
+    for s in library:
+        sample_end = s.end_ts
+        # Normalise tz so comparison cannot raise on mixed-tz inputs.
+        sample_end_ts = pd.Timestamp(sample_end)
+        if sample_end_ts.tzinfo is None and cutoff.tzinfo is not None:
+            sample_end_ts = sample_end_ts.tz_localize(cutoff.tzinfo)
+        elif sample_end_ts.tzinfo is not None and cutoff.tzinfo is None:
+            sample_end_ts = sample_end_ts.tz_convert(None).tz_localize(None)
+        if sample_end_ts <= cutoff:
+            out.append(s)
+    return out
+
+
+def compute_library_id(library: list[WaveformSample], path: str | None) -> str:
+    """Compact identifier for a waveform library: filename + size + ts range + sha8.
+
+    Stored in trace.waveform.waveform_bias.library_id and in run_metadata
+    for reproducibility. Kept short on purpose so JSONL traces don't blow
+    up — the full library should be referenced by file path elsewhere.
+    """
+    import hashlib
+    import os
+    n = len(library)
+    if n == 0:
+        return f"{os.path.basename(path or '?')}|0|empty"
+    first_ts = library[0].end_ts.isoformat()
+    last_ts = library[-1].end_ts.isoformat()
+    h = hashlib.sha256()
+    h.update(f"{n}|{first_ts}|{last_ts}".encode("utf-8"))
+    sha8 = h.hexdigest()[:8]
+    fname = os.path.basename(path or "memory")
+    return f"{fname}|n={n}|{first_ts}|{last_ts}|{sha8}"
+
+
+def waveform_bias_dict(
+    library: list[WaveformSample] | None,
+    df: pd.DataFrame,
+    i: int,
+    *,
+    interval: str,
+    library_id: str | None = None,
+    window_bars: int = 60,
+    horizon_bars: int = 24,
+    method: str = "dtw",
+    min_score: float = 0.55,
+    min_samples: int = 20,
+    min_directional_share: float = 0.6,
+    structure_weight: float = 0.25,
+    top_k: int = 30,
+) -> dict:
+    """Run a horizon-aware waveform_lookup at bar i and return the bias dict.
+
+    The dict is what's stored under `trace.waveform.waveform_bias`. When
+    lookup is impossible (no library, unknown interval, no eligible
+    samples after horizon-aware filter, or insufficient bars) the dict
+    contains only `{"unavailable_reason": "..."}` plus the static
+    config keys — never None — so consumers always know why.
+    """
+    base: dict = {
+        "library_id": library_id,
+        "horizon_bars": horizon_bars,
+        "match_method": method,
+        "window_bars": window_bars,
+    }
+
+    if library is None:
+        return {**base, "unavailable_reason": "no library attached"}
+
+    horizon_dur = _horizon_duration(interval, horizon_bars)
+    if horizon_dur is None:
+        return {
+            **base,
+            "unavailable_reason": (
+                f"unknown interval {interval!r}; cannot compute "
+                "horizon-aware look-ahead filter — disabling lookup"
+            ),
+        }
+
+    window = df.iloc[: i + 1]
+    if len(window) < window_bars:
+        return {
+            **base,
+            "unavailable_reason": (
+                f"only {len(window)} bars available, need ≥{window_bars} "
+                "for waveform window"
+            ),
+        }
+
+    bar_ts = window.index[-1]
+    if not isinstance(bar_ts, pd.Timestamp):
+        bar_ts = pd.Timestamp(bar_ts)
+
+    safe_lib = _filter_library_no_lookahead(library, bar_ts, horizon_dur)
+    if not safe_lib:
+        return {
+            **base,
+            "unavailable_reason": (
+                f"no library samples whose horizon completes by {bar_ts}; "
+                f"library has {len(library)} samples but none satisfy "
+                f"end_ts + {horizon_dur} <= bar_ts"
+            ),
+            "library_size": len(library),
+            "eligible_size": 0,
+        }
+
+    target_window = window.iloc[-window_bars:]
+    try:
+        target_sig = compute_signature(target_window, method="z_score")
+    except Exception as exc:  # noqa: BLE001
+        return {
+            **base,
+            "unavailable_reason": f"compute_signature failed: {exc}",
+        }
+
+    bias, matches = waveform_lookup(
+        target_sig, safe_lib,
+        horizon_bars=horizon_bars,
+        method=method,
+        top_k=top_k,
+        min_score=min_score,
+        min_sample_count=min_samples,
+        min_directional_share=min_directional_share,
+        structure_weight=structure_weight,
+    )
+
+    raw = bias.to_dict()
+    n = bias.sample_count
+    bullish_ratio = bias.bullish_count / n if n else None
+    bearish_ratio = bias.bearish_count / n if n else None
+    neutral_ratio = bias.neutral_count / n if n else None
+
+    median_return = None
+    if matches:
+        usable_returns = [
+            m.sample.forward_returns_pct.get(horizon_bars)
+            for m in matches
+            if m.sample.forward_returns_pct.get(horizon_bars) is not None
+        ]
+        if usable_returns:
+            usable_returns.sort()
+            mid = len(usable_returns) // 2
+            if len(usable_returns) % 2:
+                median_return = float(usable_returns[mid])
+            else:
+                median_return = float(
+                    (usable_returns[mid - 1] + usable_returns[mid]) / 2
+                )
+
+    top_similarity = float(matches[0].score) if matches else None
+
+    out = {
+        **base,
+        # Raw bias fields (kept verbatim for compat).
+        **raw,
+        # PR-#15 enriched aliases / analytics.
+        "matched_count": n,
+        "expected_direction": bias.action,
+        "avg_future_return_pct": bias.avg_forward_return_pct,
+        "median_future_return_pct": median_return,
+        "top_similarity": top_similarity,
+        "bullish_match_ratio": bullish_ratio,
+        "bearish_match_ratio": bearish_ratio,
+        "neutral_match_ratio": neutral_ratio,
+        "library_size": len(library),
+        "eligible_size": len(safe_lib),
+    }
+    return out
 
 
 def fundamental_slice(
@@ -1016,13 +1242,16 @@ def build_atr_unavailable_trace(
     bar_exit_price: float | None,
     bar_exit_trade_id: str | None,
     macro: MacroSnapshot | None = None,
+    waveform_bias: dict | None = None,
 ) -> BarDecisionTrace:
     """Trace for a bar where ATR is NaN — engine bailed before decide()."""
     from .backtest_engine import _position_dict  # local import to avoid cycle
 
     market = market_slice(df, i, data_source)
     technical = technical_slice(None, None, "HOLD", [])
-    waveform = waveform_slice(None, None, market.close)
+    waveform = waveform_slice(
+        None, None, market.close, waveform_bias=waveform_bias,
+    )
     higher_tf = higher_tf_slice(interval, "UNKNOWN", "HOLD", use_higher_tf=False)
     fundamental = fundamental_slice(events_tuple, ts, blocked_codes=())
     exec_assumption = execution_assumption_slice()
@@ -1160,11 +1389,14 @@ def build_full_trace(
     bar_exit_price: float | None,
     bar_exit_trade_id: str | None,
     macro: MacroSnapshot | None = None,
+    waveform_bias: dict | None = None,
 ) -> BarDecisionTrace:
     """Full trace for a normally processed bar."""
     market = market_slice(df, i, data_source)
     technical = technical_slice(snap, atr_value, tech, tech_reason_codes)
-    waveform = waveform_slice(pattern, atr_value, market.close)
+    waveform = waveform_slice(
+        pattern, atr_value, market.close, waveform_bias=waveform_bias,
+    )
     higher_tf_s = higher_tf_slice(interval, higher_tf, tech, use_higher_tf)
     long_term = long_term_trend_slice(df, i)
     macro_ctx = macro_context_slice(macro, ts)

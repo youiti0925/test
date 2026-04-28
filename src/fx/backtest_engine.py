@@ -42,6 +42,7 @@ import pandas as pd
 from .calendar import Event
 from .decision_engine import Decision, decide as decide_action
 from .macro import MacroSnapshot
+from .waveform_library import WaveformSample
 from .decision_trace import (
     BarDecisionTrace,
     RunMetadata,
@@ -278,6 +279,44 @@ def _bar_event_window(events: tuple[Event, ...], ts: pd.Timestamp) -> tuple[Even
     )
 
 
+def _compute_waveform_bias_for_bar(
+    df: pd.DataFrame,
+    i: int,
+    *,
+    library: list[WaveformSample] | None,
+    library_id: str | None,
+    interval: str,
+    window_bars: int,
+    horizon_bars: int,
+    method: str,
+    min_score: float,
+    min_samples: int,
+    min_directional_share: float,
+) -> dict | None:
+    """Thin wrapper: returns None when no library is attached (so the
+    trace stores a literal null and downstream tooling treats the bar
+    as 'waveform lookup not requested'). Otherwise delegates to
+    `decision_trace_build.waveform_bias_dict`, which itself returns a
+    dict — possibly with only `unavailable_reason` if the lookup could
+    not run for this bar (look-ahead filter empty, unknown interval,
+    insufficient warmup, etc.).
+    """
+    if library is None:
+        return None
+    from .decision_trace_build import waveform_bias_dict
+    return waveform_bias_dict(
+        library, df, i,
+        interval=interval,
+        library_id=library_id,
+        window_bars=window_bars,
+        horizon_bars=horizon_bars,
+        method=method,
+        min_score=min_score,
+        min_samples=min_samples,
+        min_directional_share=min_directional_share,
+    )
+
+
 def run_engine_backtest(
     df: pd.DataFrame,
     symbol: str,
@@ -296,6 +335,18 @@ def run_engine_backtest(
     data_source: str = "unknown",
     data_retrieved_at: datetime | None = None,
     macro: MacroSnapshot | None = None,
+    # PR #15: waveform-match observability — values land in
+    # trace.waveform.waveform_bias and run_metadata, but are NEVER
+    # forwarded to decide_action (decisions remain unchanged whether
+    # a library is attached or not).
+    waveform_library: list[WaveformSample] | None = None,
+    waveform_library_id: str | None = None,
+    waveform_window_bars: int = 60,
+    waveform_horizon_bars: int = 24,
+    waveform_min_samples: int = 20,
+    waveform_min_score: float = 0.55,
+    waveform_min_share: float = 0.6,
+    waveform_method: str = "dtw",
 ) -> EngineBacktestResult:
     """Run a Decision Engine-driven backtest over `df`.
 
@@ -372,6 +423,19 @@ def run_engine_backtest(
             "macro_slots": (
                 sorted(macro.series.keys()) if macro is not None else []
             ),
+            # PR #15 — waveform-match config. Saved here so a trace can be
+            # re-derived from the same library + params later.
+            "waveform_enabled": waveform_library is not None,
+            "waveform_library_id": waveform_library_id,
+            "waveform_library_size": (
+                len(waveform_library) if waveform_library is not None else 0
+            ),
+            "waveform_window_bars": waveform_window_bars,
+            "waveform_horizon_bars": waveform_horizon_bars,
+            "waveform_min_samples": waveform_min_samples,
+            "waveform_min_score": waveform_min_score,
+            "waveform_min_share": waveform_min_share,
+            "waveform_method": waveform_method,
         }
         sha, sha_status = get_commit_sha()
         run_metadata = RunMetadata(
@@ -489,6 +553,18 @@ def run_engine_backtest(
                     bar_exit_price=bar_exit_price,
                     bar_exit_trade_id=bar_exit_trade_id,
                     macro=macro,
+                    waveform_bias=_compute_waveform_bias_for_bar(
+                        df, i,
+                        library=waveform_library,
+                        library_id=waveform_library_id,
+                        interval=interval,
+                        window_bars=waveform_window_bars,
+                        horizon_bars=waveform_horizon_bars,
+                        method=waveform_method,
+                        min_score=waveform_min_score,
+                        min_samples=waveform_min_samples,
+                        min_directional_share=waveform_min_share,
+                    ),
                 )
                 result.decision_traces.append(trace)
             continue
@@ -618,6 +694,18 @@ def run_engine_backtest(
                 bar_exit_price=bar_exit_price,
                 bar_exit_trade_id=bar_exit_trade_id,
                 macro=macro,
+                waveform_bias=_compute_waveform_bias_for_bar(
+                    df, i,
+                    library=waveform_library,
+                    library_id=waveform_library_id,
+                    interval=interval,
+                    window_bars=waveform_window_bars,
+                    horizon_bars=waveform_horizon_bars,
+                    method=waveform_method,
+                    min_score=waveform_min_score,
+                    min_samples=waveform_min_samples,
+                    min_directional_share=waveform_min_share,
+                ),
             )
             result.decision_traces.append(trace)
 

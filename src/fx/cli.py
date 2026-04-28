@@ -828,6 +828,34 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
                 file=sys.stderr,
             )
 
+    # Waveform library (PR #15): user-built JSONL of past WaveformSample.
+    # Read failure is fatal here — if you asked for a library and we
+    # cannot load it, you'd unknowingly run a backtest without it.
+    # Decision logic is unchanged either way; this is observability only.
+    waveform_library = None
+    waveform_library_id = None
+    if getattr(args, "waveform_library", None):
+        from .waveform_library import read_library
+        from .decision_trace_build import compute_library_id
+        lib_path = Path(args.waveform_library)
+        try:
+            waveform_library = read_library(lib_path)
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[error] failed to read waveform library {lib_path}: {e}",
+                file=sys.stderr,
+            )
+            return 2
+        if not waveform_library:
+            print(
+                f"[error] waveform library {lib_path} is empty",
+                file=sys.stderr,
+            )
+            return 2
+        waveform_library_id = compute_library_id(
+            waveform_library, str(lib_path),
+        )
+
     result = run_engine_backtest(
         df,
         symbol=args.symbol,
@@ -839,6 +867,8 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
         events=events,
         use_higher_tf=not args.no_higher_tf,
         macro=macro,
+        waveform_library=waveform_library,
+        waveform_library_id=waveform_library_id,
     )
     metrics = result.metrics()
     start_date = str(df.index[0])
@@ -1862,6 +1892,14 @@ def build_parser() -> argparse.ArgumentParser:
     be.add_argument("--macro-period", default="2y",
                     help="yfinance period for the macro snapshot fetch "
                          "(default 2y). Must comfortably cover --period.")
+    be.add_argument("--waveform-library", default=None,
+                    help="Path to a waveform library JSONL produced by "
+                         "`waveform-build-library`. When given, trace.waveform"
+                         ".waveform_bias is populated per bar via a "
+                         "horizon-aware look-ahead-safe lookup. Decision "
+                         "logic is unchanged — bias is observability only. "
+                         "Recommended: build the library from data PRIOR "
+                         "to the backtest period (out-of-sample).")
     be.add_argument("--trace-out", default=None,
                     help="Directory to write run_metadata.json / "
                          "decision_traces.jsonl / summary.json. Skip the "
