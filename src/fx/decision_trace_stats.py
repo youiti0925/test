@@ -166,6 +166,14 @@ def aggregate_stats(
     # apply to all bars regardless of final_action.
     gate_effect_by_tech: dict[str, Counter[str]] = defaultdict(Counter)
     final_action_by_outcome: dict[str, Counter[str]] = defaultdict(Counter)
+    # ── Cross-stats accumulator (PR #10) ─────────────────────────────────
+    # `blocked_by_outcome` — keyed by each decision.blocked_by code (the
+    # closed Risk-Gate taxonomy: event_high / spread_abnormal / etc.) plus
+    # the synthetic key "no_block" for traces with empty blocked_by. The
+    # row schema mirrors hold_reason_outcome so the same finalisers and
+    # pooling helpers can be reused. A single trace with multiple
+    # blocked_by codes contributes once to EACH key (additive semantics).
+    blocked_by_outcome_aggregates: dict[str, dict[str, Any]] = {}
 
     # Metadata accumulators
     schema_versions: set[str] = set()
@@ -349,6 +357,40 @@ def aggregate_stats(
                         if row["_return_max"] is None or rv > row["_return_max"]:
                             row["_return_max"] = rv
 
+            # blocked_by_outcome — every bar contributes (PR #10).
+            # blocked_by is a list of Risk-Gate codes. Empty list →
+            # synthetic key "no_block". Multiple codes → contribute once
+            # to EACH key (a bar that triggers both event_high and
+            # spread_abnormal counts in both buckets).
+            if not blocked_by:
+                blocked_keys: list[str] = ["no_block"]
+            else:
+                blocked_keys = [c for c in blocked_by if isinstance(c, str)]
+                if not blocked_keys:
+                    # blocked_by present but contained only non-strings
+                    blocked_keys = ["no_block"]
+            for code in blocked_keys:
+                row = blocked_by_outcome_aggregates.setdefault(
+                    code, _new_hold_reason_row()
+                )
+                row["n"] += 1
+                if ge_value is not None:
+                    row["gate_effect"][ge_value] += 1
+                if outcome_value is not None:
+                    row["outcome_if_technical_action_taken"][
+                        outcome_value
+                    ] += 1
+                if isinstance(tech_action, str):
+                    row["technical_only_action"][tech_action] += 1
+                if isinstance(return_value, (int, float)):
+                    rv = float(return_value)
+                    row["_return_count"] += 1
+                    row["_return_sum"] += rv
+                    if row["_return_min"] is None or rv < row["_return_min"]:
+                        row["_return_min"] = rv
+                    if row["_return_max"] is None or rv > row["_return_max"]:
+                        row["_return_max"] = rv
+
             # ── Execution trace distributions ────────────────────────
             et = rec.get("execution_trace") or {}
             if isinstance(et.get("entry_executed"), bool):
@@ -456,6 +498,10 @@ def aggregate_stats(
             "final_action_by_outcome": {
                 action: dict(counts)
                 for action, counts in final_action_by_outcome.items()
+            },
+            "blocked_by_outcome": {
+                code: _finalise_hold_reason_row(row)
+                for code, row in blocked_by_outcome_aggregates.items()
             },
         },
         "consistency_checks": consistency_checks,
@@ -650,6 +696,9 @@ def aggregate_many(
     g_hold_reason_pool: dict[str, dict[str, Any]] = {}
     g_gate_by_tech: dict[str, dict[str, int]] = {}
     g_final_by_outcome: dict[str, dict[str, int]] = {}
+    # PR #10: Risk-Gate code → pooled accumulator. Same row schema as
+    # g_hold_reason_pool, so the same finaliser applies.
+    g_blocked_by_outcome_pool: dict[str, dict[str, Any]] = {}
 
     # Global metadata accumulators
     g_run_ids: list[str] = []                    # preserve order, dedup at end
@@ -750,6 +799,13 @@ def aggregate_many(
             target = g_final_by_outcome.setdefault(fa, {})
             _add_counters(target, counts)
 
+        # PR #10: blocked_by_outcome — same pooling shape as hold_reason_outcome.
+        for code, row in cs.get("blocked_by_outcome", {}).items():
+            pooled = g_blocked_by_outcome_pool.setdefault(
+                code, _new_pooled_hold_reason_row()
+            )
+            _pool_hold_reason_row(pooled, row)
+
     # All runs failed -> ValueError
     if not per_run:
         raise ValueError(
@@ -827,6 +883,10 @@ def aggregate_many(
             "final_action_by_outcome": {
                 action: dict(counts)
                 for action, counts in g_final_by_outcome.items()
+            },
+            "blocked_by_outcome": {
+                code: _finalise_pooled_hold_reason_row(row)
+                for code, row in g_blocked_by_outcome_pool.items()
             },
         },
     }

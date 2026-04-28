@@ -403,6 +403,7 @@ def test_cross_stats_top_level_key_present(tmp_path):
         "hold_reason_outcome",
         "gate_effect_by_technical_action",
         "final_action_by_outcome",
+        "blocked_by_outcome",
     }
 
 
@@ -1158,3 +1159,261 @@ def test_top_hold_reasons_global_is_derived_from_hold_reason_pool(tmp_path):
              for e in out["global"]["top_hold_reasons"]]
     assert pairs[0] == ("rY", 4)
     assert pairs[1] == ("rX", 2)
+
+
+# ─── PR #10: cross_stats.blocked_by_outcome ──────────────────────────────
+
+
+def test_blocked_by_outcome_top_level_key_present(tmp_path):
+    """`cross_stats.blocked_by_outcome` must always be present (possibly
+    with only a `no_block` row when no Risk Gate block fired)."""
+    p = _write_jsonl(tmp_path, [_build_synthetic_record()])
+    stats = aggregate_stats(p)
+    cs = stats["cross_stats"]
+    assert "blocked_by_outcome" in cs
+    assert isinstance(cs["blocked_by_outcome"], dict)
+
+
+def test_blocked_by_empty_buckets_into_no_block(tmp_path):
+    """A trace with `decision.blocked_by=[]` must contribute to the
+    synthetic key `no_block`, not to any code key."""
+    p = _write_jsonl(tmp_path, [
+        _build_synthetic_record(blocked_by=()),
+        _build_synthetic_record(blocked_by=(),
+                                timestamp="2025-01-01T01:00:00+00:00",
+                                bar_index=1),
+    ])
+    bbo = aggregate_stats(p)["cross_stats"]["blocked_by_outcome"]
+    assert "no_block" in bbo
+    assert bbo["no_block"]["n"] == 2
+    # No real-code keys.
+    assert all(k == "no_block" for k in bbo.keys())
+
+
+def test_blocked_by_event_high_buckets_into_event_high(tmp_path):
+    p = _write_jsonl(tmp_path, [
+        _build_synthetic_record(
+            blocked_by=("event_high",),
+            gate_effect="PROTECTED", outcome="LOSS_AVOIDED",
+        ),
+    ])
+    bbo = aggregate_stats(p)["cross_stats"]["blocked_by_outcome"]
+    assert "event_high" in bbo
+    assert bbo["event_high"]["n"] == 1
+    assert bbo["event_high"]["gate_effect"] == {"PROTECTED": 1}
+    assert bbo["event_high"]["outcome_if_technical_action_taken"] == {
+        "LOSS_AVOIDED": 1
+    }
+    # `no_block` row should NOT exist for this single trace.
+    assert "no_block" not in bbo
+
+
+def test_blocked_by_multiple_codes_contributes_to_each_key(tmp_path):
+    """One trace with two codes must contribute +1 to each code's row.
+    Each row's `n` reflects per-code counts (additive semantics), so
+    sum over rows can exceed n_traces — that's by design."""
+    p = _write_jsonl(tmp_path, [
+        _build_synthetic_record(
+            blocked_by=("event_high", "spread_abnormal"),
+            gate_effect="PROTECTED", outcome="LOSS_AVOIDED",
+            hypothetical_return_pct=-0.3,
+        ),
+    ])
+    bbo = aggregate_stats(p)["cross_stats"]["blocked_by_outcome"]
+    assert bbo["event_high"]["n"] == 1
+    assert bbo["spread_abnormal"]["n"] == 1
+    assert bbo["event_high"]["gate_effect"] == {"PROTECTED": 1}
+    assert bbo["spread_abnormal"]["gate_effect"] == {"PROTECTED": 1}
+    # return value flows into BOTH rows
+    assert bbo["event_high"]["return_stats"]["sum_pct"] == pytest.approx(-0.3)
+    assert bbo["spread_abnormal"]["return_stats"]["sum_pct"] == pytest.approx(
+        -0.3
+    )
+
+
+def test_blocked_by_outcome_gate_effect_buckets(tmp_path):
+    """Multiple gate_effect values for the same blocked_by code must
+    aggregate cleanly into PROTECTED / COST_OPPORTUNITY / NO_CHANGE."""
+    p = _write_jsonl(tmp_path, [
+        _build_synthetic_record(blocked_by=("event_high",),
+                                gate_effect="PROTECTED",
+                                outcome="LOSS_AVOIDED",
+                                bar_index=0),
+        _build_synthetic_record(blocked_by=("event_high",),
+                                gate_effect="COST_OPPORTUNITY",
+                                outcome="WIN_MISSED",
+                                timestamp="2025-01-01T01:00:00+00:00",
+                                bar_index=1),
+        _build_synthetic_record(blocked_by=("event_high",),
+                                gate_effect="NO_CHANGE",
+                                outcome="N/A",
+                                timestamp="2025-01-01T02:00:00+00:00",
+                                bar_index=2),
+    ])
+    row = aggregate_stats(p)["cross_stats"]["blocked_by_outcome"]["event_high"]
+    assert row["n"] == 3
+    assert row["gate_effect"] == {
+        "PROTECTED": 1, "COST_OPPORTUNITY": 1, "NO_CHANGE": 1,
+    }
+    assert row["outcome_if_technical_action_taken"] == {
+        "LOSS_AVOIDED": 1, "WIN_MISSED": 1, "N/A": 1,
+    }
+
+
+def test_blocked_by_outcome_technical_only_action_buckets(tmp_path):
+    p = _write_jsonl(tmp_path, [
+        _build_synthetic_record(blocked_by=("event_high",),
+                                technical_action="BUY", bar_index=0),
+        _build_synthetic_record(blocked_by=("event_high",),
+                                technical_action="SELL",
+                                timestamp="2025-01-01T01:00:00+00:00",
+                                bar_index=1),
+        _build_synthetic_record(blocked_by=("event_high",),
+                                technical_action="HOLD",
+                                timestamp="2025-01-01T02:00:00+00:00",
+                                bar_index=2),
+    ])
+    row = aggregate_stats(p)["cross_stats"]["blocked_by_outcome"]["event_high"]
+    assert row["technical_only_action"] == {
+        "BUY": 1, "SELL": 1, "HOLD": 1,
+    }
+
+
+def test_blocked_by_outcome_return_stats(tmp_path):
+    p = _write_jsonl(tmp_path, [
+        _build_synthetic_record(blocked_by=("event_high",),
+                                hypothetical_return_pct=v,
+                                timestamp=f"2025-01-01T{i:02d}:00:00+00:00",
+                                bar_index=i)
+        for i, v in enumerate([-0.5, 0.3, 0.1, -0.2, 0.4])
+    ])
+    rs = aggregate_stats(p)["cross_stats"]["blocked_by_outcome"][
+        "event_high"
+    ]["return_stats"]
+    assert rs["n_with_return"] == 5
+    assert rs["sum_pct"] == pytest.approx(0.1)
+    assert rs["avg_pct"] == pytest.approx(0.02)
+    assert rs["min_pct"] == pytest.approx(-0.5)
+    assert rs["max_pct"] == pytest.approx(0.4)
+
+
+def test_blocked_by_outcome_return_stats_null_when_no_returns(tmp_path):
+    p = _write_jsonl(tmp_path, [
+        _build_synthetic_record(blocked_by=("event_high",),
+                                hypothetical_return_pct=None,
+                                bar_index=i,
+                                timestamp=f"2025-01-01T{i:02d}:00:00+00:00")
+        for i in range(3)
+    ])
+    rs = aggregate_stats(p)["cross_stats"]["blocked_by_outcome"][
+        "event_high"
+    ]["return_stats"]
+    assert rs["n_with_return"] == 0
+    assert rs["avg_pct"] is None
+    assert rs["sum_pct"] is None
+    assert rs["min_pct"] is None
+    assert rs["max_pct"] is None
+
+
+def test_blocked_by_outcome_with_malformed_line_still_aggregates(tmp_path):
+    """A malformed line must NOT block valid lines from updating
+    blocked_by_outcome rows."""
+    p = tmp_path / "mixed.jsonl"
+    p.write_text(
+        json.dumps(_build_synthetic_record(
+            blocked_by=("event_high",),
+            gate_effect="PROTECTED",
+            outcome="LOSS_AVOIDED",
+            bar_index=0,
+        )) + "\n"
+        "{not json}\n"
+        + json.dumps(_build_synthetic_record(
+            blocked_by=("event_high",),
+            gate_effect="COST_OPPORTUNITY",
+            outcome="WIN_MISSED",
+            bar_index=2,
+            timestamp="2025-01-01T02:00:00+00:00",
+        )) + "\n",
+        encoding="utf-8",
+    )
+    stats = aggregate_stats(p)
+    assert stats["consistency_checks"]["errors_total"] >= 1
+    row = stats["cross_stats"]["blocked_by_outcome"]["event_high"]
+    assert row["n"] == 2
+    assert row["gate_effect"] == {"PROTECTED": 1, "COST_OPPORTUNITY": 1}
+
+
+def test_aggregate_many_pools_blocked_by_outcome(tmp_path):
+    """run1 + run2 with overlapping codes must collapse into one global
+    row each, with summed counters and pooled return_stats."""
+    p1 = _write_run_dir(tmp_path, "r1", records=[
+        _build_synthetic_record(
+            run_id="r1", blocked_by=("event_high",),
+            gate_effect="PROTECTED", outcome="LOSS_AVOIDED",
+            hypothetical_return_pct=-0.5,
+            timestamp="2025-01-01T00:00:00+00:00", bar_index=0,
+        ),
+        _build_synthetic_record(
+            run_id="r1", blocked_by=("event_high",),
+            gate_effect="COST_OPPORTUNITY", outcome="WIN_MISSED",
+            hypothetical_return_pct=0.3,
+            timestamp="2025-01-01T01:00:00+00:00", bar_index=1,
+        ),
+    ])
+    p2 = _write_run_dir(tmp_path, "r2", records=[
+        _build_synthetic_record(
+            run_id="r2", blocked_by=("event_high",),
+            gate_effect="PROTECTED", outcome="LOSS_AVOIDED",
+            hypothetical_return_pct=-0.2,
+            timestamp="2025-01-02T00:00:00+00:00", bar_index=0,
+        ),
+        _build_synthetic_record(
+            run_id="r2", blocked_by=("spread_abnormal",),
+            gate_effect="NO_CHANGE", outcome="N/A",
+            hypothetical_return_pct=None,
+            timestamp="2025-01-02T01:00:00+00:00", bar_index=1,
+        ),
+    ])
+    from src.fx.decision_trace_stats import aggregate_many
+    out = aggregate_many([p1, p2])
+    g_bbo = out["global"]["cross_stats"]["blocked_by_outcome"]
+    # event_high in r1 (n=2) + r2 (n=1)  =>  global n=3
+    assert g_bbo["event_high"]["n"] == 3
+    assert g_bbo["event_high"]["gate_effect"] == {
+        "PROTECTED": 2, "COST_OPPORTUNITY": 1
+    }
+    # spread_abnormal only in r2  =>  global n=1
+    assert g_bbo["spread_abnormal"]["n"] == 1
+    # return_stats pooling for event_high: -0.5 + 0.3 + (-0.2) = -0.4 / n=3
+    rs = g_bbo["event_high"]["return_stats"]
+    assert rs["n_with_return"] == 3
+    assert rs["sum_pct"] == pytest.approx(-0.4)
+    assert rs["avg_pct"] == pytest.approx(-0.4 / 3)
+    assert rs["min_pct"] == pytest.approx(-0.5)
+    assert rs["max_pct"] == pytest.approx(0.3)
+
+
+def test_existing_cross_stats_keys_unchanged_by_blocked_by_outcome(tmp_path):
+    """PR #10 must not perturb the three existing cross_stats sections."""
+    p = _write_jsonl(tmp_path, [_build_synthetic_record()])
+    cs = aggregate_stats(p)["cross_stats"]
+    assert {
+        "hold_reason_outcome",
+        "gate_effect_by_technical_action",
+        "final_action_by_outcome",
+        "blocked_by_outcome",        # new
+    } == set(cs.keys())
+
+
+def test_blocked_by_outcome_real_export_pipeline(tmp_path):
+    """End-to-end: run_engine_backtest → export_run → aggregate_stats →
+    cross_stats.blocked_by_outcome carries (at least) the no_block row."""
+    df = _ohlcv(200, seed=11)
+    res = run_engine_backtest(df, "X", interval="1h", warmup=60)
+    paths = export_run(res, out_dir=tmp_path / "real")
+    bbo = aggregate_stats(paths["decision_traces"])["cross_stats"][
+        "blocked_by_outcome"
+    ]
+    # Without seeded events, every bar's blocked_by is empty -> no_block.
+    assert "no_block" in bbo
+    assert bbo["no_block"]["n"] == len(res.decision_traces)
