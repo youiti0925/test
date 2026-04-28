@@ -209,14 +209,17 @@ def test_hold_path_writes_trace(cmd_trade_with_stub):
     )
 
 
-def test_directional_dry_run_records_dry_run_skip_reason(
+def test_directional_dry_run_records_advisory_status(
     cmd_trade_with_stub, monkeypatch
 ):
     """Force the engine to return BUY by stubbing decide_action; the
-    execution_trace must record entry_executed=False and the
-    entry_skipped_reason must be `dry_run` (not decision_was_HOLD)."""
+    execution_trace must record entry_executed=False, but the
+    entry_skipped_reason MUST stay within the closed taxonomy
+    (ENTRY_SKIPPED_REASONS) — `dry_run` is recorded in
+    decision.advisory.live_execution_status, NOT in entry_skipped_reason."""
     from src.fx import cli as cli_mod
     from src.fx.decision_engine import Decision
+    from src.fx.decision_trace import ENTRY_SKIPPED_REASONS
 
     def stub_buy(*, technical_signal, pattern, higher_timeframe_trend,
                  risk_reward, risk_state, llm_signal=None,
@@ -241,10 +244,16 @@ def test_directional_dry_run_records_dry_run_skip_reason(
     rec = json.loads((run_dir / "decision_traces.jsonl").read_text())
     assert rec["decision"]["final_action"] == "BUY"
     assert rec["execution_trace"]["entry_executed"] is False
-    assert rec["execution_trace"]["entry_skipped_reason"] == "dry_run"
-    # advisory dict carries the broker / dry-run hints we promised.
+    # entry_skipped_reason MUST stay within the closed taxonomy.
+    assert rec["execution_trace"]["entry_skipped_reason"] in ENTRY_SKIPPED_REASONS
+    # The engine path was clean (BUY decision); broker layer skipped due
+    # to dry-run, so the engine-level sentinel "entry_executed" applies.
+    assert rec["execution_trace"]["entry_skipped_reason"] == "entry_executed"
+    # Live-specific disposition lives in advisory.
+    assert rec["decision"]["advisory"]["live_execution_status"] == "dry_run"
     assert rec["decision"]["advisory"]["live_dry_run"] is True
     assert rec["decision"]["advisory"]["live_broker"] == "paper"
+    assert rec["decision"]["advisory"]["live_order_placed"] is False
 
 
 def test_directional_paper_broker_records_executed(
@@ -280,9 +289,11 @@ def test_directional_paper_broker_records_executed(
     assert rec["decision"]["final_action"] == "BUY"
     assert rec["execution_trace"]["entry_executed"] is True
     assert rec["execution_trace"]["entry_skipped_reason"] == "entry_executed"
-    # advisory carries broker label
+    # advisory carries broker label and the matching live_execution_status
     assert rec["decision"]["advisory"]["live_broker"] == "paper"
     assert rec["decision"]["advisory"]["live_dry_run"] is False
+    assert rec["decision"]["advisory"]["live_order_placed"] is True
+    assert rec["decision"]["advisory"]["live_execution_status"] == "entry_executed"
 
 
 # ─── trace-stats reads the live JSONL ──────────────────────────────────────
@@ -337,3 +348,175 @@ def test_existing_backtest_trace_export_unchanged(tmp_path):
     assert paths["run_metadata"].exists()
     assert paths["decision_traces"].exists()
     assert paths["summary"].exists()
+
+
+# ─── ENTRY_SKIPPED_REASONS taxonomy compliance ─────────────────────────────
+
+
+def test_all_live_trace_paths_use_closed_entry_skipped_reason_taxonomy(
+    cmd_trade_with_stub, monkeypatch
+):
+    """ALL live exit branches (HOLD / dry-run BUY / paper BUY actual) must
+    write `entry_skipped_reason` values that are members of the closed
+    taxonomy `ENTRY_SKIPPED_REASONS`. PR #12 review correction."""
+    from src.fx import cli as cli_mod
+    from src.fx.decision_engine import Decision
+    from src.fx.decision_trace import ENTRY_SKIPPED_REASONS
+
+    cmd, storage, cwd, cfg = cmd_trade_with_stub
+
+    def _read_skip_reason(run_subdir: Path) -> str:
+        rec = json.loads(
+            (run_subdir / "decision_traces.jsonl").read_text(encoding="utf-8")
+        )
+        return rec["execution_trace"]["entry_skipped_reason"]
+
+    # 1. HOLD path — engine returns HOLD on the seed=11 fixture
+    args = _build_trade_namespace(dry_run=False, trace_out_default=True)
+    cmd(args, cfg, storage)
+    run_subdir = next((cwd / "runs" / "live").iterdir())
+    hold_reason = _read_skip_reason(run_subdir)
+    assert hold_reason in ENTRY_SKIPPED_REASONS, (
+        f"HOLD path wrote {hold_reason!r}; not in ENTRY_SKIPPED_REASONS"
+    )
+
+    # Clear runs/live/ so the next path lands in a fresh subdir
+    import shutil
+    shutil.rmtree(cwd / "runs")
+
+    def stub_buy(*, technical_signal, pattern, higher_timeframe_trend,
+                 risk_reward, risk_state, llm_signal=None,
+                 waveform_bias=None, min_confidence=0.6, min_risk_reward=1.5):
+        return Decision(
+            action="BUY", confidence=0.9, reason="t",
+            blocked_by=(), rule_chain=("risk_gate",), advisory={},
+        )
+
+    monkeypatch.setattr(cli_mod, "decide_action", stub_buy)
+
+    # 2. dry-run BUY path
+    args = _build_trade_namespace(dry_run=True, trace_out_default=True)
+    cmd(args, cfg, storage)
+    run_subdir = next((cwd / "runs" / "live").iterdir())
+    dry_reason = _read_skip_reason(run_subdir)
+    assert dry_reason in ENTRY_SKIPPED_REASONS, (
+        f"dry-run BUY path wrote {dry_reason!r}; not in ENTRY_SKIPPED_REASONS"
+    )
+
+    shutil.rmtree(cwd / "runs")
+
+    # 3. live paper BUY path
+    args = _build_trade_namespace(dry_run=False, trace_out_default=True)
+    cmd(args, cfg, storage)
+    run_subdir = next((cwd / "runs" / "live").iterdir())
+    live_reason = _read_skip_reason(run_subdir)
+    assert live_reason in ENTRY_SKIPPED_REASONS, (
+        f"live paper BUY path wrote {live_reason!r}; "
+        f"not in ENTRY_SKIPPED_REASONS"
+    )
+
+
+def test_live_execution_status_distinguishes_dry_run_paper_hold(
+    cmd_trade_with_stub, monkeypatch
+):
+    """The closed `entry_skipped_reason` taxonomy cannot tell live cases
+    apart on its own — `decision.advisory.live_execution_status` must
+    carry the disposition (`hold` / `dry_run` / `entry_executed` /
+    `order_not_placed`)."""
+    from src.fx import cli as cli_mod
+    from src.fx.decision_engine import Decision
+
+    cmd, storage, cwd, cfg = cmd_trade_with_stub
+    import shutil
+
+    def _read_status(run_subdir: Path) -> str:
+        rec = json.loads(
+            (run_subdir / "decision_traces.jsonl").read_text(encoding="utf-8")
+        )
+        return rec["decision"]["advisory"]["live_execution_status"]
+
+    # HOLD case: status should be "hold"
+    cmd(_build_trade_namespace(dry_run=False, trace_out_default=True),
+        cfg, storage)
+    assert _read_status(next((cwd / "runs" / "live").iterdir())) == "hold"
+    shutil.rmtree(cwd / "runs")
+
+    # Force BUY for the next two cases.
+    def stub_buy(*, technical_signal, pattern, higher_timeframe_trend,
+                 risk_reward, risk_state, llm_signal=None,
+                 waveform_bias=None, min_confidence=0.6, min_risk_reward=1.5):
+        return Decision(
+            action="BUY", confidence=0.9, reason="t",
+            blocked_by=(), rule_chain=("risk_gate",), advisory={},
+        )
+
+    monkeypatch.setattr(cli_mod, "decide_action", stub_buy)
+
+    # dry-run BUY case: status should be "dry_run"
+    cmd(_build_trade_namespace(dry_run=True, trace_out_default=True),
+        cfg, storage)
+    assert _read_status(next((cwd / "runs" / "live").iterdir())) == "dry_run"
+    shutil.rmtree(cwd / "runs")
+
+    # live paper BUY: status should be "entry_executed"
+    cmd(_build_trade_namespace(dry_run=False, trace_out_default=True),
+        cfg, storage)
+    assert _read_status(next((cwd / "runs" / "live").iterdir())) == "entry_executed"
+
+
+# ─── Trace export failure surfacing ───────────────────────────────────────
+
+
+def test_trace_export_failure_returns_exit_2_when_existing_files(
+    cmd_trade_with_stub
+):
+    """When --trace-out points at a directory that already contains
+    decision_traces.jsonl and --overwrite is not set, the second run
+    must exit 2 and emit `trace_export_error` in the payload — silent
+    success on a requested-but-failed export is dangerous."""
+    cmd, storage, cwd, cfg = cmd_trade_with_stub
+    explicit = cwd / "explicit_dest"
+    captured = {}
+
+    from src.fx import cli as cli_mod
+
+    def capturing_print(payload):
+        captured.update(payload)
+
+    cli_mod._print = capturing_print  # capture _print payload
+
+    # First run: succeeds and creates files.
+    args1 = _build_trade_namespace(trace_out=str(explicit))
+    rc1 = cmd(args1, cfg, storage)
+    assert rc1 == 0
+    captured.clear()
+
+    # Second run with same --trace-out, no --overwrite: must fail.
+    args2 = _build_trade_namespace(trace_out=str(explicit))
+    rc2 = cmd(args2, cfg, storage)
+    assert rc2 == 2, (
+        f"second export with no --overwrite should exit 2; got {rc2}"
+    )
+    assert "trace_export_error" in captured, (
+        f"trace_export_error should be in the printed payload; "
+        f"keys={list(captured.keys())}"
+    )
+    assert "FileExistsError" in captured["trace_export_error"]
+
+
+def test_trace_export_failure_is_recoverable_with_overwrite(
+    cmd_trade_with_stub
+):
+    """When --overwrite is set, a second run to the same dir succeeds."""
+    cmd, storage, cwd, cfg = cmd_trade_with_stub
+    explicit = cwd / "explicit_dest"
+
+    args1 = _build_trade_namespace(trace_out=str(explicit))
+    assert cmd(args1, cfg, storage) == 0
+
+    args2 = _build_trade_namespace(
+        trace_out=str(explicit),
+        overwrite=True,
+    )
+    assert cmd(args2, cfg, storage) == 0
+    assert (explicit / "decision_traces.jsonl").exists()

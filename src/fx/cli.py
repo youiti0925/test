@@ -431,11 +431,15 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
 
     # Live trace plumbing — single helper that the three exit branches
     # (HOLD / dry-run / live order) all call so every cmd_trade invocation
-    # produces exactly one BarDecisionTrace.
+    # produces exactly one BarDecisionTrace. When --trace-out / --trace-out-default
+    # is given but export fails, we surface the error to the caller via
+    # `trace_export_error` and the exit branches return code 2 — silent
+    # success on a requested-but-failed export would be dangerous.
     trace_export_paths: dict[str, str] | None = None
+    trace_export_error: str | None = None
 
     def _emit_live_trace(*, order_placed: bool, fill_obj: object | None) -> None:
-        nonlocal trace_export_paths
+        nonlocal trace_export_paths, trace_export_error
         out_dir = _resolve_live_trace_out_dir(args, ctx)
         if out_dir is None:
             return
@@ -450,8 +454,12 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
                 out_dir=out_dir,
                 overwrite=bool(getattr(args, "overwrite", False)),
             )
-        except (FileExistsError, ValueError) as exc:
-            print(f"[error] live trace export failed: {exc}", file=sys.stderr)
+        except (FileExistsError, ValueError, OSError) as exc:
+            trace_export_error = f"{type(exc).__name__}: {exc}"
+            print(
+                f"[error] live trace export failed: {trace_export_error}",
+                file=sys.stderr,
+            )
 
     if decision.action == "HOLD":
         _emit_live_trace(order_placed=False, fill_obj=None)
@@ -467,8 +475,10 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
         }
         if trace_export_paths:
             payload_hold["trace_export"] = trace_export_paths
+        if trace_export_error:
+            payload_hold["trace_export_error"] = trace_export_error
         _print(payload_hold)
-        return 0
+        return 2 if trace_export_error else 0
 
     if atr_value <= 0:
         print("[warn] ATR is non-positive; cannot size trade.", file=sys.stderr)
@@ -514,8 +524,10 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
         }
         if trace_export_paths:
             payload_dry["trace_export"] = trace_export_paths
+        if trace_export_error:
+            payload_dry["trace_export_error"] = trace_export_error
         _print(payload_dry)
-        return 0
+        return 2 if trace_export_error else 0
 
     pos = broker.place_order(
         symbol=args.symbol,
@@ -570,8 +582,10 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
     }
     if trace_export_paths:
         payload_live["trace_export"] = trace_export_paths
+    if trace_export_error:
+        payload_live["trace_export_error"] = trace_export_error
     _print(payload_live)
-    return 0
+    return 2 if trace_export_error else 0
 
 
 def _resolve_live_trace_out_dir(args, ctx) -> "Path | None":
@@ -585,7 +599,7 @@ def _resolve_live_trace_out_dir(args, ctx) -> "Path | None":
         return Path(args.trace_out)
     if getattr(args, "trace_out_default", False):
         from .decision_trace_build import build_run_id
-        if not getattr(ctx, "_live_run_id", None):
+        if "_live_run_id" not in ctx:
             ctx["_live_run_id"] = build_run_id(args.symbol)
         return Path("runs") / "live" / ctx["_live_run_id"]
     return None
@@ -623,7 +637,6 @@ def _write_live_trace(
     higher_tf = ctx["higher_tf"]
     decision = ctx["decision"]
     atr_value = ctx["atr"]
-    risk_state = decision.advisory if False else None  # see below
 
     # Re-derive the same RiskState the engine saw — _gather_inputs builds
     # it inline and discards it; re-build with the same inputs to feed

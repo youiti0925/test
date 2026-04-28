@@ -1304,28 +1304,41 @@ def build_live_decision_trace(
     # and decision.advisory; we don't bend execution_assumption fields.
     exec_assumption = execution_assumption_slice()
 
-    # Slice 7: execution_trace — live-specific bookkeeping. We keep
-    # entry_executed=False for HOLD and dry-run; True only when an order
-    # actually went out. Position bookkeeping (bars_held / trade_id) is
-    # owned by the broker / storage layer, not this trace; we just record
-    # the broker_order_id when available so the join is doable later.
+    # Slice 7: execution_trace — live-specific bookkeeping. The five
+    # values in `decision_trace.ENTRY_SKIPPED_REASONS` are a CLOSED
+    # taxonomy from the backtest world, so live cases must map to one of
+    # them. We pick the closest taxonomy value and keep the live-specific
+    # disposition (dry_run / order_not_placed / entry_executed / hold)
+    # in `decision.advisory.live_execution_status` so callers can split
+    # those cases without adding to the schema. Test pin:
+    # tests/test_decision_trace.py::test_entry_skipped_reason_in_fixed_candidates
+    # would fail if a live trace ever wrote a non-taxonomy value here.
     entry_executed = bool(order_placed)
     if decision.action == "HOLD":
+        # Engine decided HOLD — straightforward map to the existing value.
         skipped_reason = "decision_was_HOLD"
-        entry_price = None
-        trade_id = None
-    elif dry_run:
-        skipped_reason = "dry_run"
-        entry_price = None
-        trade_id = None
-    elif not order_placed:
-        skipped_reason = "order_not_placed"
+        live_execution_status = "hold"
         entry_price = None
         trade_id = None
     else:
+        # Engine decided BUY/SELL — the engine path was clean; whether
+        # the broker actually filled is a wrapper-layer concern. We use
+        # the "entry_executed" sentinel ("no engine-level skip occurred")
+        # for all of: real fill, dry-run, broker-no-fill. The discriminator
+        # lives in advisory below.
         skipped_reason = "entry_executed"
-        entry_price = float(getattr(fill, "actual_fill_price", None) or 0.0) or None
-        trade_id = getattr(fill, "broker_order_id", None) or None
+        if dry_run:
+            live_execution_status = "dry_run"
+            entry_price = None
+            trade_id = None
+        elif not order_placed:
+            live_execution_status = "order_not_placed"
+            entry_price = None
+            trade_id = None
+        else:
+            live_execution_status = "entry_executed"
+            entry_price = float(getattr(fill, "actual_fill_price", None) or 0.0) or None
+            trade_id = getattr(fill, "broker_order_id", None) or None
 
     exec_trace = ExecutionTraceSlice(
         position_before=None,
@@ -1345,13 +1358,15 @@ def build_live_decision_trace(
         bars_held_after=None,
     )
 
-    # Decoration on decision.advisory: stamp broker label + dry-run flag
-    # WITHOUT mutating the original decision (frozen dataclass). We build
-    # a new DecisionSlice with an enriched advisory dict.
+    # Decoration on decision.advisory: stamp broker label + live execution
+    # status WITHOUT mutating the original decision (frozen dataclass).
+    # `live_execution_status` carries the live-specific disposition that
+    # cannot be expressed via the closed `entry_skipped_reason` taxonomy.
     enriched_advisory = dict(decision.advisory)
     enriched_advisory.setdefault("live_broker", broker_label)
     enriched_advisory.setdefault("live_dry_run", dry_run)
     enriched_advisory.setdefault("live_order_placed", entry_executed)
+    enriched_advisory.setdefault("live_execution_status", live_execution_status)
 
     decision_s = DecisionSlice(
         technical_only_action=technical_action,
