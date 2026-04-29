@@ -493,11 +493,16 @@ def aggregate_stats(
     waveform_bias_by_technical_action_outcome: dict[str, dict[str, Any]] = {}
     symbol_waveform_bias_outcome: dict[str, dict[str, Any]] = {}
     # PR #16 — top-level distribution of normalised unavailable_reason.
-    # `none` counts bars whose lookup ran cleanly (bias.action populated)
-    # AND bars whose trace pre-dates PR #15 (waveform_bias absent). This
-    # lets a multi-symbol report at a glance separate "library is healthy"
-    # from "library is being rejected for reason X" without splitting on
-    # the variable portion of each reason ("only 51 bars" vs "only 52 bars").
+    # Bucket policy (see `_classify_waveform_unavailable`):
+    #   - `none` counts bars where waveform_bias is a dict with NO
+    #     unavailable_reason set — i.e. the lookup ran cleanly.
+    #   - `no_library_attached` counts bars where waveform_bias is
+    #     absent entirely (library was not passed to the engine, OR
+    #     the trace pre-dates PR #15 and lacks the bias dict).
+    # This lets a multi-symbol report at a glance separate "library is
+    # healthy" from "library is being rejected for reason X" without
+    # splitting on the variable portion of each reason ("only 51 bars"
+    # vs "only 52 bars").
     waveform_unavailable_reason_dist: dict[str, int] = (
         _empty_unavailable_reason_distribution()
     )
