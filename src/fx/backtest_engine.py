@@ -317,6 +317,64 @@ def _compute_waveform_bias_for_bar(
     )
 
 
+def _build_waveform_metadata(
+    *,
+    library: list[WaveformSample] | None,
+    library_id: str | None,
+    window_bars: int,
+    horizon_bars: int,
+    min_samples: int,
+    min_score: float,
+    min_share: float,
+    method: str,
+) -> dict:
+    """Readable waveform-match config for run_metadata.json (PR #16).
+
+    The same payload is fed into `compute_strategy_config_hash` so the hash
+    still distinguishes runs with different libraries, but the readable
+    copy here lets a future audit answer "which library / horizon / method
+    produced this run?" without cracking open decision_traces.jsonl.
+    Always emitted (waveform_enabled may be False) — a missing field would
+    be ambiguous between "unset" and "explicitly disabled".
+    """
+    schema: str | None = None
+    basename: str | None = None
+    first_end_ts: str | None = None
+    last_end_ts: str | None = None
+
+    if library is not None and library_id is not None:
+        # library_id format (PR-#15):
+        #   "{basename}|schema={v1|v2|empty}|n=N|{first_end_ts}|{last_end_ts}|{sha8}"
+        # Pre-PR-#15 callers may pass a non-conforming string — keep parsing
+        # forgiving so we never crash run_metadata generation.
+        parts = library_id.split("|")
+        if len(parts) >= 1:
+            basename = parts[0]
+        for p in parts[1:]:
+            if p.startswith("schema="):
+                schema = p[len("schema="):]
+                break
+        if len(parts) >= 5:
+            first_end_ts = parts[3] or None
+            last_end_ts = parts[4] or None
+
+    return {
+        "waveform_enabled": library is not None,
+        "waveform_library_id": library_id,
+        "waveform_library_size": len(library) if library is not None else 0,
+        "waveform_library_schema": schema,
+        "waveform_library_path_basename": basename,
+        "waveform_library_first_end_ts": first_end_ts,
+        "waveform_library_last_end_ts": last_end_ts,
+        "waveform_window_bars": window_bars,
+        "waveform_horizon_bars": horizon_bars,
+        "waveform_min_samples": min_samples,
+        "waveform_min_score": min_score,
+        "waveform_min_share": min_share,
+        "waveform_method": method,
+    }
+
+
 def run_engine_backtest(
     df: pd.DataFrame,
     symbol: str,
@@ -409,6 +467,21 @@ def run_engine_backtest(
     trade_counter = 0
     if capture_traces:
         run_id = _build_run_id(symbol)
+        # PR #16: derive readable waveform metadata once, then reuse for both
+        # the strategy_config_hash payload and RunMetadata.waveform. The hash
+        # alone cannot tell a future audit which library / horizon / method
+        # produced these traces; without the readable copy you have to crack
+        # open decision_traces.jsonl just to find the library_id.
+        waveform_meta = _build_waveform_metadata(
+            library=waveform_library,
+            library_id=waveform_library_id,
+            window_bars=waveform_window_bars,
+            horizon_bars=waveform_horizon_bars,
+            min_samples=waveform_min_samples,
+            min_score=waveform_min_score,
+            min_share=waveform_min_share,
+            method=waveform_method,
+        )
         config_payload = {
             "interval": interval,
             "initial_cash": initial_cash,
@@ -425,17 +498,7 @@ def run_engine_backtest(
             ),
             # PR #15 — waveform-match config. Saved here so a trace can be
             # re-derived from the same library + params later.
-            "waveform_enabled": waveform_library is not None,
-            "waveform_library_id": waveform_library_id,
-            "waveform_library_size": (
-                len(waveform_library) if waveform_library is not None else 0
-            ),
-            "waveform_window_bars": waveform_window_bars,
-            "waveform_horizon_bars": waveform_horizon_bars,
-            "waveform_min_samples": waveform_min_samples,
-            "waveform_min_score": waveform_min_score,
-            "waveform_min_share": waveform_min_share,
-            "waveform_method": waveform_method,
+            **waveform_meta,
         }
         sha, sha_status = get_commit_sha()
         run_metadata = RunMetadata(
@@ -457,6 +520,7 @@ def run_engine_backtest(
             execution_mode="synthetic_backtest",
             engine_version="backtest_engine.run_engine_backtest",
             timezone_name="UTC",
+            waveform=dict(waveform_meta),
         )
         result.run_metadata = run_metadata
     else:

@@ -1463,3 +1463,234 @@ def test_blocked_by_outcome_real_export_pipeline(tmp_path):
     # Without seeded events, every bar's blocked_by is empty -> no_block.
     assert "no_block" in bbo
     assert bbo["no_block"]["n"] == len(res.decision_traces)
+
+
+# ─── PR #16: waveform_unavailable_reason_distribution ──────────────────────
+
+
+_PR16_DIST_BUCKETS = {
+    "none",
+    "no_library_attached",
+    "warmup_insufficient_bars",
+    "legacy_library_missing_forward_return_end_ts",
+    "eligible_0",
+    "unknown_interval",
+    "compute_signature_failed",
+    "other",
+}
+
+
+def _build_record_with_waveform_bias(
+    *, bias: dict | None, timestamp: str, bar_index: int = 0,
+) -> dict:
+    """Helper: a synthetic trace record carrying an arbitrary
+    waveform.waveform_bias payload so we can drive the normaliser
+    deterministically — the engine path is exercised separately."""
+    rec = _build_synthetic_record(timestamp=timestamp, bar_index=bar_index)
+    rec["waveform"] = {"waveform_bias": bias}
+    return rec
+
+
+def test_waveform_unavailable_reason_distribution_normalises_warmup_strings(
+    tmp_path,
+):
+    """PR #16: "only 51 bars available", "only 52 bars available", ...
+    must collapse into a single ``warmup_insufficient_bars`` bucket so
+    the warmup tail of every backtest doesn't fragment the
+    distribution into N singleton entries."""
+    recs = []
+    for i in range(9):
+        recs.append(_build_record_with_waveform_bias(
+            bias={
+                "library_id": "lib|schema=v2|n=10|...|...|deadbeef",
+                "horizon_bars": 24,
+                "match_method": "dtw",
+                "window_bars": 60,
+                "unavailable_reason": (
+                    f"only {51 + i} bars available, need ≥60 "
+                    "for waveform window"
+                ),
+            },
+            timestamp=f"2025-01-01T{i:02d}:00:00+00:00",
+            bar_index=i,
+        ))
+    # Plus one healthy populated bar to verify "none" still works.
+    recs.append(_build_record_with_waveform_bias(
+        bias={"library_id": "lib", "action": "BUY", "confidence": 0.5},
+        timestamp="2025-01-01T09:00:00+00:00",
+        bar_index=9,
+    ))
+
+    p = _write_jsonl(tmp_path, recs)
+    stats = aggregate_stats(p)
+
+    dist = stats["waveform_unavailable_reason_distribution"]
+    # Shape: every canonical bucket pre-seeded, no foreign keys.
+    assert set(dist.keys()) == _PR16_DIST_BUCKETS
+    # All 9 "only NN bars available" rows folded into one bucket.
+    assert dist["warmup_insufficient_bars"] == 9
+    # Healthy bar bucketed as "none".
+    assert dist["none"] == 1
+    # No-other-bucket leakage.
+    for k in _PR16_DIST_BUCKETS - {"warmup_insufficient_bars", "none"}:
+        assert dist[k] == 0
+
+
+def test_waveform_unavailable_reason_distribution_normalises_legacy_library(
+    tmp_path,
+):
+    """PR #16: legacy (pre-PR-#15) library bars expose the long
+    "library lacks forward_return_end_ts ..." reason. These must
+    collapse to ``legacy_library_missing_forward_return_end_ts`` so a
+    multi-symbol report flags the rebuild need clearly."""
+    recs = [
+        _build_record_with_waveform_bias(
+            bias={
+                "library_id": "old_lib|schema=v1|n=100|...|...|deadbeef",
+                "horizon_bars": h,
+                "match_method": "dtw",
+                "window_bars": 60,
+                "unavailable_reason": (
+                    f"library lacks forward_return_end_ts for horizon {h}; "
+                    "rebuild library with PR #15+ (pre-PR-#15 libraries "
+                    "cannot be filtered safely against FX weekend gaps)"
+                ),
+                "library_size": 100,
+                "eligible_size": 0,
+            },
+            timestamp=f"2025-01-01T{i:02d}:00:00+00:00",
+            bar_index=i,
+        )
+        for i, h in enumerate([24, 24, 12])  # different horizons → still 1 bucket
+    ]
+    p = _write_jsonl(tmp_path, recs)
+
+    dist = aggregate_stats(p)["waveform_unavailable_reason_distribution"]
+    assert dist["legacy_library_missing_forward_return_end_ts"] == 3
+    for k in _PR16_DIST_BUCKETS - {
+        "legacy_library_missing_forward_return_end_ts",
+    }:
+        assert dist[k] == 0
+
+
+def test_waveform_unavailable_reason_distribution_legacy_traces_dont_break_stats(
+    tmp_path,
+):
+    """PR #16: a trace JSONL without ``waveform.waveform_bias`` — i.e.
+    pre-PR-#15 export OR a backtest run with no library attached —
+    must aggregate cleanly. All bars bucket as ``no_library_attached``;
+    no exception, no dropped records, no unrelated cross_stats damage.
+    """
+    # Plain synthetic records — _build_synthetic_record does NOT add a
+    # waveform section, so this mirrors a legacy trace.
+    recs = [
+        _build_synthetic_record(
+            timestamp=f"2025-01-01T{i:02d}:00:00+00:00", bar_index=i,
+        )
+        for i in range(5)
+    ]
+    p = _write_jsonl(tmp_path, recs)
+    stats = aggregate_stats(p)
+
+    dist = stats["waveform_unavailable_reason_distribution"]
+    assert set(dist.keys()) == _PR16_DIST_BUCKETS
+    assert dist["no_library_attached"] == 5
+    assert sum(dist.values()) == 5
+    # Cross-stats keys still populated; no collateral damage.
+    cs = stats["cross_stats"]
+    assert "waveform_bias_direction_outcome" in cs
+    assert "blocked_by_outcome" in cs
+
+
+def test_aggregate_many_pools_waveform_unavailable_reason_distribution(
+    tmp_path,
+):
+    """PR #16: multi-run pool sums the per-run buckets. A mix of legacy
+    library, healthy lookup, and warmup bars across two runs must end
+    up correctly summed in the ``global`` section."""
+    from src.fx.decision_trace_stats import aggregate_many
+
+    # Run 1: 2 healthy + 1 warmup
+    r1_recs = [
+        _build_record_with_waveform_bias(
+            bias={"library_id": "L", "action": "BUY", "confidence": 0.5},
+            timestamp="2025-01-01T00:00:00+00:00", bar_index=0,
+        ),
+        _build_record_with_waveform_bias(
+            bias={"library_id": "L", "action": "SELL", "confidence": 0.5},
+            timestamp="2025-01-01T01:00:00+00:00", bar_index=1,
+        ),
+        _build_record_with_waveform_bias(
+            bias={"library_id": "L", "horizon_bars": 24,
+                  "unavailable_reason":
+                      "only 55 bars available, need ≥60 for waveform window"},
+            timestamp="2025-01-01T02:00:00+00:00", bar_index=2,
+        ),
+    ]
+    for r in r1_recs:
+        r["run_id"] = "r1"
+    # Run 2: 3 legacy library bars
+    r2_recs = [
+        _build_record_with_waveform_bias(
+            bias={"library_id": "old", "horizon_bars": 24,
+                  "unavailable_reason":
+                      "library lacks forward_return_end_ts for horizon 24; "
+                      "rebuild library with PR #15+"},
+            timestamp=f"2025-01-02T{i:02d}:00:00+00:00", bar_index=i,
+        )
+        for i in range(3)
+    ]
+    for r in r2_recs:
+        r["run_id"] = "r2"
+
+    p1 = _write_run_dir(tmp_path, "r1", records=r1_recs)
+    p2 = _write_run_dir(tmp_path, "r2", records=r2_recs)
+    out = aggregate_many([p1, p2])
+
+    dist = out["global"]["waveform_unavailable_reason_distribution"]
+    assert set(dist.keys()) == _PR16_DIST_BUCKETS
+    # 2 healthy + 0 + 1 warmup + 3 legacy
+    assert dist["none"] == 2
+    assert dist["warmup_insufficient_bars"] == 1
+    assert dist["legacy_library_missing_forward_return_end_ts"] == 3
+    assert dist["no_library_attached"] == 0
+    # Sum equals total bars across both runs.
+    assert sum(dist.values()) == 6
+
+
+def test_waveform_unavailable_reason_normalize_helper_unit():
+    """PR #16: direct unit coverage of the normaliser so future reason
+    template tweaks fail the test rather than silently re-bucket as
+    ``other``. Each canonical bucket must round-trip from at least one
+    representative reason string."""
+    from src.fx.decision_trace_stats import (
+        WAVEFORM_UNAVAILABLE_REASON_BUCKETS,
+        _normalize_unavailable_reason,
+    )
+    cases = {
+        "no library attached": "no_library_attached",
+        "only 50 bars available, need ≥60 for waveform window":
+            "warmup_insufficient_bars",
+        "only 59 bars available": "warmup_insufficient_bars",
+        ("library lacks forward_return_end_ts for horizon 24; rebuild "
+         "library with PR #15+"): "legacy_library_missing_forward_return_end_ts",
+        ("no library samples whose label was realised by 2026-01-30 "
+         "00:00:00+00:00; library has 100 samples but none satisfy "
+         "forward_return_end_ts[24] <= bar_ts"): "eligible_0",
+        "unknown interval '3h'; disabling lookup as a safe-side default":
+            "unknown_interval",
+        "compute_signature failed: ZeroDivisionError": "compute_signature_failed",
+        "totally unrecognised reason that nobody emits": "other",
+        None: "none",
+        "": "none",
+        "   ": "none",
+    }
+    for inp, expected in cases.items():
+        assert _normalize_unavailable_reason(inp) == expected, (
+            f"input={inp!r} expected={expected} "
+            f"got={_normalize_unavailable_reason(inp)}"
+        )
+    # Every canonical bucket is reachable through this set.
+    reached = {_normalize_unavailable_reason(k) for k in cases}
+    # "none" via the None / empty cases; all 8 buckets reached.
+    assert reached == set(WAVEFORM_UNAVAILABLE_REASON_BUCKETS)
