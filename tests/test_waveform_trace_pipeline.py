@@ -33,7 +33,9 @@ from src.fx.decision_trace_build import (
     waveform_bias_dict,
 )
 from src.fx.decision_trace_stats import aggregate_stats, aggregate_many
-from src.fx.waveform_library import WaveformSample, build_library, write_library
+from src.fx.waveform_library import (
+    WaveformSample, build_library, read_library, write_library,
+)
 from src.fx.waveform_matcher import WaveformSignature, compute_signature
 
 
@@ -89,8 +91,18 @@ def test_horizon_duration_unknown_interval_returns_none():
 # ---------------------------------------------------------------------------
 
 
-def _mk_sample(end_ts: pd.Timestamp, *, return_pct: float = 1.0) -> WaveformSample:
-    """Minimal WaveformSample with a synthetic signature."""
+def _mk_sample(
+    end_ts: pd.Timestamp,
+    *,
+    return_pct: float = 1.0,
+    label_ts: pd.Timestamp | None = None,
+    horizon_bars: int = 24,
+) -> WaveformSample:
+    """Minimal v2 WaveformSample (PR #15+). When `label_ts` is omitted
+    we populate `forward_return_end_ts` from `end_ts + horizon_bars*1h`
+    (no weekend gap), but tests can pass a custom `label_ts` to
+    exercise the FX gap path. Pass `label_ts=False` to omit the field
+    entirely, simulating a legacy v1 library."""
     sig = WaveformSignature(
         vector=np.array([0.0, 1.0, 0.0]),
         structure=["HH", "HL", "LH"],
@@ -102,65 +114,102 @@ def _mk_sample(end_ts: pd.Timestamp, *, return_pct: float = 1.0) -> WaveformSamp
         atr=None,
     )
     end_dt = end_ts.to_pydatetime() if isinstance(end_ts, pd.Timestamp) else end_ts
+    if label_ts is False:
+        forward_end_ts: dict[int, datetime | None] = {}
+    else:
+        target = label_ts if label_ts is not None else (
+            end_dt + timedelta(hours=horizon_bars)
+        )
+        target_dt = (
+            target.to_pydatetime() if isinstance(target, pd.Timestamp) else target
+        )
+        forward_end_ts = {horizon_bars: target_dt}
     return WaveformSample(
         symbol="X", timeframe="1h",
         start_ts=end_dt - timedelta(hours=60),
         end_ts=end_dt,
         signature=sig,
-        forward_returns_pct={24: return_pct},
+        forward_returns_pct={horizon_bars: return_pct},
         max_favorable_pct=1.5, max_adverse_pct=-0.5,
+        forward_return_end_ts=forward_end_ts,
     )
 
 
 def test_filter_excludes_sample_with_unrealised_horizon():
-    """sample.end_ts < bar_ts BUT sample.end_ts + horizon > bar_ts must
-    be excluded — the label was not yet known at bar_ts."""
+    """sample.forward_return_end_ts[24] > bar_ts must be excluded —
+    the label was not yet known at bar_ts."""
     bar_ts = pd.Timestamp("2025-01-15 10:00", tz="UTC")
-    horizon_dur = pd.Timedelta(hours=24)
-
-    # end_ts = bar_ts − 12h (younger than 1 day) → end_ts + 24h = bar_ts + 12h (future).
+    # end_ts = bar_ts − 12h, label_ts = bar_ts + 12h (future).
     s_unrealised = _mk_sample(bar_ts - pd.Timedelta(hours=12))
-    out = _filter_library_no_lookahead([s_unrealised], bar_ts, horizon_dur)
+    out = _filter_library_no_lookahead([s_unrealised], bar_ts, 24)
     assert out == [], (
-        "sample whose horizon has not completed by bar_ts must be excluded"
+        "sample whose label_ts > bar_ts must be excluded"
     )
 
 
 def test_filter_includes_sample_with_horizon_completed_exactly_at_bar_ts():
-    """end_ts + horizon == bar_ts: label is realised AT bar_ts → eligible."""
+    """label_ts == bar_ts: label is realised AT bar_ts → eligible."""
     bar_ts = pd.Timestamp("2025-01-15 10:00", tz="UTC")
-    horizon_dur = pd.Timedelta(hours=24)
     s_boundary = _mk_sample(bar_ts - pd.Timedelta(hours=24))
-    out = _filter_library_no_lookahead([s_boundary], bar_ts, horizon_dur)
+    out = _filter_library_no_lookahead([s_boundary], bar_ts, 24)
     assert out == [s_boundary]
 
 
 def test_filter_includes_sample_with_horizon_completed_earlier():
     bar_ts = pd.Timestamp("2025-01-15 10:00", tz="UTC")
-    horizon_dur = pd.Timedelta(hours=24)
     s_old = _mk_sample(bar_ts - pd.Timedelta(days=10))
-    out = _filter_library_no_lookahead([s_old], bar_ts, horizon_dur)
+    out = _filter_library_no_lookahead([s_old], bar_ts, 24)
     assert out == [s_old]
 
 
 def test_filter_handles_tz_naive_sample_ts():
     bar_ts = pd.Timestamp("2025-01-15 10:00", tz="UTC")
-    horizon_dur = pd.Timedelta(hours=24)
-    naive = pd.Timestamp("2025-01-13 10:00")  # tz-naive, two days before bar_ts
-    sig = WaveformSignature(
-        vector=np.array([0.0, 1.0]), structure=[], swing_structure=[],
-        trend_state="UPTREND", detected_pattern=None, length=2,
-        method="z_score", atr=None,
-    )
-    s = WaveformSample(
-        symbol="X", timeframe="1h",
-        start_ts=naive.to_pydatetime() - timedelta(hours=60),
-        end_ts=naive.to_pydatetime(),
-        signature=sig, forward_returns_pct={24: 0.5},
-        max_favorable_pct=None, max_adverse_pct=None,
-    )
-    out = _filter_library_no_lookahead([s], bar_ts, horizon_dur)
+    naive = pd.Timestamp("2025-01-13 10:00")  # tz-naive, two days before
+    s = _mk_sample(naive, label_ts=naive + pd.Timedelta(hours=24))
+    out = _filter_library_no_lookahead([s], bar_ts, 24)
     assert out == [s]
+
+
+def test_filter_excludes_legacy_sample_without_forward_return_end_ts():
+    """Pre-PR-#15 library samples (no forward_return_end_ts) must be
+    excluded — we cannot prove their label was realised by bar_ts."""
+    bar_ts = pd.Timestamp("2025-01-15 10:00", tz="UTC")
+    s_legacy = _mk_sample(bar_ts - pd.Timedelta(days=30), label_ts=False)
+    out = _filter_library_no_lookahead([s_legacy], bar_ts, 24)
+    assert out == [], (
+        "v1 library sample (missing forward_return_end_ts) must NOT be "
+        "treated as eligible — safe-side default"
+    )
+
+
+def test_filter_excludes_friday_sample_when_horizon_extends_past_weekend():
+    """The point of the fix: end_ts=Fri 23:00 + 24 *bars* lands on
+    Monday-or-later (weekends have no FX bars), but end_ts + 24*1h lands
+    on Saturday 23:00. A naive wall-clock filter at bar_ts=Sun 00:00
+    would let this sample through; the v2 filter correctly excludes it
+    because the actual label_ts (recorded by build_library from
+    idx[target]) is past bar_ts."""
+    bar_ts = pd.Timestamp("2025-01-19 00:00", tz="UTC")  # Sunday
+    fri = pd.Timestamp("2025-01-17 23:00", tz="UTC")
+    # Realistic: 24 hourly bars after Friday 23:00, skipping the
+    # weekend, would land Monday around 22:00. The exact moment doesn't
+    # matter for the test — only that label_ts is past bar_ts.
+    label_ts = pd.Timestamp("2025-01-20 22:00", tz="UTC")  # Monday
+    s = _mk_sample(fri, label_ts=label_ts)
+
+    # Sanity: the naive wall-clock check `end_ts + 24h <= bar_ts` would
+    # have INCLUDED this sample (Sat 23:00 ≤ Sun 00:00). The v2 filter
+    # excludes it because the recorded label_ts is past bar_ts.
+    naive_wallclock_ok = (fri + pd.Timedelta(hours=24)) <= bar_ts
+    assert naive_wallclock_ok, (
+        "sanity: the OLD filter would have let this sample through — "
+        "this is exactly the FX weekend hole the v2 filter closes"
+    )
+    out = _filter_library_no_lookahead([s], bar_ts, 24)
+    assert out == [], (
+        "v2 filter must exclude Friday-end sample whose 24-bar label "
+        "lands past the weekend"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +495,125 @@ def test_aggregate_stats_with_waveform_bias_present(tmp_path):
     assert "strong>=0.75" in cs["top_similarity_bucket_outcome"]
     # matched_count 25 → "10-29"
     assert "10-29" in cs["matched_count_bucket_outcome"]
+
+
+# ---------------------------------------------------------------------------
+# v2 library schema: forward_return_end_ts JSONL roundtrip + id marker
+# ---------------------------------------------------------------------------
+
+
+def test_build_library_populates_forward_return_end_ts_per_horizon():
+    """Every sample emitted by build_library carries label timestamps
+    drawn from the source df's index (NOT from end_ts + h*bar_interval)."""
+    df = _ohlcv(24 * 30, start="2024-06-01")
+    lib = build_library(
+        df, symbol="X", timeframe="1h",
+        window_bars=60, step_bars=8, forward_horizons=(4, 24),
+    )
+    assert lib, "expected build_library to emit samples"
+    for s in lib:
+        # Each requested horizon must appear (value may be None when the
+        # sample is too close to df's right edge).
+        assert 4 in s.forward_return_end_ts
+        assert 24 in s.forward_return_end_ts
+        # When the label is non-None, the recorded ts must equal idx[target].
+        if s.forward_returns_pct.get(24) is not None:
+            assert s.forward_return_end_ts[24] is not None
+
+
+def test_waveform_sample_jsonl_roundtrip_v2_keeps_forward_return_end_ts(tmp_path):
+    """write_library → read_library must preserve forward_return_end_ts."""
+    df = _ohlcv(24 * 30, start="2024-06-01")
+    lib = build_library(
+        df, symbol="X", timeframe="1h",
+        window_bars=60, step_bars=20, forward_horizons=(24,),
+    )
+    p = tmp_path / "lib.jsonl"
+    write_library(p, lib)
+    from src.fx.waveform_library import read_library
+    lib_back = read_library(p)
+    assert lib_back, "expected non-empty roundtrip"
+    for orig, back in zip(lib, lib_back):
+        assert orig.forward_return_end_ts.keys() == back.forward_return_end_ts.keys()
+        for h in orig.forward_return_end_ts:
+            o = orig.forward_return_end_ts[h]
+            b = back.forward_return_end_ts[h]
+            assert (o is None) == (b is None)
+            if o is not None:
+                # tz survives the JSON encode/decode cycle.
+                assert o == b
+
+
+def test_waveform_sample_jsonl_legacy_v1_loads_with_empty_forward_return_end_ts(tmp_path):
+    """Pre-PR-#15 JSONL records lack `forward_return_end_ts`. They must
+    still be readable; the field defaults to {} so downstream filters
+    correctly treat them as ineligible."""
+    legacy = {
+        "symbol": "X", "timeframe": "1h",
+        "start_ts": "2024-01-01T00:00:00+00:00",
+        "end_ts": "2024-01-03T11:00:00+00:00",
+        "signature": {
+            "vector": [0.0, 1.0, 0.0],
+            "structure": [], "swing_structure": [],
+            "trend_state": "RANGE", "detected_pattern": None,
+            "length": 3, "method": "z_score", "atr": None,
+        },
+        "forward_returns_pct": {"24": 0.5},
+        "max_favorable_pct": None, "max_adverse_pct": None,
+        # NO forward_return_end_ts field — this is the v1 shape.
+    }
+    p = tmp_path / "legacy.jsonl"
+    p.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+    from src.fx.waveform_library import read_library
+    lib = read_library(p)
+    assert len(lib) == 1
+    assert lib[0].forward_return_end_ts == {}, (
+        "legacy JSONL must read back with empty forward_return_end_ts"
+    )
+
+
+def test_compute_library_id_reports_v2_when_all_samples_have_forward_return_end_ts():
+    df = _ohlcv(24 * 30, start="2024-06-01")
+    lib = build_library(
+        df, symbol="X", timeframe="1h",
+        window_bars=60, step_bars=20, forward_horizons=(24,),
+    )
+    assert lib
+    lid = compute_library_id(lib, "/tmp/lib.jsonl")
+    assert "schema=v2" in lid
+
+
+def test_compute_library_id_reports_v1_when_any_sample_lacks_forward_return_end_ts():
+    """Mixed library (one legacy sample) must be flagged v1 so callers
+    can route to safe-side handling."""
+    df = _ohlcv(24 * 30, start="2024-06-01")
+    lib = build_library(
+        df, symbol="X", timeframe="1h",
+        window_bars=60, step_bars=20, forward_horizons=(24,),
+    )
+    legacy = _mk_sample(
+        pd.Timestamp("2024-01-15 12:00", tz="UTC"),
+        label_ts=False,  # explicitly omit forward_return_end_ts
+    )
+    lid = compute_library_id(lib + [legacy], "/tmp/mix.jsonl")
+    assert "schema=v1" in lid
+
+
+def test_waveform_bias_dict_unavailable_for_legacy_library():
+    """A library where every sample has empty forward_return_end_ts
+    must produce an explicit `unavailable_reason` mentioning the
+    rebuild path — NOT silently fall through to `no eligible samples`."""
+    df = _ohlcv(24 * 80, start="2024-06-01")
+    legacy = [
+        _mk_sample(pd.Timestamp("2024-04-01 10:00", tz="UTC"), label_ts=False),
+        _mk_sample(pd.Timestamp("2024-04-02 10:00", tz="UTC"), label_ts=False),
+    ]
+    out = waveform_bias_dict(
+        legacy, df, len(df) - 1, interval="1h",
+    )
+    assert "unavailable_reason" in out
+    assert "forward_return_end_ts" in out["unavailable_reason"]
+    assert "rebuild" in out["unavailable_reason"]
 
 
 def test_aggregate_many_pools_waveform_buckets(tmp_path):

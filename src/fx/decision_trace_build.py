@@ -501,55 +501,82 @@ def _horizon_duration(
 def _filter_library_no_lookahead(
     library: list[WaveformSample],
     bar_ts: pd.Timestamp,
-    horizon_dur: pd.Timedelta,
+    horizon_bars: int,
 ) -> list[WaveformSample]:
-    """Keep only samples whose forward-return label is fully realised by bar_ts.
+    """Keep only samples whose forward-return LABEL was actually realised
+    by `bar_ts`, using the per-horizon target-bar timestamp recorded at
+    library-build time.
 
-    A sample's `forward_returns_pct[horizon_bars]` is computed from
-    `closes[end + horizon]`, so it is only knowable AT that future
-    timestamp. To match against the sample's labels at bar_ts without
-    leaking future information, we require:
+    Why bar-count + bar_interval is NOT enough
+    -----------------------------------------
+    `forward_returns_pct[h]` is computed from `closes[end + h]` — a
+    bar-count offset, NOT a wall-clock offset. With FX data the market
+    is closed Sat/Sun, so there's no `end + 1h` bar across a Friday
+    night; the 24th bar after Friday 23:00 lands on Monday-or-later.
+    `sample.end_ts + 24h` (= Saturday 23:00) is therefore strictly
+    earlier than the actual label timestamp (= Monday-something), and
+    a filter using only `end_ts + h*bar_interval <= bar_ts` would
+    silently let through samples whose labels were not yet known at
+    bar_ts. Tested in `test_filter_excludes_friday_sample_when_horizon_extends_past_weekend`.
 
-        sample.end_ts + horizon_dur <= bar_ts
-
-    Stricter than `sample.end_ts < bar_ts`. Samples whose horizon
-    straddles bar_ts are excluded — those labels were not yet fully
-    realised at the moment the engine would have queried.
+    Correct filter
+    --------------
+    Use `sample.forward_return_end_ts[horizon_bars]` (recorded by
+    `build_library` from `idx[target]`). Samples missing this field are
+    excluded — older library files (pre-PR-#15) cannot be filtered
+    safely; rebuild the library to use them.
     """
-    cutoff = bar_ts - horizon_dur
     out: list[WaveformSample] = []
     for s in library:
-        sample_end = s.end_ts
+        label_ts_raw = s.forward_return_end_ts.get(horizon_bars)
+        if label_ts_raw is None:
+            # Either the field is missing entirely (legacy library) or
+            # the horizon's target bar didn't exist when the sample was
+            # built. Safe-side: exclude.
+            continue
+        label_ts = pd.Timestamp(label_ts_raw)
         # Normalise tz so comparison cannot raise on mixed-tz inputs.
-        sample_end_ts = pd.Timestamp(sample_end)
-        if sample_end_ts.tzinfo is None and cutoff.tzinfo is not None:
-            sample_end_ts = sample_end_ts.tz_localize(cutoff.tzinfo)
-        elif sample_end_ts.tzinfo is not None and cutoff.tzinfo is None:
-            sample_end_ts = sample_end_ts.tz_convert(None).tz_localize(None)
-        if sample_end_ts <= cutoff:
+        if label_ts.tzinfo is None and bar_ts.tzinfo is not None:
+            label_ts = label_ts.tz_localize(bar_ts.tzinfo)
+        elif label_ts.tzinfo is not None and bar_ts.tzinfo is None:
+            label_ts = label_ts.tz_convert(None).tz_localize(None)
+        if label_ts <= bar_ts:
             out.append(s)
     return out
 
 
 def compute_library_id(library: list[WaveformSample], path: str | None) -> str:
-    """Compact identifier for a waveform library: filename + size + ts range + sha8.
+    """Compact identifier for a waveform library.
 
-    Stored in trace.waveform.waveform_bias.library_id and in run_metadata
-    for reproducibility. Kept short on purpose so JSONL traces don't blow
-    up — the full library should be referenced by file path elsewhere.
+    Format: ``{filename}|schema={v1|v2}|n={N}|{first_end_ts}|{last_end_ts}|{sha8}``
+
+    `schema=v2` means every sample carries `forward_return_end_ts`
+    (PR-#15 build_library produces this). `schema=v1` means at least
+    one sample lacks it — pre-PR-#15 library, look-ahead-safe filter
+    cannot run, downstream waveform_bias will surface
+    `unavailable_reason="library lacks forward_return_end_ts ..."`.
+
+    Stored in trace.waveform.waveform_bias.library_id and in
+    run_metadata so a future audit can tell at a glance whether the
+    library was rebuilt with the new schema.
     """
     import hashlib
     import os
     n = len(library)
     if n == 0:
-        return f"{os.path.basename(path or '?')}|0|empty"
+        return f"{os.path.basename(path or '?')}|schema=empty|0|empty"
+    schema = "v2" if all(
+        s.forward_return_end_ts for s in library
+    ) else "v1"
     first_ts = library[0].end_ts.isoformat()
     last_ts = library[-1].end_ts.isoformat()
     h = hashlib.sha256()
-    h.update(f"{n}|{first_ts}|{last_ts}".encode("utf-8"))
+    h.update(f"{schema}|{n}|{first_ts}|{last_ts}".encode("utf-8"))
     sha8 = h.hexdigest()[:8]
     fname = os.path.basename(path or "memory")
-    return f"{fname}|n={n}|{first_ts}|{last_ts}|{sha8}"
+    return (
+        f"{fname}|schema={schema}|n={n}|{first_ts}|{last_ts}|{sha8}"
+    )
 
 
 def waveform_bias_dict(
@@ -586,13 +613,17 @@ def waveform_bias_dict(
     if library is None:
         return {**base, "unavailable_reason": "no library attached"}
 
-    horizon_dur = _horizon_duration(interval, horizon_bars)
-    if horizon_dur is None:
+    # PR #15: interval is no longer needed for the filter itself — the
+    # filter compares pre-recorded `forward_return_end_ts[h]` against
+    # bar_ts directly. We still validate the interval here so that the
+    # unavailable_reason is informative if the lookup is asked of an
+    # unsupported timeframe.
+    if _horizon_duration(interval, horizon_bars) is None:
         return {
             **base,
             "unavailable_reason": (
-                f"unknown interval {interval!r}; cannot compute "
-                "horizon-aware look-ahead filter — disabling lookup"
+                f"unknown interval {interval!r}; disabling lookup as a "
+                "safe-side default"
             ),
         }
 
@@ -610,14 +641,33 @@ def waveform_bias_dict(
     if not isinstance(bar_ts, pd.Timestamp):
         bar_ts = pd.Timestamp(bar_ts)
 
-    safe_lib = _filter_library_no_lookahead(library, bar_ts, horizon_dur)
+    # Detect legacy library (no forward_return_end_ts[horizon] anywhere)
+    # so we can record an explicit unavailable_reason rather than just
+    # "no eligible samples". Helps the user debug.
+    has_label_ts = any(
+        s.forward_return_end_ts.get(horizon_bars) is not None for s in library
+    )
+    if not has_label_ts:
+        return {
+            **base,
+            "unavailable_reason": (
+                "library lacks forward_return_end_ts for horizon "
+                f"{horizon_bars}; rebuild library with PR #15+ "
+                "(pre-PR-#15 libraries cannot be filtered safely "
+                "against FX weekend gaps)"
+            ),
+            "library_size": len(library),
+            "eligible_size": 0,
+        }
+
+    safe_lib = _filter_library_no_lookahead(library, bar_ts, horizon_bars)
     if not safe_lib:
         return {
             **base,
             "unavailable_reason": (
-                f"no library samples whose horizon completes by {bar_ts}; "
+                f"no library samples whose label was realised by {bar_ts}; "
                 f"library has {len(library)} samples but none satisfy "
-                f"end_ts + {horizon_dur} <= bar_ts"
+                f"forward_return_end_ts[{horizon_bars}] <= bar_ts"
             ),
             "library_size": len(library),
             "eligible_size": 0,

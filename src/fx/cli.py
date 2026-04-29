@@ -1898,8 +1898,13 @@ def build_parser() -> argparse.ArgumentParser:
                          ".waveform_bias is populated per bar via a "
                          "horizon-aware look-ahead-safe lookup. Decision "
                          "logic is unchanged — bias is observability only. "
-                         "Recommended: build the library from data PRIOR "
-                         "to the backtest period (out-of-sample).")
+                         "REQUIRES a PR-#15+ library that records "
+                         "`forward_return_end_ts` per horizon (older "
+                         "libraries are rejected at lookup time and "
+                         "logged as unavailable_reason; rebuild with the "
+                         "current `waveform-build-library`). Recommended: "
+                         "build the library from data PRIOR to the "
+                         "backtest period (out-of-sample).")
     be.add_argument("--trace-out", default=None,
                     help="Directory to write run_metadata.json / "
                          "decision_traces.jsonl / summary.json. Skip the "
