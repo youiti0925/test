@@ -237,6 +237,12 @@ class RunMetadata:
     # library / horizon / method produced its traces. Default None so
     # legacy callers (cmd_trade live exports etc.) continue to work.
     waveform: dict[str, Any] | None = None
+    # PR #17: backtest --context-days run config. Records whether long-term
+    # historical context was attached and over what window. The judgement
+    # path NEVER reads this slice — context is observation-only via
+    # `long_term_trend_slice` (decisions remain byte-identical with or
+    # without context). Default None for live cmd_trade compatibility.
+    context: dict[str, Any] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -257,6 +263,7 @@ class RunMetadata:
             "engine_version": self.engine_version,
             "timezone": self.timezone_name,
             "waveform": dict(self.waveform) if self.waveform is not None else None,
+            "context": dict(self.context) if self.context is not None else None,
         }
 
 
