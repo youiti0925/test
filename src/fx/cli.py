@@ -824,9 +824,7 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
                     file=sys.stderr,
                 )
                 return 2
-        ctx_end = (test_start_ts - pd.Timedelta(seconds=1)).strftime(
-            "%Y-%m-%d %H:%M:%S",
-        )
+        ctx_end = test_start_ts.strftime("%Y-%m-%d")
         ctx_start = (
             test_start_ts - pd.Timedelta(days=context_days)
         ).strftime("%Y-%m-%d")
