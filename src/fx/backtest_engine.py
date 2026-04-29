@@ -533,6 +533,12 @@ def run_engine_backtest(
     # test_decisions_byte_identical_with_or_without_context.
     df_context: pd.DataFrame | None = None,
     context_days: int | None = None,
+    # PR #18: optional pre-built calendar metadata block (events.json
+    # freshness / coverage / window-policy version). Engine doesn't
+    # touch the events themselves through this kwarg — events flow as
+    # before via the `events=` tuple, keeping decision behaviour
+    # invariant. This kwarg is purely for run_metadata.calendar.
+    calendar: dict | None = None,
 ) -> EngineBacktestResult:
     """Run a Decision Engine-driven backtest over `df`.
 
@@ -692,6 +698,7 @@ def run_engine_backtest(
             timezone_name="UTC",
             waveform=dict(waveform_meta),
             context=dict(context_meta),
+            calendar=dict(calendar) if calendar is not None else None,
         )
         result.run_metadata = run_metadata
     else:

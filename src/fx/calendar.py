@@ -51,9 +51,17 @@ class Event:
     impact: str
     forecast: str | None = None
     previous: str | None = None
+    # PR #18: optional canonical kind (FOMC / NFP / BOE / ...) and an
+    # explicit window_hours override. Both default None to keep the
+    # schema permissive — current data/events.json does not need to be
+    # rewritten. When kind/window_hours are absent, risk_gate falls back
+    # to a spec-aware title matcher that recognises NFP / BoE / Rate
+    # Decision spellings.
+    kind: str | None = None
+    window_hours: float | None = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "when": self.when.isoformat(),
             "currency": self.currency,
             "title": self.title,
@@ -61,6 +69,40 @@ class Event:
             "forecast": self.forecast,
             "previous": self.previous,
         }
+        # Only emit optional fields when set so existing JSON files round-
+        # trip identically through load_events / save_events.
+        if self.kind is not None:
+            d["kind"] = self.kind
+        if self.window_hours is not None:
+            d["window_hours"] = self.window_hours
+        return d
+
+
+@dataclass(frozen=True)
+class LoadEventsDiagnostics:
+    """Audit view of a load_events_with_diagnostics() call. PR #18.
+
+    `dropped_examples` is capped to 5 to keep run_metadata.json small
+    even when an upstream feed pipeline regresses; `parse_errors` keeps
+    distinct error messages (deduped) for the same reason.
+    """
+
+    loaded_count: int
+    dropped_count: int
+    dropped_examples: list[dict]
+    parse_errors: list[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "loaded_count": self.loaded_count,
+            "dropped_count": self.dropped_count,
+            "dropped_examples": list(self.dropped_examples),
+            "parse_errors": list(self.parse_errors),
+        }
+
+
+_DROPPED_EXAMPLES_CAP = 5
+_PARSE_ERRORS_CAP = 5
 
 
 # Symbol → list of currency codes the instrument is exposed to.
@@ -83,27 +125,103 @@ def currencies_for(symbol: str) -> list[str]:
 
 
 def load_events(path: Path) -> list[Event]:
-    if not path.exists():
-        return []
-    with path.open("r", encoding="utf-8") as f:
-        raw = json.load(f)
-    events: list[Event] = []
-    for item in raw:
-        try:
-            events.append(
-                Event(
-                    when=datetime.fromisoformat(item["when"]),
-                    currency=item["currency"],
-                    title=item["title"],
-                    impact=item.get("impact", "medium"),
-                    forecast=item.get("forecast"),
-                    previous=item.get("previous"),
-                )
-            )
-        except (KeyError, ValueError):
-            continue
-    events.sort(key=lambda e: e.when)
+    """Read events from JSON. PR-#18-compatible shim — preserves the legacy
+    silent-drop behaviour for existing callers. New audit-aware callers
+    should use `load_events_with_diagnostics()` instead."""
+    events, _diag = load_events_with_diagnostics(path)
     return events
+
+
+def load_events_with_diagnostics(
+    path: Path,
+) -> tuple[list[Event], LoadEventsDiagnostics]:
+    """Read events with explicit drop / error reporting. PR #18.
+
+    The legacy `load_events()` wraps this and discards the diagnostics
+    so it stays drop-in. CLI / engine callers that want to audit the
+    load (run_metadata.calendar.events_dropped_count etc.) should use
+    this instead. The parsing logic is unchanged — only the reporting.
+
+    Drop reasons captured:
+    - missing required key (KeyError)
+    - malformed `when` (ValueError from datetime.fromisoformat)
+    - any other ValueError from the Event constructor
+
+    Each captured drop logs a slim `{"index": i, "error": "..."}`
+    snapshot up to `_DROPPED_EXAMPLES_CAP` so a multi-symbol audit can
+    surface the first few without bloating the JSON.
+    """
+    if not path.exists():
+        return [], LoadEventsDiagnostics(0, 0, [], [])
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        return [], LoadEventsDiagnostics(
+            loaded_count=0,
+            dropped_count=0,
+            dropped_examples=[],
+            parse_errors=[f"json parse failed: {e}"],
+        )
+    events: list[Event] = []
+    dropped_examples: list[dict] = []
+    parse_errors: list[str] = []
+    dropped_count = 0
+    for i, item in enumerate(raw or []):
+        try:
+            events.append(Event(
+                when=datetime.fromisoformat(item["when"]),
+                currency=item["currency"],
+                title=item["title"],
+                impact=item.get("impact", "medium"),
+                forecast=item.get("forecast"),
+                previous=item.get("previous"),
+                kind=item.get("kind"),
+                window_hours=item.get("window_hours"),
+            ))
+        except (KeyError, ValueError, TypeError) as e:
+            dropped_count += 1
+            if len(dropped_examples) < _DROPPED_EXAMPLES_CAP:
+                # Snapshot just enough to identify which entry without
+                # echoing the full malformed payload back.
+                dropped_examples.append({
+                    "index": i,
+                    "title": (item or {}).get("title") if isinstance(
+                        item, dict
+                    ) else None,
+                    "error": f"{type(e).__name__}: {e}",
+                })
+            err_msg = f"{type(e).__name__}: {e}"
+            if (
+                err_msg not in parse_errors
+                and len(parse_errors) < _PARSE_ERRORS_CAP
+            ):
+                parse_errors.append(err_msg)
+    events.sort(key=lambda e: e.when)
+    return events, LoadEventsDiagnostics(
+        loaded_count=len(events),
+        dropped_count=dropped_count,
+        dropped_examples=dropped_examples,
+        parse_errors=parse_errors,
+    )
+
+
+def events_file_sha8(path: Path) -> str | None:
+    """Short SHA of the raw events.json bytes. PR #18.
+
+    File-content hash, NOT mtime. `run_metadata.calendar.events_file_sha8`
+    is what tells two runs apart when the calendar has actually changed,
+    and what proves two runs match when only the touched-but-unchanged
+    mtime differs (the deterministic-backtest core invariant).
+    """
+    import hashlib
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        return hashlib.sha256(p.read_bytes()).hexdigest()[:8]
+    except OSError:
+        return None
 
 
 def save_events(path: Path, events: Iterable[Event]) -> None:
@@ -230,9 +348,14 @@ def calendar_freshness(
 
     age_h = max(0.0, (now - mtime).total_seconds() / 3600.0)
 
-    try:
-        events = load_events(p)
-    except (json.JSONDecodeError, ValueError, OSError) as e:
+    # PR #18: prefer the diagnostics-aware loader so we can distinguish
+    # "JSON malformed" (status=unreadable, parse_errors populated) from
+    # "JSON parsed but produced 0 events" (status=empty). The legacy
+    # `load_events` swallowed exceptions silently — which is correct for
+    # callers that want a flat list, but loses the failure mode this
+    # status field is meant to surface.
+    events, diag = load_events_with_diagnostics(p)
+    if diag.parse_errors and not events:
         return CalendarFreshness(
             status="unreadable",
             path=str(p),
@@ -242,7 +365,7 @@ def calendar_freshness(
             next_24h=0,
             next_7d=0,
             max_age_hours=max_age_hours,
-            detail=f"parse failed: {e}",
+            detail=f"parse failed: {diag.parse_errors[0]}",
         )
 
     next_24h = sum(1 for e in events if now <= e.when <= now + timedelta(hours=24))
