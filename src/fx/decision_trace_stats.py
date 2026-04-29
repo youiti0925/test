@@ -222,6 +222,99 @@ def _bucket_matched_count(n: int | None) -> str:
     return "30+"
 
 
+# PR #16 — fixed canonical bucket labels for the waveform unavailable_reason
+# distribution. Defined once so test fixtures, downstream tooling, and the
+# multi-run pool path all reuse the same vocabulary. Adding a new bucket
+# here is a schema change — bump TRACE_SCHEMA_VERSION downstream callers
+# rely on if you ever do that.
+WAVEFORM_UNAVAILABLE_REASON_BUCKETS: tuple[str, ...] = (
+    "none",
+    "no_library_attached",
+    "warmup_insufficient_bars",
+    "legacy_library_missing_forward_return_end_ts",
+    "eligible_0",
+    "unknown_interval",
+    "compute_signature_failed",
+    "other",
+)
+
+
+def _normalize_unavailable_reason(reason: object) -> str:
+    """Bucket a waveform_bias.unavailable_reason STRING into a canonical
+    category. PR #16.
+
+    Prefix-based matching keeps the buckets stable across the variable
+    portion of each reason — e.g. "only 51 bars available", "only 52 bars
+    available", "only 56 bars available, need ≥60 for waveform window"
+    all collapse to ``warmup_insufficient_bars``. Likewise the eligible-
+    zero reason is "no library samples whose label was realised by
+    {bar_ts}; library has N samples ..." — we anchor on the prefix so
+    bar_ts and N do not split the bucket.
+
+    Inputs:
+    - ``None`` or any non-string → ``"none"`` (the bias dict had no UR
+      field, i.e. the lookup ran cleanly).
+    - empty / whitespace-only string → ``"none"``.
+    - any unmatched string → ``"other"`` so a future reason template
+      added without updating this normaliser shows up loudly in the
+      distribution rather than silently disappearing.
+
+    NOTE: this function looks at the unavailable_reason STRING only.
+    The case "trace has waveform_bias = None entirely" (engine ran
+    without --waveform-library, OR a legacy pre-PR-#15 trace) is the
+    caller's responsibility to detect and bucket as
+    ``"no_library_attached"`` separately. See the call site in
+    aggregate_stats for the convention.
+    """
+    if not isinstance(reason, str):
+        return "none"
+    s = reason.strip()
+    if not s:
+        return "none"
+    # The 6 templates emitted by waveform_bias_dict, anchored on the
+    # leading literal portion of each fmt-string.
+    if s == "no library attached":
+        return "no_library_attached"
+    if s.startswith("only ") and "bars available" in s:
+        return "warmup_insufficient_bars"
+    if s.startswith("library lacks forward_return_end_ts"):
+        return "legacy_library_missing_forward_return_end_ts"
+    if s.startswith("no library samples whose label was realised"):
+        return "eligible_0"
+    if s.startswith("unknown interval "):
+        return "unknown_interval"
+    if s.startswith("compute_signature failed"):
+        return "compute_signature_failed"
+    return "other"
+
+
+def _classify_waveform_unavailable(waveform_bias: object) -> str:
+    """Classify a `trace.waveform.waveform_bias` value (dict or None).
+
+    PR #16. This is the layer that disambiguates "trace has no bias dict"
+    (engine ran without --waveform-library, OR a pre-PR-#15 trace) from
+    "trace has bias dict, lookup ran cleanly". The former is bucketed as
+    ``no_library_attached``, the latter as ``none``.
+
+    Pre-PR-#15 traces are misclassified as ``no_library_attached`` here
+    because they lack the dict entirely — there's no signal in the trace
+    to distinguish them from a current run without ``--waveform-library``.
+    Acceptable: legacy traces are rare in active research and the bucket
+    name still warns the reader that the lookup did not run.
+    """
+    if not isinstance(waveform_bias, dict):
+        return "no_library_attached"
+    return _normalize_unavailable_reason(waveform_bias.get("unavailable_reason"))
+
+
+def _empty_unavailable_reason_distribution() -> dict[str, int]:
+    """Pre-seed all canonical bucket keys at 0 so the output JSON shape
+    is stable across runs, even those that never hit a particular bucket.
+    Matches the pattern used elsewhere in this module for distributions
+    consumed by external dashboards / tests."""
+    return {bucket: 0 for bucket in WAVEFORM_UNAVAILABLE_REASON_BUCKETS}
+
+
 def _bucket_vix_level(level: float | None) -> str:
     if level is None:
         return "unknown"
@@ -399,6 +492,15 @@ def aggregate_stats(
     matched_count_bucket_outcome: dict[str, dict[str, Any]] = {}
     waveform_bias_by_technical_action_outcome: dict[str, dict[str, Any]] = {}
     symbol_waveform_bias_outcome: dict[str, dict[str, Any]] = {}
+    # PR #16 — top-level distribution of normalised unavailable_reason.
+    # `none` counts bars whose lookup ran cleanly (bias.action populated)
+    # AND bars whose trace pre-dates PR #15 (waveform_bias absent). This
+    # lets a multi-symbol report at a glance separate "library is healthy"
+    # from "library is being rejected for reason X" without splitting on
+    # the variable portion of each reason ("only 51 bars" vs "only 52 bars").
+    waveform_unavailable_reason_dist: dict[str, int] = (
+        _empty_unavailable_reason_distribution()
+    )
 
     # Metadata accumulators
     schema_versions: set[str] = set()
@@ -743,6 +845,13 @@ def aggregate_stats(
             # to "unknown" for visibility-by-default.
             wf_section = (rec.get("waveform") or {}).get("waveform_bias")
             wf_dict = wf_section if isinstance(wf_section, dict) else {}
+            # PR #16 — bucket every bar by classified availability. The
+            # helper distinguishes "no library attached" (bias is None
+            # entirely, OR pre-PR-#15 trace) from "lookup ran cleanly"
+            # (dict with no unavailable_reason).
+            waveform_unavailable_reason_dist[
+                _classify_waveform_unavailable(wf_section)
+            ] += 1
             wf_action = wf_dict.get("action") or wf_dict.get("expected_direction")
             if not isinstance(wf_action, str):
                 wf_action = "unknown"
@@ -894,6 +1003,14 @@ def aggregate_stats(
             {"reason": r, "count": c}
             for r, c in hold_reason_counter.most_common(top_n_hold_reasons)
         ],
+        # PR #16 — top-level for visibility (separate from cross_stats so
+        # multi-bucket dashboards can render it as a single bar chart).
+        # Keys are guaranteed to be exactly WAVEFORM_UNAVAILABLE_REASON_BUCKETS;
+        # zero-count buckets are kept so consumers can compute share without
+        # `KeyError` defensive code.
+        "waveform_unavailable_reason_distribution": dict(
+            waveform_unavailable_reason_dist
+        ),
         "cross_stats": {
             "hold_reason_outcome": {
                 reason: _finalise_hold_reason_row(row)
@@ -1206,6 +1323,12 @@ def aggregate_many(
     g_matched_count_bucket_outcome: dict[str, dict[str, dict[str, Any]]] = {}
     g_waveform_bias_by_technical_action_outcome: dict[str, dict[str, dict[str, Any]]] = {}
     g_symbol_waveform_bias_outcome: dict[str, dict[str, dict[str, Any]]] = {}
+    # PR #16 — pooled normalised distribution. Sum-by-bucket across runs;
+    # pre-seeded with all canonical buckets at 0 so output JSON shape is
+    # stable even when zero runs have a particular reason.
+    g_waveform_unavailable_reason_dist: dict[str, int] = (
+        _empty_unavailable_reason_distribution()
+    )
 
     # Global metadata accumulators
     g_run_ids: list[str] = []                    # preserve order, dedup at end
@@ -1375,6 +1498,16 @@ def aggregate_many(
         _pool_two_way(g_symbol_waveform_bias_outcome,
                       cs.get("symbol_waveform_bias_outcome", {}))
 
+        # PR #16 — pool the normalised unavailable_reason distribution by
+        # summing each canonical bucket. Older per-run stats may not have
+        # this key (e.g. cached output from before PR #16) — `.get(...) or {}`
+        # makes the fold tolerant of that.
+        per_run_dist = stats.get("waveform_unavailable_reason_distribution") or {}
+        for bucket in WAVEFORM_UNAVAILABLE_REASON_BUCKETS:
+            v = per_run_dist.get(bucket)
+            if isinstance(v, int):
+                g_waveform_unavailable_reason_dist[bucket] += v
+
     # All runs failed -> ValueError
     if not per_run:
         raise ValueError(
@@ -1440,6 +1573,12 @@ def aggregate_many(
         "top_hold_reasons": [
             {"reason": r, "count": c} for r, c in top_pairs
         ],
+        # PR #16 — pooled normalised distribution mirrors the per-run
+        # `aggregate_stats` shape so consumers can use the same key on
+        # single-run and multi-run reports interchangeably.
+        "waveform_unavailable_reason_distribution": dict(
+            g_waveform_unavailable_reason_dist
+        ),
         "cross_stats": {
             "hold_reason_outcome": {
                 reason: _finalise_pooled_hold_reason_row(row)

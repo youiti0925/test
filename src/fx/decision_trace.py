@@ -231,6 +231,12 @@ class RunMetadata:
     execution_mode: str
     engine_version: str
     timezone_name: str
+    # PR #16: waveform-match run config in plain text. The same payload is
+    # already folded into strategy_config_hash, but the hash is one-way —
+    # without the readable copy you cannot tell from a stored run which
+    # library / horizon / method produced its traces. Default None so
+    # legacy callers (cmd_trade live exports etc.) continue to work.
+    waveform: dict[str, Any] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -250,6 +256,7 @@ class RunMetadata:
             "execution_mode": self.execution_mode,
             "engine_version": self.engine_version,
             "timezone": self.timezone_name,
+            "waveform": dict(self.waveform) if self.waveform is not None else None,
         }
 
 

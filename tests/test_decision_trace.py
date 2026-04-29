@@ -141,6 +141,88 @@ def test_run_metadata_attached_unique_and_complete():
     assert ids == {rm.run_id}
 
 
+# ─── PR #16: waveform run_metadata audit fields ────────────────────────────
+
+
+_PR16_REQUIRED_WAVEFORM_KEYS = {
+    "waveform_enabled",
+    "waveform_library_id",
+    "waveform_library_size",
+    "waveform_library_schema",
+    "waveform_library_path_basename",
+    "waveform_library_first_end_ts",
+    "waveform_library_last_end_ts",
+    "waveform_window_bars",
+    "waveform_horizon_bars",
+    "waveform_min_samples",
+    "waveform_min_score",
+    "waveform_min_share",
+    "waveform_method",
+}
+
+
+def test_run_metadata_includes_waveform_section_when_no_library_attached():
+    """PR #16: a backtest run WITHOUT --waveform-library still records
+    its waveform run config in run_metadata.json so the absence is
+    explicit. Otherwise readers cannot distinguish "library wasn't
+    attached" from "field was added later and is missing for older
+    runs"."""
+    df = _ohlcv(200, seed=3)
+    res = run_engine_backtest(df, "X", interval="1h", warmup=60)
+    rm_dict = res.run_metadata.to_dict()
+    assert "waveform" in rm_dict
+    assert rm_dict["waveform"] is not None
+    wf = rm_dict["waveform"]
+    assert set(wf.keys()) == _PR16_REQUIRED_WAVEFORM_KEYS
+    # No library → enabled=False, all library-derived fields null/0,
+    # but the parameter knobs (window/horizon/method) still surface.
+    assert wf["waveform_enabled"] is False
+    assert wf["waveform_library_id"] is None
+    assert wf["waveform_library_size"] == 0
+    assert wf["waveform_library_schema"] is None
+    assert wf["waveform_library_path_basename"] is None
+    assert wf["waveform_library_first_end_ts"] is None
+    assert wf["waveform_library_last_end_ts"] is None
+    assert wf["waveform_window_bars"] == 60
+    assert wf["waveform_horizon_bars"] == 24
+    assert wf["waveform_method"] == "dtw"
+
+
+def test_run_metadata_includes_waveform_section_when_library_attached():
+    """PR #16: with a library attached, run_metadata exposes basename,
+    schema (v1/v2), and first/last_end_ts parsed out of library_id so
+    a future audit can tell from run_metadata.json alone which library
+    fed the run, without having to open decision_traces.jsonl."""
+    from src.fx.waveform_library import build_library
+    from src.fx.decision_trace_build import compute_library_id
+
+    history = _ohlcv(24 * 200, seed=11)
+    lib = build_library(
+        history, symbol="X", timeframe="1h",
+        window_bars=60, step_bars=8, forward_horizons=(24,),
+    )
+    assert lib, "fixture build_library produced 0 samples"
+    library_id = compute_library_id(lib, "/tmp/somewhere/usdjpy_train.jsonl")
+
+    df = _ohlcv(200, seed=12)
+    res = run_engine_backtest(
+        df, "X", interval="1h", warmup=60,
+        waveform_library=lib, waveform_library_id=library_id,
+    )
+    wf = res.run_metadata.to_dict()["waveform"]
+    assert set(wf.keys()) == _PR16_REQUIRED_WAVEFORM_KEYS
+    assert wf["waveform_enabled"] is True
+    assert wf["waveform_library_id"] == library_id
+    assert wf["waveform_library_size"] == len(lib)
+    # PR #15+ build → schema=v2; basename only (no absolute path leakage);
+    # endpoints match the library's first/last sample end_ts in iso form.
+    assert wf["waveform_library_schema"] == "v2"
+    assert wf["waveform_library_path_basename"] == "usdjpy_train.jsonl"
+    assert "/" not in wf["waveform_library_path_basename"]
+    assert wf["waveform_library_first_end_ts"] == lib[0].end_ts.isoformat()
+    assert wf["waveform_library_last_end_ts"] == lib[-1].end_ts.isoformat()
+
+
 # ─── Regression / decision-invariance tests ────────────────────────────────
 
 
