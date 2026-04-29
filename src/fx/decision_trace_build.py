@@ -1293,6 +1293,7 @@ def build_atr_unavailable_trace(
     bar_exit_trade_id: str | None,
     macro: MacroSnapshot | None = None,
     waveform_bias: dict | None = None,
+    long_term_trend_override: LongTermTrendSlice | None = None,
 ) -> BarDecisionTrace:
     """Trace for a bar where ATR is NaN — engine bailed before decide()."""
     from .backtest_engine import _position_dict  # local import to avoid cycle
@@ -1398,7 +1399,15 @@ def build_atr_unavailable_trace(
         rule_checks=tuple(checks),
         decision=decision,
         future_outcome=None,
-        long_term_trend=long_term_trend_slice(df, i),
+        # PR #17: when the engine has built `df_full = df_context + df_test`,
+        # it precomputes long_term_trend_slice(df_full, i_full) and passes
+        # the override here. The judgement path NEVER sees df_full — only
+        # this slice does, and the slice is observation-only.
+        long_term_trend=(
+            long_term_trend_override
+            if long_term_trend_override is not None
+            else long_term_trend_slice(df, i)
+        ),
         macro_context=macro_context_slice(macro, ts),
     )
 
@@ -1440,6 +1449,7 @@ def build_full_trace(
     bar_exit_trade_id: str | None,
     macro: MacroSnapshot | None = None,
     waveform_bias: dict | None = None,
+    long_term_trend_override: LongTermTrendSlice | None = None,
 ) -> BarDecisionTrace:
     """Full trace for a normally processed bar."""
     market = market_slice(df, i, data_source)
@@ -1448,7 +1458,15 @@ def build_full_trace(
         pattern, atr_value, market.close, waveform_bias=waveform_bias,
     )
     higher_tf_s = higher_tf_slice(interval, higher_tf, tech, use_higher_tf)
-    long_term = long_term_trend_slice(df, i)
+    # PR #17: when --context-days is in play, the engine precomputes the
+    # long-term trend over `df_context + df` (so SMA90/200 + monthly_trend
+    # become valid from test_start) and passes it here. Without context the
+    # fallback computes from `df` alone, preserving legacy behaviour.
+    long_term = (
+        long_term_trend_override
+        if long_term_trend_override is not None
+        else long_term_trend_slice(df, i)
+    )
     macro_ctx = macro_context_slice(macro, ts)
     fundamental = fundamental_slice(
         risk_state.events, ts, blocked_codes=tuple(decision.blocked_by)

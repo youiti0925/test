@@ -797,6 +797,65 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
         end=args.end,
     )
 
+    # PR #17: optional historical context — feeds long_term_trend_slice
+    # only, NOT the judgement path. Fetched as a separate yfinance call
+    # ending strictly before df.index.min(). The 1h-specific 730d total-
+    # span limit is enforced here because the user's combined window
+    # (context + test) must fit; longer intervals (1d / 1wk) have no
+    # such limit and we don't blanket-apply it.
+    df_context = None
+    context_days = int(getattr(args, "context_days", 0) or 0)
+    if context_days > 0:
+        if len(df) == 0:
+            print(
+                "[error] --context-days given but the test fetch is empty",
+                file=sys.stderr,
+            )
+            return 2
+        test_start_ts = pd.Timestamp(df.index.min())
+        # Combined-window guard for 1h: yfinance hard-stops at ~730 days.
+        if args.interval == "1h":
+            test_span_days = (df.index.max() - df.index.min()).days + 1
+            if context_days + test_span_days > 730:
+                print(
+                    f"[error] --context-days {context_days} + test span "
+                    f"{test_span_days}d > 730d (yfinance 1h hard limit). "
+                    "Reduce --context-days or shorten test window.",
+                    file=sys.stderr,
+                )
+                return 2
+        ctx_end = test_start_ts.strftime("%Y-%m-%d")
+        ctx_start = (
+            test_start_ts - pd.Timedelta(days=context_days)
+        ).strftime("%Y-%m-%d")
+        try:
+            df_context = fetch_ohlcv(
+                args.symbol,
+                interval=args.interval,
+                period=None,
+                start=ctx_start,
+                end=ctx_end,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[error] context fetch failed: {e}",
+                file=sys.stderr,
+            )
+            return 2
+        # Drop any rows that landed at or after test_start (yfinance can
+        # over-deliver near the boundary). Strict-less-than is rechecked
+        # by the engine, but we trim defensively here so the engine
+        # doesn't reject the run on what is really a data-source quirk.
+        if len(df_context) > 0:
+            df_context = df_context[df_context.index < df.index.min()]
+        if len(df_context) == 0:
+            print(
+                "[warn] context fetch returned 0 bars after the strict-"
+                "before filter — proceeding without context",
+                file=sys.stderr,
+            )
+            df_context = None
+
     events = ()
     if not args.no_events:
         cal_health = calendar_freshness(EVENTS_PATH)
@@ -869,6 +928,8 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
         macro=macro,
         waveform_library=waveform_library,
         waveform_library_id=waveform_library_id,
+        df_context=df_context,
+        context_days=context_days,
     )
     metrics = result.metrics()
     start_date = str(df.index[0])
@@ -1905,6 +1966,17 @@ def build_parser() -> argparse.ArgumentParser:
                          "current `waveform-build-library`). Recommended: "
                          "build the library from data PRIOR to the "
                          "backtest period (out-of-sample).")
+    be.add_argument("--context-days", type=int, default=0,
+                    help="Days of historical OHLCV to fetch BEFORE the "
+                         "test window for long_term_trend / SMA200 / "
+                         "monthly_trend computation. Observation-only — "
+                         "the judgement path (ATR / patterns / "
+                         "higher_tf / RSI / waveform target signature / "
+                         "decide_action) NEVER sees this context, so "
+                         "decisions are byte-identical with or without "
+                         "it. Default 0 (legacy behaviour). For "
+                         "`--interval 1h`, context_days + test span "
+                         "must be ≤730 (yfinance hard limit).")
     be.add_argument("--trace-out", default=None,
                     help="Directory to write run_metadata.json / "
                          "decision_traces.jsonl / summary.json. Skip the "

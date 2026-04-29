@@ -55,6 +55,7 @@ from .decision_trace_build import (
     build_atr_unavailable_trace as _build_atr_unavailable_trace,
     build_full_trace as _build_full_trace,
     build_run_id as _build_run_id,
+    long_term_trend_slice as _long_term_trend_slice,
     populate_future_outcomes as _populate_future_outcomes,
 )
 from .higher_timeframe import HIGHER_INTERVAL_MAP
@@ -317,6 +318,125 @@ def _compute_waveform_bias_for_bar(
     )
 
 
+def _validate_and_concat_context(
+    df_context: pd.DataFrame, df_test: pd.DataFrame,
+) -> tuple[pd.DataFrame, int]:
+    """Concatenate `df_context + df_test` after strict validation. PR #17.
+
+    Returns
+    -------
+    df_full : pd.DataFrame
+        The concatenation, sorted by index, used **only** as input to
+        `long_term_trend_slice`. The judgement path keeps using df_test.
+    n_context_bars : int
+        `len(df_context)` after validation. Surfaced in run_metadata so
+        the audit reader can recover the boundary.
+
+    Raises
+    ------
+    ValueError
+        If df_context overlaps with df_test in time, or either has
+        duplicate / non-monotonic index, or the tz state of the two
+        indices is mismatched. We fail loud — silently dropping rows
+        would corrupt long-term trend computation in ways that look
+        plausible but are wrong.
+    """
+    if df_context.empty:
+        return df_test, 0
+
+    # tz-state must match — comparing tz-aware against tz-naive raises
+    # in pandas, but the message is cryptic. Catch it here.
+    ctx_tz = df_context.index.tz
+    test_tz = df_test.index.tz
+    if (ctx_tz is None) != (test_tz is None):
+        raise ValueError(
+            "df_context and df_test have mismatched timezone state "
+            f"(context tz={ctx_tz}, test tz={test_tz}). Both must be "
+            "tz-aware or both tz-naive — cannot compare."
+        )
+
+    # Sort defensively, but catch unexpected duplicates *before* the sort
+    # masks them.
+    if df_context.index.duplicated().any():
+        n_dup = int(df_context.index.duplicated().sum())
+        raise ValueError(
+            f"df_context has {n_dup} duplicate index entries; refuse to "
+            "silently dedupe (would corrupt SMA computation). Caller must "
+            "clean upstream."
+        )
+    if df_test.index.duplicated().any():
+        n_dup = int(df_test.index.duplicated().sum())
+        raise ValueError(
+            f"df_test has {n_dup} duplicate index entries; refuse to "
+            "silently dedupe."
+        )
+
+    df_context_sorted = df_context.sort_index()
+    df_test_sorted = df_test.sort_index()
+    ctx_max = df_context_sorted.index.max()
+    test_min = df_test_sorted.index.min()
+    if ctx_max >= test_min:
+        raise ValueError(
+            "df_context overlaps df_test: "
+            f"context.max={ctx_max!s} >= test.min={test_min!s}. "
+            "context must be strictly before test_start."
+        )
+
+    df_full = pd.concat([df_context_sorted, df_test_sorted])
+    # Defensive: post-concat duplicates would only happen if the two
+    # frames share a timestamp on the seam, which the strict-less-than
+    # check above already rejects. Belt and braces.
+    if df_full.index.duplicated().any():  # pragma: no cover
+        raise ValueError(
+            "concatenated df_full has duplicate index after merge — "
+            "context/test boundary likely overlapping."
+        )
+    return df_full, len(df_context_sorted)
+
+
+def _build_context_metadata(
+    *,
+    df_test: pd.DataFrame,
+    df_context: pd.DataFrame | None,
+    n_context_bars: int,
+    context_days: int | None,
+) -> dict:
+    """Readable context-period block for run_metadata. PR #17.
+
+    Always emits all 9 fields regardless of whether context is attached —
+    a missing field would be ambiguous between "old run" and "explicitly
+    no context", and the reader has to defend against `KeyError` either
+    way. ``trace_scope`` / ``metrics_scope`` are constants here because
+    the engine ALWAYS confines trades and traces to the test frame, even
+    when context is supplied (the judgement loop only iterates df_test).
+    """
+    enabled = n_context_bars > 0 and df_context is not None
+    test_start_iso = (
+        df_test.index.min().isoformat() if len(df_test) > 0 else None
+    )
+    test_end_iso = (
+        df_test.index.max().isoformat() if len(df_test) > 0 else None
+    )
+    if enabled:
+        # df_context has been validated and possibly sorted — recover its
+        # earliest bar, which is the start of the historical window.
+        context_start_iso = df_context.sort_index().index.min().isoformat()
+    else:
+        context_start_iso = None
+    return {
+        "context_enabled": enabled,
+        "context_days": context_days if context_days is not None else 0,
+        "context_start": context_start_iso,
+        "test_start": test_start_iso,
+        "test_end": test_end_iso,
+        "n_context_bars": n_context_bars,
+        "n_test_bars": len(df_test),
+        "metrics_scope": "test_only",
+        "trace_scope": "test_only",
+        "long_term_context_attached": enabled,
+    }
+
+
 def _build_waveform_metadata(
     *,
     library: list[WaveformSample] | None,
@@ -405,6 +525,14 @@ def run_engine_backtest(
     waveform_min_score: float = 0.55,
     waveform_min_share: float = 0.6,
     waveform_method: str = "dtw",
+    # PR #17: optional historical OHLCV strictly BEFORE `df.index.min()`,
+    # used **only** by long_term_trend_slice so SMA90/200 + monthly_trend
+    # become valid from test_start. The judgement path (ATR / patterns /
+    # _resample_higher_tf / waveform target signature / RSI / decide_action)
+    # NEVER sees df_context — invariant pinned by
+    # test_decisions_byte_identical_with_or_without_context.
+    df_context: pd.DataFrame | None = None,
+    context_days: int | None = None,
 ) -> EngineBacktestResult:
     """Run a Decision Engine-driven backtest over `df`.
 
@@ -454,6 +582,33 @@ def run_engine_backtest(
     pending_chain: tuple[str, ...] = ()
     pending_blocked: tuple[str, ...] = ()
 
+    # PR #17: optional historical context for long_term_trend_slice ONLY.
+    # The judgement path (ATR / patterns / higher_tf / RSI / waveform) sees
+    # df only — never df_full. This is what keeps decisions byte-identical
+    # with or without context (pinned by
+    # test_decisions_byte_identical_with_or_without_context).
+    df_full = df
+    n_context_bars = 0
+    if df_context is not None and len(df_context) > 0:
+        df_full, n_context_bars = _validate_and_concat_context(df_context, df)
+
+    def _long_term_trend_for_bar(i_test: int):
+        """Closure: compute long_term_trend at test bar i_test, expanding
+        the input window to include df_context if provided. PR #17.
+
+        Returns None when no context is attached — preserves the existing
+        behaviour where the trace builder falls back to
+        long_term_trend_slice(df, i) on its own. We only emit an override
+        when context actually changes the answer, keeping the no-context
+        path byte-identical with pre-PR-#17 runs.
+        """
+        if n_context_bars == 0:
+            return None
+        # Map the test-frame bar index into the full-frame index. The
+        # full frame is df_context (length n_context_bars) followed by df,
+        # so test bar i_test corresponds to full bar i_test + n_context_bars.
+        return _long_term_trend_slice(df_full, i_test + n_context_bars)
+
     # ATR is monotonic-suffix — compute once over the full df. Each bar
     # only reads atr_series.iloc[i], no future leak.
     atr_series = compute_atr(df, period=14)
@@ -482,6 +637,15 @@ def run_engine_backtest(
             min_share=waveform_min_share,
             method=waveform_method,
         )
+        # PR #17: backtest-engine context-period block. Always emitted for
+        # backtest runs so a future audit can see "context_enabled=false"
+        # explicitly rather than guessing from a missing field.
+        context_meta = _build_context_metadata(
+            df_test=df,
+            df_context=df_context,
+            n_context_bars=n_context_bars,
+            context_days=context_days,
+        )
         config_payload = {
             "interval": interval,
             "initial_cash": initial_cash,
@@ -499,6 +663,12 @@ def run_engine_backtest(
             # PR #15 — waveform-match config. Saved here so a trace can be
             # re-derived from the same library + params later.
             **waveform_meta,
+            # PR #17 — context-period config. Folded into the hash so a run
+            # made WITH context is distinguishable from one WITHOUT, even
+            # though decisions byte-match by design.
+            "context_enabled": context_meta["context_enabled"],
+            "context_days": context_meta["context_days"],
+            "n_context_bars": context_meta["n_context_bars"],
         }
         sha, sha_status = get_commit_sha()
         run_metadata = RunMetadata(
@@ -521,6 +691,7 @@ def run_engine_backtest(
             engine_version="backtest_engine.run_engine_backtest",
             timezone_name="UTC",
             waveform=dict(waveform_meta),
+            context=dict(context_meta),
         )
         result.run_metadata = run_metadata
     else:
@@ -629,6 +800,7 @@ def run_engine_backtest(
                         min_samples=waveform_min_samples,
                         min_directional_share=waveform_min_share,
                     ),
+                    long_term_trend_override=_long_term_trend_for_bar(i),
                 )
                 result.decision_traces.append(trace)
             continue
@@ -770,6 +942,7 @@ def run_engine_backtest(
                     min_samples=waveform_min_samples,
                     min_directional_share=waveform_min_share,
                 ),
+                long_term_trend_override=_long_term_trend_for_bar(i),
             )
             result.decision_traces.append(trace)
 
