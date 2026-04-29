@@ -83,11 +83,13 @@ def check_data_quality(df: pd.DataFrame, min_bars: int = 50) -> BlockReason | No
     return None
 
 
-# Default windows per spec §6.
+# Default windows per spec §6 (docs/DESIGN.md §6).
 HIGH_IMPACT_WINDOWS_HOURS = {
     "FOMC": 6,
     "BOJ": 6,
     "ECB": 4,
+    "BOE": 6,         # PR #18: spec is RATE_DECISION = ±6h, and BoE is
+                      # a rate-decision body. Explicit BOE = 6h here.
     "CPI": 2,
     "PCE": 2,
     "NFP": 2,         # Non-farm payrolls
@@ -96,16 +98,87 @@ HIGH_IMPACT_WINDOWS_HOURS = {
     "INTERVENTION": 12,
 }
 
+# PR #18 — version stamp recorded in run_metadata.calendar so a future
+# audit can reconcile event_high counts across schema/window changes.
+EVENT_WINDOW_POLICY_VERSION = "v1"
+
+# PR #18 — title alias map. Each canonical kind lists the substrings
+# the title matcher should accept AFTER upper-casing AND replacing
+# `-` / `_` with spaces. This is what lets "Non-Farm Payrolls" match
+# NFP and "BoE Rate Decision (MPC)" match BOE — both of which the
+# legacy substring matcher missed and silently fell through to the
+# impact-based 4h fallback.
+#
+# Order matters: more specific keys come first so a title containing
+# both "BOE" and "RATE DECISION" lands on BOE (the central-bank
+# specific window).
+_TITLE_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("FOMC",          ("FOMC", "FEDERAL OPEN MARKET COMMITTEE")),
+    ("BOJ",           ("BOJ", "BANK OF JAPAN")),
+    ("ECB",           ("ECB", "EUROPEAN CENTRAL BANK")),
+    ("BOE",           ("BOE", "BANK OF ENGLAND")),
+    ("CPI",           ("CPI", "CONSUMER PRICE")),
+    ("PCE",           ("PCE", "PERSONAL CONSUMPTION EXPENDITURE")),
+    ("NFP",           ("NFP",
+                       "NON FARM PAYROLLS",
+                       "NONFARM PAYROLLS",
+                       "EMPLOYMENT SITUATION")),
+    ("GDP",           ("GDP", "GROSS DOMESTIC PRODUCT")),
+    ("INTERVENTION",  ("INTERVENTION",)),
+    # RATE_DECISION is the catch-all for unbranded "Rate Decision" /
+    # "Interest Rate Decision" titles. Checked LAST so a BoE-tagged
+    # title routes to BOE first.
+    ("RATE_DECISION", ("RATE DECISION", "INTEREST RATE DECISION")),
+)
+
+
+def infer_event_kind(event: Event) -> str | None:
+    """Canonical kind for an event. PR #18.
+
+    Resolution order:
+    1. ``event.kind`` if it already names a known bucket.
+    2. Title alias map (covers NFP / BoE / Rate Decision spellings the
+       legacy substring matcher missed).
+
+    Returns None when nothing matches — caller falls back to the
+    impact-based window. Exposed for trace-stats / audit code.
+    """
+    explicit = (getattr(event, "kind", None) or "").upper()
+    if explicit and explicit in HIGH_IMPACT_WINDOWS_HOURS:
+        return explicit
+    title_norm = (event.title or "").upper().replace("-", " ").replace("_", " ")
+    for kind_canon, aliases in _TITLE_ALIASES:
+        for alias in aliases:
+            if alias in title_norm:
+                return kind_canon
+    return None
+
 
 def _window_hours_for(event: Event) -> float:
-    """Map an event title/impact to a HOLD window in hours."""
-    title_upper = (event.title or "").upper()
-    for kw, hours in HIGH_IMPACT_WINDOWS_HOURS.items():
-        if kw in title_upper:
-            return hours
-    if (event.impact or "medium").lower() == "high":
+    """HOLD window for an event in hours. PR-#18-revised resolution order:
+
+    1. Explicit ``event.window_hours`` (a per-event override for future
+       feeds that ship a known cadence).
+    2. ``event.kind`` mapped through HIGH_IMPACT_WINDOWS_HOURS.
+    3. Title alias map — covers "Non-Farm Payrolls" / "BoE Rate Decision"
+       / "Rate Decision" that the legacy substring matcher missed.
+    4. Impact-based fallback (high=4h / medium=2h / low=0.5h). Same as
+       legacy, but very few real events should reach this branch now.
+
+    Substantive change vs pre-PR-#18: NFP recovers its spec ±2h (was
+    ±4h fallback); BoE Rate Decision gains ±6h (was ±4h fallback).
+    FOMC / BOJ / ECB / CPI windows are unchanged.
+    """
+    explicit_window = getattr(event, "window_hours", None)
+    if isinstance(explicit_window, (int, float)) and explicit_window > 0:
+        return float(explicit_window)
+    kind = infer_event_kind(event)
+    if kind is not None:
+        return float(HIGH_IMPACT_WINDOWS_HOURS[kind])
+    impact = (event.impact or "medium").lower()
+    if impact == "high":
         return 4.0
-    if (event.impact or "medium").lower() == "medium":
+    if impact == "medium":
         return 2.0
     return 0.5
 

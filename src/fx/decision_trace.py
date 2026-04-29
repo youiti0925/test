@@ -243,6 +243,15 @@ class RunMetadata:
     # `long_term_trend_slice` (decisions remain byte-identical with or
     # without context). Default None for live cmd_trade compatibility.
     context: dict[str, Any] | None = None
+    # PR #18: events.json freshness / coverage / window-policy block. The
+    # mtime-based freshness check no longer determines whether events flow
+    # to the gate (research backtests use `backtest_warn_but_use` so
+    # historical results are deterministic against the events.json
+    # content). This metadata captures everything an audit needs to
+    # reproduce a run: events_file_sha8, dropped_count, coverage, policy.
+    # Default None so live cmd_trade RunMetadata construction stays
+    # backwards compatible.
+    calendar: dict[str, Any] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -264,6 +273,7 @@ class RunMetadata:
             "timezone": self.timezone_name,
             "waveform": dict(self.waveform) if self.waveform is not None else None,
             "context": dict(self.context) if self.context is not None else None,
+            "calendar": dict(self.calendar) if self.calendar is not None else None,
         }
 
 

@@ -40,10 +40,17 @@ from .waveform_library import build_library, read_library, write_library
 from .waveform_matcher import compute_signature
 from .broker import Broker, PaperBroker
 from .calendar import (
+    Event,
     calendar_freshness,
+    events_file_sha8,
     load_events,
+    load_events_with_diagnostics,
     seed_defaults,
     upcoming_for_symbol,
+)
+from .risk_gate import (
+    EVENT_WINDOW_POLICY_VERSION,
+    infer_event_kind,
 )
 from .config import Config
 from .context import (
@@ -79,6 +86,188 @@ from src.notify import (
 )
 
 EVENTS_PATH = Path("data/events.json")
+
+
+# PR #18 — calendar policy enum recorded in run_metadata.calendar.
+# `backtest_warn_but_use` / `paper_warn_but_use`: stale is a warning,
+# events are still loaded so historical results stay deterministic.
+# `live_require_fresh`: stale fails closed (events disabled here, Risk
+# Gate also blocks via require_calendar_fresh). `disabled_*` variants
+# capture explicit / structural reasons events were not loaded.
+_CALENDAR_POLICY_BACKTEST = "backtest_warn_but_use"
+_CALENDAR_POLICY_PAPER    = "paper_warn_but_use"
+_CALENDAR_POLICY_LIVE     = "live_require_fresh"
+_CALENDAR_POLICY_DISABLED_EXPLICIT   = "disabled_explicit"
+_CALENDAR_POLICY_DISABLED_MISSING    = "disabled_missing"
+_CALENDAR_POLICY_DISABLED_UNREADABLE = "disabled_unreadable"
+_CALENDAR_POLICY_DISABLED_EMPTY      = "disabled_empty"
+
+
+def _load_events_for_run(
+    *,
+    events_path: Path,
+    no_events: bool,
+    policy: str,
+    test_range: tuple | None = None,
+) -> tuple[tuple[Event, ...], dict, list[str]]:
+    """Load events for a research backtest / analyze / timeline run.
+
+    PR #18. The freshness signal goes into the metadata + warnings, but
+    `backtest_warn_but_use` deliberately uses events anyway so historical
+    backtests are deterministic against the events.json content (not the
+    file mtime). Returns:
+        (events_tuple, calendar_metadata_dict, warning_strings)
+    `calendar_metadata_dict` is the run_metadata.calendar block emission;
+    callers should attach it to RunMetadata via the engine kwarg.
+
+    `policy` is one of the `_CALENDAR_POLICY_*` constants. `test_range`
+    is `(start, end)` of the run window (used to compute
+    `test_range_within_coverage`). Pass None to skip that check.
+    """
+    warnings: list[str] = []
+
+    def _build_metadata(
+        *,
+        events_loaded: bool,
+        events: tuple[Event, ...],
+        diagnostics,
+        freshness,
+        effective_policy: str,
+        event_high_enabled: bool,
+    ) -> dict:
+        coverage_start = (
+            min(e.when for e in events).isoformat() if events else None
+        )
+        coverage_end = (
+            max(e.when for e in events).isoformat() if events else None
+        )
+        in_test_range = None
+        within_coverage: bool | None = None
+        if events and test_range is not None:
+            ts_start, ts_end = test_range
+            in_test_range = sum(
+                1 for e in events
+                if (e.impact or "medium").lower() == "high"
+                and ts_start <= e.when <= ts_end
+            )
+            within_coverage = (
+                min(e.when for e in events) <= ts_start
+                and max(e.when for e in events) >= ts_end
+            )
+        return {
+            "events_path": str(events_path),
+            "events_path_basename": Path(events_path).name,
+            "events_loaded": events_loaded,
+            "events_count": len(events),
+            "events_loaded_count": (
+                diagnostics.loaded_count if diagnostics else 0
+            ),
+            "events_dropped_count": (
+                diagnostics.dropped_count if diagnostics else 0
+            ),
+            "events_dropped_examples": (
+                list(diagnostics.dropped_examples) if diagnostics else []
+            ),
+            "events_parse_errors": (
+                list(diagnostics.parse_errors) if diagnostics else []
+            ),
+            "events_coverage_start": coverage_start,
+            "events_coverage_end": coverage_end,
+            "events_in_test_range_high_count": in_test_range,
+            "test_range_within_coverage": within_coverage,
+            "calendar_freshness_status": (
+                freshness.status if freshness else None
+            ),
+            "calendar_freshness_age_hours": (
+                freshness.age_hours if freshness else None
+            ),
+            "calendar_max_age_hours": (
+                freshness.max_age_hours if freshness else None
+            ),
+            "calendar_policy": effective_policy,
+            "event_high_enabled": event_high_enabled,
+            "event_window_policy_version": EVENT_WINDOW_POLICY_VERSION,
+            "events_file_sha8": events_file_sha8(events_path),
+            "warnings": list(warnings),
+        }
+
+    if no_events:
+        warnings.append("calendar disabled by --no-events")
+        return (), _build_metadata(
+            events_loaded=False, events=(), diagnostics=None,
+            freshness=None,
+            effective_policy=_CALENDAR_POLICY_DISABLED_EXPLICIT,
+            event_high_enabled=False,
+        ), warnings
+
+    freshness = calendar_freshness(events_path)
+
+    # Structural failure paths — independent of policy choice.
+    if freshness.status == "missing":
+        warnings.append(
+            f"events.json not found at {events_path}; running without events"
+        )
+        return (), _build_metadata(
+            events_loaded=False, events=(), diagnostics=None,
+            freshness=freshness,
+            effective_policy=_CALENDAR_POLICY_DISABLED_MISSING,
+            event_high_enabled=False,
+        ), warnings
+    if freshness.status == "unreadable":
+        warnings.append(
+            f"events.json unreadable: {freshness.detail}; "
+            "running without events"
+        )
+        return (), _build_metadata(
+            events_loaded=False, events=(), diagnostics=None,
+            freshness=freshness,
+            effective_policy=_CALENDAR_POLICY_DISABLED_UNREADABLE,
+            event_high_enabled=False,
+        ), warnings
+
+    events_list, diagnostics = load_events_with_diagnostics(events_path)
+    if diagnostics.dropped_count > 0:
+        warnings.append(
+            f"events.json: {diagnostics.dropped_count} entries dropped "
+            f"during parse (see events_dropped_examples)"
+        )
+    if not events_list:
+        warnings.append("events.json contains zero events")
+        return (), _build_metadata(
+            events_loaded=True, events=(), diagnostics=diagnostics,
+            freshness=freshness,
+            effective_policy=_CALENDAR_POLICY_DISABLED_EMPTY,
+            event_high_enabled=False,
+        ), warnings
+
+    # Live policy: stale fails closed. Research policies: stale is a
+    # warning, events are still loaded → backtest stays deterministic
+    # vs the events.json content.
+    if freshness.status == "stale" and policy == _CALENDAR_POLICY_LIVE:
+        warnings.append(
+            f"calendar stale ({freshness.age_hours:.1f}h > "
+            f"{freshness.max_age_hours:.0f}h) and policy={policy} → "
+            "events disabled for this run"
+        )
+        return (), _build_metadata(
+            events_loaded=False, events=(), diagnostics=diagnostics,
+            freshness=freshness, effective_policy=policy,
+            event_high_enabled=False,
+        ), warnings
+
+    if freshness.status == "stale":
+        warnings.append(
+            f"calendar stale ({freshness.age_hours:.1f}h > "
+            f"{freshness.max_age_hours:.0f}h) — using events anyway "
+            f"(policy={policy})"
+        )
+
+    events_tuple = tuple(events_list)
+    return events_tuple, _build_metadata(
+        events_loaded=True, events=events_tuple, diagnostics=diagnostics,
+        freshness=freshness, effective_policy=policy,
+        event_high_enabled=True,
+    ), warnings
 
 
 def _notify(storage: Storage, kind: str, text: str, min_confidence: float = 0.0) -> None:
@@ -856,18 +1045,22 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
             )
             df_context = None
 
-    events = ()
-    if not args.no_events:
-        cal_health = calendar_freshness(EVENTS_PATH)
-        if cal_health.is_fresh:
-            events = tuple(load_events(EVENTS_PATH))
-        else:
-            print(
-                f"[warn] calendar {cal_health.status}: "
-                f"{cal_health.detail or 'unhealthy'} — "
-                "running backtest without macro events",
-                file=sys.stderr,
-            )
+    # PR #18 — backtest deterministic policy: stale events.json is a
+    # WARNING, not a reason to drop events. Same events.json content +
+    # different mtime must yield the same trades. Live path uses
+    # `live_require_fresh` separately.
+    test_range_for_calendar = (
+        (df.index.min().to_pydatetime(), df.index.max().to_pydatetime())
+        if len(df) > 0 else None
+    )
+    events, calendar_metadata, calendar_warnings = _load_events_for_run(
+        events_path=EVENTS_PATH,
+        no_events=args.no_events,
+        policy=_CALENDAR_POLICY_BACKTEST,
+        test_range=test_range_for_calendar,
+    )
+    for w in calendar_warnings:
+        print(f"[warn] {w}", file=sys.stderr)
 
     # Macro context (DXY / US10Y / VIX / indices). Fetched once per run
     # and attached to the engine; build_full_trace samples each slot
@@ -930,6 +1123,7 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
         waveform_library_id=waveform_library_id,
         df_context=df_context,
         context_days=context_days,
+        calendar=calendar_metadata,
     )
     metrics = result.metrics()
     start_date = str(df.index[0])
@@ -1005,18 +1199,20 @@ def cmd_build_timeline(args, cfg: Config, storage: Storage) -> int:
         end=args.end,
     )
 
-    events: tuple = ()
-    if not args.no_events:
-        cal_health = calendar_freshness(EVENTS_PATH)
-        if cal_health.is_fresh:
-            events = tuple(load_events(EVENTS_PATH))
-        else:
-            print(
-                f"[warn] calendar {cal_health.status}: "
-                f"{cal_health.detail or 'unhealthy'} — "
-                "timeline will have no event columns",
-                file=sys.stderr,
-            )
+    # PR #18: timeline is a research path — same deterministic policy
+    # as backtest-engine so the event columns are reproducible.
+    test_range_for_calendar = (
+        (df.index.min().to_pydatetime(), df.index.max().to_pydatetime())
+        if len(df) > 0 else None
+    )
+    events, _calendar_metadata, calendar_warnings = _load_events_for_run(
+        events_path=EVENTS_PATH,
+        no_events=args.no_events,
+        policy=_CALENDAR_POLICY_BACKTEST,
+        test_range=test_range_for_calendar,
+    )
+    for w in calendar_warnings:
+        print(f"[warn] {w}", file=sys.stderr)
 
     macro = None
     if not args.no_macro:
