@@ -252,6 +252,15 @@ class RunMetadata:
     # Default None so live cmd_trade RunMetadata construction stays
     # backwards compatible.
     calendar: dict[str, Any] | None = None
+    # PR #19: literature-based parameter baseline catalog block. Records
+    # baseline_id / baseline_version / baseline_payload_hash and the full
+    # baseline payload + (optionally) the requested --parameter-profile
+    # name. METADATA-ONLY: nothing here flows into decide_action or
+    # risk_gate. `applied_to_runtime` is always False in PR #19; the
+    # value exists so a future PR that DOES connect a profile to the
+    # runtime can flip it without renaming the field. Default None so
+    # live cmd_trade exports stay backwards compatible.
+    parameters: dict[str, Any] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -274,6 +283,7 @@ class RunMetadata:
             "waveform": dict(self.waveform) if self.waveform is not None else None,
             "context": dict(self.context) if self.context is not None else None,
             "calendar": dict(self.calendar) if self.calendar is not None else None,
+            "parameters": dict(self.parameters) if self.parameters is not None else None,
         }
 
 

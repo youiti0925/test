@@ -539,6 +539,12 @@ def run_engine_backtest(
     # before via the `events=` tuple, keeping decision behaviour
     # invariant. This kwarg is purely for run_metadata.calendar.
     calendar: dict | None = None,
+    # PR #19: optional pre-built parameter catalog block (baseline_id,
+    # baseline_version, baseline_payload_hash, full baseline payload,
+    # requested profile). METADATA-ONLY — engine reads no values from
+    # here. The kwarg exists so the catalog reaches RunMetadata via
+    # the same plumbing as `calendar`, without touching decide_action.
+    parameters: dict | None = None,
 ) -> EngineBacktestResult:
     """Run a Decision Engine-driven backtest over `df`.
 
@@ -699,6 +705,7 @@ def run_engine_backtest(
             waveform=dict(waveform_meta),
             context=dict(context_meta),
             calendar=dict(calendar) if calendar is not None else None,
+            parameters=dict(parameters) if parameters is not None else None,
         )
         result.run_metadata = run_metadata
     else:
