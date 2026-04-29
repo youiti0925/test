@@ -419,6 +419,13 @@ def test_cross_stats_top_level_key_present(tmp_path):
         # PR-A v2: USD-exposure normalised + per-symbol DXY cuts
         "dxy_trend_by_usd_exposure_outcome",
         "symbol_dxy_trend_outcome",
+        # PR #15: waveform-match crosses
+        "waveform_bias_direction_outcome",
+        "waveform_confidence_bucket_outcome",
+        "top_similarity_bucket_outcome",
+        "matched_count_bucket_outcome",
+        "waveform_bias_by_technical_action_outcome",
+        "symbol_waveform_bias_outcome",
     }
 
 
@@ -1434,6 +1441,13 @@ def test_existing_cross_stats_keys_unchanged_by_blocked_by_outcome(tmp_path):
         # PR-A v2: USD-exposure normalised + per-symbol DXY cuts
         "dxy_trend_by_usd_exposure_outcome",
         "symbol_dxy_trend_outcome",
+        # PR #15: waveform-match crosses
+        "waveform_bias_direction_outcome",
+        "waveform_confidence_bucket_outcome",
+        "top_similarity_bucket_outcome",
+        "matched_count_bucket_outcome",
+        "waveform_bias_by_technical_action_outcome",
+        "symbol_waveform_bias_outcome",
     } == set(cs.keys())
 
 

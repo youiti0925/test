@@ -48,6 +48,17 @@ class WaveformSample:
     hours — the timeframe is recorded so callers know what "4 bars"
     means.
 
+    `forward_return_end_ts[h]` is the **wall-clock timestamp of the
+    target bar** that produced `forward_returns_pct[h]`. Bar count is
+    not the same as wall-clock time when bars contain weekend / holiday
+    gaps (FX is closed Sat-Sun): "24 bars after Friday 23:00" lands on
+    Monday-or-later, NOT on Saturday 23:00. Look-ahead-safe filters in
+    backtest_engine MUST use `forward_return_end_ts[h]` rather than
+    `end_ts + h * bar_interval` to decide whether a sample's label was
+    realised by `bar_ts`. Older library files (pre-PR-#15) lack this
+    field — consumers should treat such samples as ineligible for
+    look-ahead-sensitive lookups (safe-side default).
+
     `max_favorable_pct` / `max_adverse_pct` use the longest horizon
     measured (typically `max(forward_horizons)`).
     """
@@ -60,6 +71,10 @@ class WaveformSample:
     forward_returns_pct: dict[int, float | None]
     max_favorable_pct: float | None
     max_adverse_pct: float | None
+    # PR #15: per-horizon target-bar timestamp. Optional for backward
+    # compat with older JSONL files; missing values mean "lookup at
+    # this horizon is not safe-to-evaluate" downstream.
+    forward_return_end_ts: dict[int, datetime | None] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -72,12 +87,23 @@ class WaveformSample:
             "forward_returns_pct": {
                 str(k): v for k, v in self.forward_returns_pct.items()
             },
+            "forward_return_end_ts": {
+                str(k): (v.isoformat() if v is not None else None)
+                for k, v in self.forward_return_end_ts.items()
+            },
             "max_favorable_pct": self.max_favorable_pct,
             "max_adverse_pct": self.max_adverse_pct,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "WaveformSample":
+        end_ts_map_raw = d.get("forward_return_end_ts") or {}
+        end_ts_map: dict[int, datetime | None] = {}
+        for k, v in end_ts_map_raw.items():
+            if v is None:
+                end_ts_map[int(k)] = None
+            else:
+                end_ts_map[int(k)] = _parse_ts(v)
         return cls(
             symbol=d["symbol"],
             timeframe=d["timeframe"],
@@ -89,6 +115,7 @@ class WaveformSample:
             },
             max_favorable_pct=d.get("max_favorable_pct"),
             max_adverse_pct=d.get("max_adverse_pct"),
+            forward_return_end_ts=end_ts_map,
         )
 
 
@@ -169,14 +196,24 @@ def build_library(
 
         anchor_close = closes[end - 1]
         forward: dict[int, float | None] = {}
+        # PR #15: also record the wall-clock timestamp of each horizon's
+        # target bar. `target = end - 1 + h` is a bar-count offset into
+        # the SAME df (which already excludes weekend gaps for FX), so
+        # idx[target] is the actual close timestamp the label was
+        # measured at — NOT `end_ts + h * bar_interval`, which double-
+        # counts gaps. Look-ahead-safe filters in backtest must use
+        # this timestamp.
+        forward_end_ts: dict[int, datetime | None] = {}
         for h in horizons:
             target = end - 1 + h
             if target >= n or anchor_close == 0 or not math.isfinite(anchor_close):
                 forward[h] = None
+                forward_end_ts[h] = None
             else:
                 forward[h] = float(
                     100.0 * (closes[target] - anchor_close) / anchor_close
                 )
+                forward_end_ts[h] = _to_dt(idx[target])
 
         max_fav: float | None = None
         max_adv: float | None = None
@@ -199,6 +236,7 @@ def build_library(
             forward_returns_pct=forward,
             max_favorable_pct=max_fav,
             max_adverse_pct=max_adv,
+            forward_return_end_ts=forward_end_ts,
         ))
 
     return samples
