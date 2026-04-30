@@ -50,7 +50,7 @@ def _build_summary(
 ) -> dict:
     rm = result.run_metadata
     assert rm is not None  # validated by caller
-    return {
+    summary = {
         "run_id": rm.run_id,
         "symbol": rm.symbol,
         "interval": rm.timeframe,
@@ -63,6 +63,67 @@ def _build_summary(
         "output_files": dict(output_files),
         "export_gzip": bool(gzip_enabled),
     }
+    # PR #20: r_candidates_summary (R1-R11 hypothesis cells). Computed
+    # from the in-memory traces + reconstructed entry-trace-bound
+    # trades. Pure observation; never read by the engine. Fail-soft —
+    # any exception during compute is recorded as `r_candidates_error`
+    # and the rest of summary.json is unaffected.
+    try:
+        from .decision_trace_r_candidates import compute_r_candidates_summary
+        bound_trades = _build_trades_with_traces(result)
+        test_period = None
+        bar_range = getattr(rm, "bar_range", None) or {}
+        if bar_range.get("start") and bar_range.get("end"):
+            test_period = {
+                "start": str(bar_range["start"]),
+                "end":   str(bar_range["end"]),
+            }
+        summary["r_candidates_summary"] = compute_r_candidates_summary(
+            traces=result.decision_traces,
+            trades=bound_trades,
+            test_period=test_period,
+        )
+    except Exception as e:  # noqa: BLE001
+        summary["r_candidates_error"] = f"{type(e).__name__}: {e}"
+    return summary
+
+
+def _build_trades_with_traces(result: "EngineBacktestResult") -> list[dict]:
+    """Bind each `result.trades[*]` to its entry-bar BarDecisionTrace.
+
+    The R-helper needs `entry_trace` so it can pivot trades by macro /
+    waveform / long-term observations at entry. Lookups are O(N+M)
+    via a `(symbol, entry_ts)` → trace map.
+    """
+    trace_index: dict[tuple, "BarDecisionTrace"] = {}
+    for tr in result.decision_traces:
+        ts = getattr(tr, "timestamp", None)
+        sym = getattr(tr, "symbol", None)
+        if ts and sym:
+            trace_index[(sym, str(ts))] = tr
+    out: list[dict] = []
+    for trade in result.trades:
+        entry_ts = getattr(trade, "entry_ts", None)
+        sym = getattr(trade, "symbol", None) or result.run_metadata.symbol
+        entry_ts_iso = str(entry_ts) if entry_ts is not None else None
+        entry_trace_obj = trace_index.get((sym, entry_ts_iso))
+        # Pass the trace as a dict so the R-helper's `_safe_get` works
+        # uniformly (real BarDecisionTrace exposes attrs; serialised dict
+        # exposes keys; we accept both via _safe_get).
+        out.append({
+            "sym": sym,
+            "side": getattr(trade, "side", None),
+            "entry_ts": entry_ts_iso,
+            "exit_ts": str(getattr(trade, "exit_ts", "")) or None,
+            "exit_reason": getattr(trade, "exit_reason", None),
+            "return_pct": float(getattr(trade, "return_pct", 0.0) or 0.0),
+            "bars_held": int(getattr(trade, "bars_held", 0) or 0),
+            "entry_trace": (
+                entry_trace_obj.to_dict() if entry_trace_obj is not None
+                else None
+            ),
+        })
+    return out
 
 
 def export_run(
