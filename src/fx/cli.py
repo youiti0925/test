@@ -106,21 +106,31 @@ _CALENDAR_POLICY_DISABLED_EMPTY      = "disabled_empty"
 # PR #19: Literature parameter baseline catalog. Always emitted into
 # `run_metadata.parameters` from the research backtest path so a stored
 # trace can be reconciled with the catalog version that produced it.
-# `--parameter-profile` only flips which profile name appears in
-# `parameter_profile`; `applied_to_runtime` is always False because no
-# value here is wired into decide_action / risk_gate. Pinned by
-# `tests/test_parameter_defaults.py::test_parameter_profile_metadata_only_trade_results_identical`.
+# PR #21: when `--apply-parameter-profile` is also supplied, the
+# baseline values are RESOLVED into runtime kwargs and forwarded to
+# `run_engine_backtest`. The metadata flips `applied_to_runtime=True`
+# and emits applied_sections / skipped_sections / applied_values /
+# diff_vs_default. `--parameter-profile X` ALONE remains metadata-only
+# (PR #19 invariant preserved). Live `cmd_trade` never calls this
+# helper, so live behaviour is unaffected.
 def _build_parameters_metadata(
     requested_profile: str | None,
-) -> dict:
-    """Build the run_metadata.parameters block.
+    *,
+    apply_runtime: bool = False,
+) -> tuple[dict, dict]:
+    """Build the run_metadata.parameters block + runtime kwargs.
 
-    `requested_profile` comes from `--parameter-profile`. If None,
-    `parameter_profile` is null and `runtime_profile` is the literal
-    `current_runtime` (i.e. existing constants in decision_engine /
-    risk_gate). If a known profile name is given, it is recorded
-    verbatim — but `applied_to_runtime` stays False until a future PR
-    explicitly wires the catalog into the runtime gate.
+    Returns (parameters_metadata, runtime_kwargs).
+
+    parameters_metadata is the dict folded into `run_metadata.parameters`.
+    runtime_kwargs is what to splat into `run_engine_backtest(**kwargs)`
+      to actually apply the profile to the engine. Empty dict when
+      `apply_runtime` is False, in which case the engine uses its
+      historical defaults (PR #20 main byte-identical).
+
+    `requested_profile` comes from `--parameter-profile`. None +
+    apply_runtime=True → ValueError (CLI must reject; this is a
+    defensive guard).
     """
     from .parameter_defaults import (
         PARAMETER_BASELINE_V1,
@@ -130,6 +140,7 @@ def _build_parameters_metadata(
         baseline_payload_hash,
         KNOWN_PARAMETER_PROFILES,
     )
+    from .runtime_parameters import resolve_runtime_parameters
     if (
         requested_profile is not None
         and requested_profile not in KNOWN_PARAMETER_PROFILES
@@ -138,20 +149,29 @@ def _build_parameters_metadata(
             f"unknown --parameter-profile: {requested_profile!r}. "
             f"Known profiles: {list(KNOWN_PARAMETER_PROFILES)}"
         )
-    return {
+    if apply_runtime and requested_profile is None:
+        raise ValueError(
+            "--apply-parameter-profile requires --parameter-profile to "
+            "be set as well"
+        )
+    runtime_kwargs, runtime_audit = resolve_runtime_parameters(
+        profile_baseline=PARAMETER_BASELINE_V1 if apply_runtime else None,
+        apply_runtime=apply_runtime,
+    )
+    base = {
         "parameter_profile": requested_profile,
-        "runtime_profile": "current_runtime",
+        "runtime_profile": (
+            requested_profile if apply_runtime else "current_runtime"
+        ),
         "baseline_id": PARAMETER_BASELINE_ID,
         "baseline_version": PARAMETER_BASELINE_VERSION,
         "baseline_payload_hash": baseline_payload_hash(PARAMETER_BASELINE_V1),
         "baseline_reference": PARAMETER_BASELINE_ID,
         "baseline_values": dict(PARAMETER_BASELINE_V1),
         "sweep_space_reference": PARAMETER_SWEEP_SPACE_V1.get("sweep_space_id"),
-        # Always False in PR #19. The catalog is metadata-only; nothing
-        # here flows into decide_action / risk_gate. A future PR that
-        # connects a profile to the runtime gate will flip this to True.
-        "applied_to_runtime": False,
     }
+    base.update(runtime_audit)
+    return base, runtime_kwargs
 
 
 def _load_events_for_run(
@@ -1161,24 +1181,45 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
 
     # PR #19: build the literature_baseline_v1 metadata block. This is
     # ALWAYS emitted (regardless of --parameter-profile) so a stored
-    # trace records which catalog version was current at run time. The
-    # block is metadata-only; nothing here flows into decide_action.
+    # trace records which catalog version was current at run time.
+    # PR #21: when `--apply-parameter-profile` is also supplied, the
+    # baseline values are RESOLVED into runtime kwargs that flow to
+    # `run_engine_backtest`. Without that flag, runtime is unchanged
+    # (PR #19 invariant preserved).
     try:
-        parameters_metadata = _build_parameters_metadata(
+        parameters_metadata, runtime_kwargs = _build_parameters_metadata(
             getattr(args, "parameter_profile", None),
+            apply_runtime=bool(getattr(args, "apply_parameter_profile", False)),
         )
     except ValueError as e:
         print(f"[error] {e}", file=sys.stderr)
         return 2
+
+    # When PR #21 runtime apply is on, the resolved profile values
+    # override stop_atr_mult / tp_atr_mult / max_holding_bars. CLI args
+    # (--stop-atr etc.) take precedence ONLY when the user did NOT
+    # request profile apply — otherwise the profile wins.
+    _stop_atr_mult = (
+        runtime_kwargs.get("stop_atr_mult", args.stop_atr)
+        if runtime_kwargs else args.stop_atr
+    )
+    _tp_atr_mult = (
+        runtime_kwargs.get("tp_atr_mult", args.tp_atr)
+        if runtime_kwargs else args.tp_atr
+    )
+    _max_holding_bars = (
+        runtime_kwargs.get("max_holding_bars", args.max_holding_bars)
+        if runtime_kwargs else args.max_holding_bars
+    )
 
     result = run_engine_backtest(
         df,
         symbol=args.symbol,
         interval=args.interval,
         warmup=args.warmup,
-        stop_atr_mult=args.stop_atr,
-        tp_atr_mult=args.tp_atr,
-        max_holding_bars=args.max_holding_bars,
+        stop_atr_mult=_stop_atr_mult,
+        tp_atr_mult=_tp_atr_mult,
+        max_holding_bars=_max_holding_bars,
         events=events,
         use_higher_tf=not args.no_higher_tf,
         macro=macro,
@@ -1188,6 +1229,17 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
         context_days=context_days,
         calendar=calendar_metadata,
         parameters=parameters_metadata,
+        # PR #21 indicator-period overrides (None when apply_runtime=False
+        # → engine uses its existing defaults)
+        rsi_period=runtime_kwargs.get("rsi_period"),
+        rsi_overbought=runtime_kwargs.get("rsi_overbought"),
+        rsi_oversold=runtime_kwargs.get("rsi_oversold"),
+        macd_fast=runtime_kwargs.get("macd_fast"),
+        macd_slow=runtime_kwargs.get("macd_slow"),
+        macd_signal_period=runtime_kwargs.get("macd_signal"),
+        bb_period=runtime_kwargs.get("bb_period"),
+        bb_std=runtime_kwargs.get("bb_std"),
+        atr_period=runtime_kwargs.get("atr_period"),
     )
     metrics = result.metrics()
     start_date = str(df.index[0])
@@ -2240,16 +2292,34 @@ def build_parser() -> argparse.ArgumentParser:
     be.add_argument("--parameter-profile", default=None,
                     help="Literature parameter catalog profile to record "
                          "in run_metadata.parameters. PR #19: "
-                         "METADATA-ONLY. Even with "
+                         "METADATA-ONLY by default. Even with "
                          "`--parameter-profile literature_baseline_v1` "
-                         "the runtime gate / decide_action / risk_gate "
-                         "values are unchanged — `applied_to_runtime` "
-                         "stays False. trade list / metrics / "
-                         "hold_reasons / equity_curve are byte-identical "
-                         "with or without this flag (pinned by "
+                         "alone the runtime gate / decide_action / "
+                         "risk_gate values are unchanged — "
+                         "`applied_to_runtime` stays False. trade list "
+                         "/ metrics / hold_reasons / equity_curve are "
+                         "byte-identical with or without this flag "
+                         "(pinned by "
                          "test_parameter_profile_metadata_only_trade_"
-                         "results_identical). Unknown profile names are "
-                         "rejected with exit code 2.")
+                         "results_identical). To actually apply the "
+                         "profile to backtest runtime, ALSO pass "
+                         "--apply-parameter-profile. Unknown profile "
+                         "names are rejected with exit code 2.")
+    be.add_argument("--apply-parameter-profile", action="store_true",
+                    help="PR #21: actually apply the catalog selected "
+                         "by --parameter-profile to the backtest "
+                         "engine's runtime. Backtest-only — live "
+                         "(cmd_trade --broker oanda) and paper paths "
+                         "are unaffected. Without this flag, "
+                         "--parameter-profile stays metadata-only "
+                         "(PR #19 invariant preserved). Requires "
+                         "--parameter-profile X; passing this flag "
+                         "alone is rejected with exit code 2. "
+                         "literature_baseline_v1 differs from "
+                         "current_runtime defaults ONLY on "
+                         "stop_atr_mult (1.5 vs 2.0); other "
+                         "indicator periods / thresholds already "
+                         "match current defaults.")
     be.add_argument("--trace-out", default=None,
                     help="Directory to write run_metadata.json / "
                          "decision_traces.jsonl / summary.json. Skip the "

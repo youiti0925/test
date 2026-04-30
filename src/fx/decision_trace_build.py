@@ -150,7 +150,32 @@ def technical_slice(
     atr_value: float | None,
     technical_only_action: str,
     technical_reason_codes: list[str],
+    *,
+    runtime_overrides: dict | None = None,
 ) -> TechnicalSlice:
+    """Build the TechnicalSlice for the trace.
+
+    PR #21: `runtime_overrides` (when not None) carries the actually-
+    used indicator periods / thresholds / multipliers at this run, so
+    a trace consumer can audit how `Snapshot.rsi_14` (whose name does
+    NOT change) was actually computed. None preserves the pre-PR-#21
+    `*_used = None` defaults — older trace files keep parsing.
+    """
+    overrides = runtime_overrides or {}
+    used = {
+        "rsi_period_used":         overrides.get("rsi_period"),
+        "rsi_overbought_used":     overrides.get("rsi_overbought"),
+        "rsi_oversold_used":       overrides.get("rsi_oversold"),
+        "macd_fast_used":          overrides.get("macd_fast"),
+        "macd_slow_used":          overrides.get("macd_slow"),
+        "macd_signal_used":        overrides.get("macd_signal"),
+        "bb_period_used":          overrides.get("bb_period"),
+        "bb_std_used":             overrides.get("bb_std"),
+        "atr_period_used":         overrides.get("atr_period"),
+        "stop_atr_mult_used":      overrides.get("stop_atr_mult"),
+        "tp_atr_mult_used":        overrides.get("tp_atr_mult"),
+        "max_holding_bars_used":   overrides.get("max_holding_bars"),
+    }
     if snap is None:
         return TechnicalSlice(
             rsi_14=float("nan"), macd=0.0, macd_signal=0.0, macd_hist=0.0,
@@ -161,6 +186,7 @@ def technical_slice(
             technical_only_action=technical_only_action,
             technical_reason_codes=tuple(technical_reason_codes),
             reason_derivation="snapshot_unavailable",
+            **used,
         )
     return TechnicalSlice(
         rsi_14=snap.rsi_14, macd=snap.macd, macd_signal=snap.macd_signal,
@@ -172,6 +198,7 @@ def technical_slice(
         technical_only_action=technical_only_action,
         technical_reason_codes=tuple(technical_reason_codes),
         reason_derivation="shared_scoring_helper",
+        **used,
     )
 
 
@@ -1606,12 +1633,15 @@ def build_atr_unavailable_trace(
     macro: MacroSnapshot | None = None,
     waveform_bias: dict | None = None,
     long_term_trend_override: LongTermTrendSlice | None = None,
+    runtime_overrides: dict | None = None,
 ) -> BarDecisionTrace:
     """Trace for a bar where ATR is NaN — engine bailed before decide()."""
     from .backtest_engine import _position_dict  # local import to avoid cycle
 
     market = market_slice(df, i, data_source)
-    technical = technical_slice(None, None, "HOLD", [])
+    technical = technical_slice(
+        None, None, "HOLD", [], runtime_overrides=runtime_overrides,
+    )
     waveform = waveform_slice(
         None, None, market.close, waveform_bias=waveform_bias,
     )
@@ -1762,10 +1792,20 @@ def build_full_trace(
     macro: MacroSnapshot | None = None,
     waveform_bias: dict | None = None,
     long_term_trend_override: LongTermTrendSlice | None = None,
+    runtime_overrides: dict | None = None,
 ) -> BarDecisionTrace:
-    """Full trace for a normally processed bar."""
+    """Full trace for a normally processed bar.
+
+    `runtime_overrides` (PR #21): when the engine ran with
+    `--apply-parameter-profile`, the resolved per-bar indicator
+    settings are passed here so `TechnicalSlice.*_used` audit fields
+    can be populated. None for default-runtime traces.
+    """
     market = market_slice(df, i, data_source)
-    technical = technical_slice(snap, atr_value, tech, tech_reason_codes)
+    technical = technical_slice(
+        snap, atr_value, tech, tech_reason_codes,
+        runtime_overrides=runtime_overrides,
+    )
     waveform = waveform_slice(
         pattern, atr_value, market.close, waveform_bias=waveform_bias,
     )
