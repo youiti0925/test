@@ -163,6 +163,13 @@ def test_long_term_trend_to_dict_roundtrips_known_keys():
         "close_vs_sma_200d_pct",
         "weekly_return_pct", "monthly_return_pct", "quarterly_return_pct",
         "bars_available", "unavailable_reasons",
+        # PR #20 observation-only additions (SMA50 + monthly audit)
+        "sma_50d", "close_vs_sma_50d_pct",
+        "sma_50_vs_sma_200_pct", "sma_50_200_state",
+        "monthly_volatility_pct", "monthly_slope_per_bar",
+        "monthly_trend_classification_inputs",
+        "monthly_trend_classification_threshold",
+        "monthly_trend_classification_reason",
     }
     assert set(d.keys()) == expected_keys
 

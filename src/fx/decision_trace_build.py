@@ -309,6 +309,7 @@ def long_term_trend_slice(df: pd.DataFrame, i: int) -> LongTermTrendSlice:
         return v
 
     sma30 = _sma_daily(30)
+    sma50 = _sma_daily(50)
     sma90 = _sma_daily(90)
     sma200 = _sma_daily(200)
 
@@ -316,6 +317,25 @@ def long_term_trend_slice(df: pd.DataFrame, i: int) -> LongTermTrendSlice:
         if sma is None or sma == 0 or not np.isfinite(sma):
             return None
         return 100.0 * (close_now - sma) / sma
+
+    # PR #20: SMA50/200 cross state. Observation-only — never read by
+    # decide_action. Dead band keeps the state stable across noise.
+    if sma50 is not None and sma200 is not None and sma200 > 0:
+        sma_50_vs_sma_200_pct = 100.0 * (sma50 - sma200) / sma200
+        if not np.isfinite(sma_50_vs_sma_200_pct):
+            sma_50_vs_sma_200_pct = None
+            sma_50_200_state = "UNKNOWN"
+        else:
+            band = _SMA_50_200_DEAD_BAND_PCT
+            if sma_50_vs_sma_200_pct >= band:
+                sma_50_200_state = "BULLISH"
+            elif sma_50_vs_sma_200_pct <= -band:
+                sma_50_200_state = "BEARISH"
+            else:
+                sma_50_200_state = "NEUTRAL"
+    else:
+        sma_50_vs_sma_200_pct = None
+        sma_50_200_state = "UNKNOWN"
 
     # N-day returns: take the most recent close at-or-before ts_now − N.
     def _ret_back(days: int) -> float | None:
@@ -344,6 +364,20 @@ def long_term_trend_slice(df: pd.DataFrame, i: int) -> LongTermTrendSlice:
     # Pandas accepts "1MS" (month start) for monthly resample.
     monthly_trend = _resample_trend(window, "1MS")
 
+    # PR #20: monthly_trend classification audit. Computed from the same
+    # daily_closes series used for SMA, with a 30-day window. Records
+    # the inputs (return / slope / volatility) and the threshold used,
+    # so verification can pinpoint whether all-RANGE labels are because
+    # the inputs are genuinely calm or because the threshold is strict.
+    # Classification logic itself is unchanged — those labels still come
+    # from `_resample_trend` above.
+    monthly_audit = _monthly_trend_audit(
+        daily_closes=daily_closes,
+        ts_now=ts_now,
+        monthly_label=monthly_trend,
+        monthly_return_pct=monthly_ret,
+    )
+
     return LongTermTrendSlice(
         daily_trend=daily_trend,
         weekly_trend=weekly_trend,
@@ -359,7 +393,183 @@ def long_term_trend_slice(df: pd.DataFrame, i: int) -> LongTermTrendSlice:
         quarterly_return_pct=quarterly_ret,
         bars_available=n_bars,
         unavailable_reasons=dict(unavailable),
+        # PR #20 observation-only additions
+        sma_50d=sma50,
+        close_vs_sma_50d_pct=_close_vs_sma(sma50),
+        sma_50_vs_sma_200_pct=sma_50_vs_sma_200_pct,
+        sma_50_200_state=sma_50_200_state,
+        monthly_volatility_pct=monthly_audit["volatility_pct"],
+        monthly_slope_per_bar=monthly_audit["slope_per_bar"],
+        monthly_trend_classification_inputs=monthly_audit["inputs"],
+        monthly_trend_classification_threshold=monthly_audit["thresholds"],
+        monthly_trend_classification_reason=monthly_audit["reason"],
     )
+
+
+# ───────────────────────────────────────────────────────────────────────
+# PR #20 observation constants — NOT in PARAMETER_BASELINE_V1 because
+# adding them there would change `baseline_payload_hash`. These are
+# trace/stats-side analysis thresholds, not trading parameters.
+# ───────────────────────────────────────────────────────────────────────
+
+# SMA50/200 cross dead band (% of SMA200). Below the band the state
+# stays NEUTRAL. 0.5% picked to keep noise from flipping state on
+# every bar.
+_SMA_50_200_DEAD_BAND_PCT: float = 0.5
+
+# DXY trend bucket thresholds. Bucket boundaries are open on the high
+# side: `STRONG_UP` is `>=2.0%`. `_dxy_trend_bucket()` is the canonical
+# classifier; the same numbers feed
+# `r_candidates_summary.thresholds.dxy_trend_bucket`.
+_DXY_TREND_BUCKET_THRESHOLDS: dict[str, float] = {
+    "strong_down": -2.0,
+    "down":        -0.5,
+    "up":           0.5,
+    "strong_up":    2.0,
+}
+
+# DXY z-score bucket thresholds. Symmetric around 0; uses 20d z-score.
+_DXY_ZSCORE_BUCKET_THRESHOLDS: dict[str, float] = {
+    "extreme_low":  -2.0,
+    "low":          -1.0,
+    "high":          1.0,
+    "extreme_high":  2.0,
+}
+
+# Shadow outcome direction threshold (% return). Below this in absolute
+# value, blocked_outcome_direction is FLAT.
+_SHADOW_OUTCOME_THRESHOLD_PCT: float = 0.3
+
+
+def _dxy_trend_bucket(return_pct: float | None) -> str | None:
+    if return_pct is None or not np.isfinite(return_pct):
+        return None
+    t = _DXY_TREND_BUCKET_THRESHOLDS
+    if return_pct < t["strong_down"]: return "STRONG_DOWN"
+    if return_pct < t["down"]:        return "DOWN"
+    if return_pct < t["up"]:          return "FLAT"
+    if return_pct < t["strong_up"]:   return "UP"
+    return "STRONG_UP"
+
+
+def _dxy_zscore_bucket(z: float | None) -> str | None:
+    if z is None or not np.isfinite(z):
+        return None
+    t = _DXY_ZSCORE_BUCKET_THRESHOLDS
+    if z < t["extreme_low"]:  return "EXTREME_LOW"
+    if z < t["low"]:          return "LOW"
+    if z < t["high"]:         return "NEUTRAL"
+    if z < t["extreme_high"]: return "HIGH"
+    return "EXTREME_HIGH"
+
+
+def _shadow_outcome_direction(return_pct: float | None) -> str | None:
+    """UP / DOWN / FLAT classification for shadow forward return."""
+    if return_pct is None or not np.isfinite(return_pct):
+        return None
+    th = _SHADOW_OUTCOME_THRESHOLD_PCT
+    if return_pct >= th: return "UP"
+    if return_pct <= -th: return "DOWN"
+    return "FLAT"
+
+
+def _shadow_outcome_bucket(
+    return_pct: float | None, technical_only_action: str | None
+) -> str | None:
+    """STRONG_FOR / FOR / NEUTRAL / AGAINST / STRONG_AGAINST relative
+    to `technical_only_action`. Used by r_candidates_v1 to compute
+    PROTECTED / COST_OPPORTUNITY / WIN_MISSED / LOSS_AVOIDED.
+    """
+    if return_pct is None or not np.isfinite(return_pct):
+        return None
+    if technical_only_action not in ("BUY", "SELL"):
+        # No directional intent to compare against.
+        return "NEUTRAL"
+    # Sign relative to direction we WOULD have taken.
+    if technical_only_action == "BUY":
+        signed = return_pct
+    else:  # SELL
+        signed = -return_pct
+    th = _SHADOW_OUTCOME_THRESHOLD_PCT
+    strong_th = th * 3.0  # ~0.9% — strong move
+    if signed >= strong_th:  return "STRONG_FOR"
+    if signed >= th:         return "FOR"
+    if signed <= -strong_th: return "STRONG_AGAINST"
+    if signed <= -th:        return "AGAINST"
+    return "NEUTRAL"
+
+
+def _monthly_trend_audit(
+    *, daily_closes: pd.Series, ts_now: pd.Timestamp,
+    monthly_label: str, monthly_return_pct: float | None,
+) -> dict:
+    """Expose the inputs and thresholds behind the monthly_trend label.
+
+    The classification itself stays in `_resample_trend(..., "1MS")`;
+    this function only computes the diagnostic side-channels — return
+    / slope / volatility on the trailing 30 daily closes plus the
+    threshold values used downstream so verification can answer "why
+    is monthly_trend RANGE for every bar?".
+    """
+    out: dict = {
+        "volatility_pct": None,
+        "slope_per_bar": None,
+        "inputs": None,
+        "thresholds": {
+            "trend_threshold_pct": 2.0,   # patterns.analyse default range guard
+            "range_threshold_pct": 1.0,   # |return| <= range_threshold => RANGE
+            "volatile_threshold_pct": 5.0,  # daily stdev that flips to VOLATILE
+            "n_bars_required": 30,
+        },
+        "reason": None,
+    }
+    if daily_closes is None or len(daily_closes) < 30:
+        out["reason"] = "insufficient_history"
+        return out
+    # Trailing 30 daily closes (calendar days; weekends already dropped).
+    cutoff = ts_now - pd.Timedelta(days=30)
+    window = daily_closes.loc[daily_closes.index <= ts_now].tail(30)
+    if len(window) < 30:
+        out["reason"] = "insufficient_history"
+        return out
+    closes_arr = window.astype(float).to_numpy()
+    # Daily log-returns volatility (annualised-style not needed here —
+    # raw daily stdev is what _resample_trend's classifier sees).
+    daily_pct = (closes_arr[1:] / closes_arr[:-1] - 1.0) * 100.0
+    daily_pct = daily_pct[np.isfinite(daily_pct)]
+    if len(daily_pct) >= 2:
+        vol_pct = float(np.std(daily_pct, ddof=1))
+    else:
+        vol_pct = None
+    # Linear slope per bar via simple least-squares on enumerated index.
+    xs = np.arange(len(closes_arr), dtype=float)
+    if len(closes_arr) >= 2 and np.std(xs) > 0:
+        slope = float(np.polyfit(xs, closes_arr, 1)[0])
+        if not np.isfinite(slope): slope = None
+    else:
+        slope = None
+    out["volatility_pct"] = vol_pct
+    out["slope_per_bar"] = slope
+    out["inputs"] = {
+        "return_pct": monthly_return_pct,
+        "slope_per_bar": slope,
+        "volatility_pct": vol_pct,
+        "n_bars_used": int(len(closes_arr)),
+    }
+    # Reason classification — diagnostic only; matches _resample_trend
+    # observation pattern.
+    th = out["thresholds"]
+    if monthly_return_pct is None:
+        out["reason"] = "return_unavailable"
+    elif vol_pct is not None and vol_pct >= th["volatile_threshold_pct"]:
+        out["reason"] = "volatility_above_volatile_threshold"
+    elif abs(monthly_return_pct) <= th["range_threshold_pct"]:
+        out["reason"] = "return_within_range_threshold"
+    elif abs(monthly_return_pct) < th["trend_threshold_pct"]:
+        out["reason"] = "return_below_trend_threshold"
+    else:
+        out["reason"] = "return_above_trend_threshold"
+    return out
 
 
 # Macro slots we expose in the trace. Order is the canonical export order.
@@ -449,6 +659,11 @@ def macro_context_slice(
     one_day = pd.Timedelta(days=1)
     five_days = pd.Timedelta(days=5)
 
+    # PR #20: DXY return / z-score / bucket observability. Look-ahead-safe
+    # by construction — we filter the raw macro series to entries whose
+    # index <= ts_lookup before computing window stats.
+    dxy_obs = _dxy_observability(macro, ts_lookup)
+
     return MacroContextSlice(
         us10y=levels["us10y"],
         us_short_yield_proxy=levels["us_short_yield_proxy"],
@@ -469,7 +684,104 @@ def macro_context_slice(
         available_slots=tuple(available),
         missing_slots=tuple(missing),
         fetch_errors=dict(macro.fetch_errors),
+        # PR #20 observation-only DXY trend / z-score
+        dxy_return_5d_pct=dxy_obs["return_5d_pct"],
+        dxy_return_20d_pct=dxy_obs["return_20d_pct"],
+        dxy_zscore_20d=dxy_obs["zscore_20d"],
+        dxy_zscore_60d=dxy_obs["zscore_60d"],
+        dxy_trend_5d_bucket=_dxy_trend_bucket(dxy_obs["return_5d_pct"]),
+        dxy_trend_20d_bucket=_dxy_trend_bucket(dxy_obs["return_20d_pct"]),
+        dxy_zscore_bucket=_dxy_zscore_bucket(dxy_obs["zscore_20d"]),
+        dxy_unavailable_reason=dxy_obs["unavailable_reason"],
     )
+
+
+def _dxy_observability(
+    macro: MacroSnapshot, ts_lookup: pd.Timestamp,
+) -> dict:
+    """Compute DXY return (5d/20d) + z-score (20d/60d) at `ts_lookup`.
+
+    Look-ahead-safe: filters the raw macro series to entries with
+    `index <= ts_lookup` before any window operation. Reasons:
+      - `MacroSnapshot.value_at` gives the level at ts via Series.asof.
+      - For window stats we need the actual dated points, not just the
+        latest level — hence direct series access here.
+
+    Returns a dict with `return_5d_pct`, `return_20d_pct`,
+    `zscore_20d`, `zscore_60d`, `unavailable_reason`. Stdev=0 → None
+    (per Q-clarification: never raise on degenerate inputs).
+    """
+    out: dict = {
+        "return_5d_pct": None,
+        "return_20d_pct": None,
+        "zscore_20d": None,
+        "zscore_60d": None,
+        "unavailable_reason": None,
+    }
+    series = macro.series.get("dxy") if macro is not None else None
+    if series is None or series.empty:
+        out["unavailable_reason"] = "dxy_series_unavailable"
+        return out
+    try:
+        s = series.loc[series.index <= ts_lookup].dropna()
+    except (KeyError, TypeError):
+        out["unavailable_reason"] = "dxy_index_compare_failed"
+        return out
+    if s.empty:
+        out["unavailable_reason"] = "dxy_no_history_at_or_before_ts"
+        return out
+    s = s.astype(float)
+    now_val = float(s.iloc[-1])
+    if not np.isfinite(now_val) or now_val == 0:
+        out["unavailable_reason"] = "dxy_current_value_invalid"
+        return out
+
+    def _ret_n_days(n: int) -> float | None:
+        cutoff = ts_lookup - pd.Timedelta(days=n)
+        prior = s.loc[s.index <= cutoff]
+        if prior.empty:
+            return None
+        ref = float(prior.iloc[-1])
+        if ref == 0 or not np.isfinite(ref):
+            return None
+        v = 100.0 * (now_val - ref) / ref
+        return v if np.isfinite(v) else None
+
+    out["return_5d_pct"] = _ret_n_days(5)
+    out["return_20d_pct"] = _ret_n_days(20)
+
+    def _zscore_n_days(n: int) -> float | None:
+        cutoff = ts_lookup - pd.Timedelta(days=n)
+        window_s = s.loc[s.index >= cutoff]
+        # Need at least ~n/2 observations for a meaningful z-score on
+        # daily macro (DXY trades ~5 days/week, so 20d ≈ 14 obs).
+        if len(window_s) < max(5, n // 2):
+            return None
+        arr = window_s.to_numpy()
+        arr = arr[np.isfinite(arr)]
+        if len(arr) < 2:
+            return None
+        mu = float(np.mean(arr))
+        sd = float(np.std(arr, ddof=1))
+        if sd == 0 or not np.isfinite(sd):
+            # degenerate window — record reason on the first hit only
+            if out["unavailable_reason"] is None:
+                out["unavailable_reason"] = f"stdev_zero_in_{n}d_window"
+            return None
+        z = (now_val - mu) / sd
+        return float(z) if np.isfinite(z) else None
+
+    out["zscore_20d"] = _zscore_n_days(20)
+    out["zscore_60d"] = _zscore_n_days(60)
+
+    # If everything succeeded, leave unavailable_reason None.
+    if (
+        out["return_5d_pct"] is None and out["return_20d_pct"] is None
+        and out["zscore_20d"] is None and out["zscore_60d"] is None
+        and out["unavailable_reason"] is None
+    ):
+        out["unavailable_reason"] = "insufficient_history_for_5d_and_20d"
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1677,6 +1989,30 @@ def populate_future_outcomes(
         else:
             gate_effect = "NO_CHANGE"
 
+        # PR #20: lightweight shadow future outcome on blocked bars.
+        # Populated only when `decision.blocked_by` is non-empty so the
+        # PR #19 verification's COST_OPPORTUNITY / PROTECTED / WIN_MISSED
+        # / LOSS_AVOIDED tally has a target population. Re-uses the same
+        # 24-bar forward window already computed above; this is purely
+        # an EX-POST diagnostic — never read by decide_action / risk_gate.
+        was_blocked = bool(getattr(trace.decision, "blocked_by", ()) or ())
+        if was_blocked:
+            blocked_ret_24h = future_buy["24h"]   # signed forward return
+            # `if_buy` and `if_sell` mirror the convention used by the
+            # main future_outcome fields (sell return = -buy return).
+            blocked_ret_buy = future_buy["24h"]
+            blocked_ret_sell = future_sell["24h"]
+            blocked_dir = _shadow_outcome_direction(blocked_ret_24h)
+            blocked_bucket = _shadow_outcome_bucket(
+                blocked_ret_24h, tech_action,
+            )
+        else:
+            blocked_ret_24h = None
+            blocked_ret_buy = None
+            blocked_ret_sell = None
+            blocked_dir = None
+            blocked_bucket = None
+
         trace.future_outcome = FutureOutcomeSlice(
             horizons_bars={k: int(v) if v is not None else None for k, v in horizons.items()},
             future_return_1h_if_buy_pct=future_buy["1h"],
@@ -1697,6 +2033,12 @@ def populate_future_outcomes(
             hypothetical_technical_trade_exit_price=hyp_price,
             hypothetical_technical_trade_bars_held=hyp_bars,
             hypothetical_technical_trade_return_pct=hyp_ret,
+            # PR #20 shadow outcome (blocked-bars only)
+            blocked_future_return_24h_pct=blocked_ret_24h,
+            blocked_future_return_24h_if_buy_pct=blocked_ret_buy,
+            blocked_future_return_24h_if_sell_pct=blocked_ret_sell,
+            blocked_outcome_direction=blocked_dir,
+            blocked_outcome_bucket=blocked_bucket,
         )
 
 

@@ -420,20 +420,63 @@ class LongTermTrendSlice:
     bars_available: int
     unavailable_reasons: dict
 
+    # PR #20: SMA50 observability. literature_baseline_v1 records SMA50 as
+    # the canonical fast SMA but pre-PR-#20 traces only carried 30/90/200.
+    # Adding 50d alongside keeps backward compat (older traces still parse,
+    # these fields default to None on the dataclass — populated by
+    # `long_term_trend_slice`). NOT used by decide_action / risk_gate.
+    sma_50d: float | None = None
+    close_vs_sma_50d_pct: float | None = None
+    sma_50_vs_sma_200_pct: float | None = None
+    # `BULLISH` (sma50 >= sma200 × (1 + dead_band)) /
+    # `BEARISH` (sma50 <= sma200 × (1 − dead_band)) /
+    # `NEUTRAL` (within dead band) / `UNKNOWN` (data unavailable).
+    # Dead band is `_SMA_50_200_DEAD_BAND_PCT` (default 0.5%) — observation
+    # constant, NOT in PARAMETER_BASELINE_V1 (would change baseline hash).
+    sma_50_200_state: str | None = None
+
+    # PR #20: monthly_trend classification audit. The catalog re-verification
+    # found 5666/5666 bars labelled RANGE — these fields expose the
+    # classification inputs (return / slope / volatility) and the threshold
+    # actually used so the all-RANGE pattern can be diagnosed without
+    # changing the classification logic itself.
+    monthly_volatility_pct: float | None = None
+    monthly_slope_per_bar: float | None = None
+    monthly_trend_classification_inputs: dict | None = None
+    monthly_trend_classification_threshold: dict | None = None
+    monthly_trend_classification_reason: str | None = None
+
     def to_dict(self) -> dict:
         return {
             "daily_trend": self.daily_trend,
             "weekly_trend": self.weekly_trend,
             "monthly_trend": self.monthly_trend,
             "sma_30d": self.sma_30d,
+            "sma_50d": self.sma_50d,
             "sma_90d": self.sma_90d,
             "sma_200d": self.sma_200d,
             "close_vs_sma_30d_pct": self.close_vs_sma_30d_pct,
+            "close_vs_sma_50d_pct": self.close_vs_sma_50d_pct,
             "close_vs_sma_90d_pct": self.close_vs_sma_90d_pct,
             "close_vs_sma_200d_pct": self.close_vs_sma_200d_pct,
+            "sma_50_vs_sma_200_pct": self.sma_50_vs_sma_200_pct,
+            "sma_50_200_state": self.sma_50_200_state,
             "weekly_return_pct": self.weekly_return_pct,
             "monthly_return_pct": self.monthly_return_pct,
             "quarterly_return_pct": self.quarterly_return_pct,
+            "monthly_volatility_pct": self.monthly_volatility_pct,
+            "monthly_slope_per_bar": self.monthly_slope_per_bar,
+            "monthly_trend_classification_inputs": (
+                dict(self.monthly_trend_classification_inputs)
+                if self.monthly_trend_classification_inputs is not None else None
+            ),
+            "monthly_trend_classification_threshold": (
+                dict(self.monthly_trend_classification_threshold)
+                if self.monthly_trend_classification_threshold is not None else None
+            ),
+            "monthly_trend_classification_reason": (
+                self.monthly_trend_classification_reason
+            ),
             "bars_available": self.bars_available,
             "unavailable_reasons": dict(self.unavailable_reasons),
         }
@@ -488,6 +531,29 @@ class MacroContextSlice:
     missing_slots: tuple[str, ...]
     fetch_errors: dict
 
+    # PR #20: DXY trend / return / z-score observability. R5
+    # (DXY trend × USD exposure × outcome) was un-evaluable in the
+    # PR-#19 verification because trace had only `dxy` level — no
+    # historical context. These fields close that gap. ALL
+    # observation-only — never read by decide_action / risk_gate.
+    # Returns are calendar-day basis (not bars) per Q-clarification.
+    # `*_unavailable_reason` carries the structured reason when a
+    # field is None (e.g. "insufficient_history_for_20d", "stdev_zero").
+    dxy_return_5d_pct: float | None = None
+    dxy_return_20d_pct: float | None = None
+    dxy_zscore_20d: float | None = None
+    dxy_zscore_60d: float | None = None
+    # Buckets: STRONG_DOWN (<-2%) / DOWN (-2..-0.5%) / FLAT (-0.5..0.5%) /
+    # UP (0.5..2%) / STRONG_UP (>=2%). Thresholds live in
+    # `_DXY_TREND_BUCKET_THRESHOLDS` in decision_trace_build.py.
+    dxy_trend_5d_bucket: str | None = None
+    dxy_trend_20d_bucket: str | None = None
+    # Z-score bucket (uses 20d z-score by default):
+    # EXTREME_LOW (<-2) / LOW (-2..-1) / NEUTRAL (-1..1) /
+    # HIGH (1..2) / EXTREME_HIGH (>=2).
+    dxy_zscore_bucket: str | None = None
+    dxy_unavailable_reason: str | None = None
+
     def to_dict(self) -> dict:
         return {
             "us10y": self.us10y,
@@ -500,6 +566,14 @@ class MacroContextSlice:
             "nikkei": self.nikkei,
             "dxy_change_24h_pct": self.dxy_change_24h_pct,
             "dxy_change_5d_pct": self.dxy_change_5d_pct,
+            "dxy_return_5d_pct": self.dxy_return_5d_pct,
+            "dxy_return_20d_pct": self.dxy_return_20d_pct,
+            "dxy_zscore_20d": self.dxy_zscore_20d,
+            "dxy_zscore_60d": self.dxy_zscore_60d,
+            "dxy_trend_5d_bucket": self.dxy_trend_5d_bucket,
+            "dxy_trend_20d_bucket": self.dxy_trend_20d_bucket,
+            "dxy_zscore_bucket": self.dxy_zscore_bucket,
+            "dxy_unavailable_reason": self.dxy_unavailable_reason,
             "us10y_change_24h_bp": self.us10y_change_24h_bp,
             "us10y_change_5d_bp": self.us10y_change_5d_bp,
             "yield_spread_change_5d_bp": self.yield_spread_change_5d_bp,
@@ -670,6 +744,26 @@ class FutureOutcomeSlice:
     hypothetical_technical_trade_exit_price: float | None
     hypothetical_technical_trade_bars_held: int | None
     hypothetical_technical_trade_return_pct: float | None
+
+    # PR #20: Lightweight shadow future outcome for blocked bars.
+    # Populated when `decision.blocked_by` is non-empty so PR #19
+    # verification's COST_OPPORTUNITY / PROTECTED / WIN_MISSED /
+    # LOSS_AVOIDED tally can be computed retroactively. Forward-looking
+    # by design — these fields are EX-POST DIAGNOSTIC ONLY and are
+    # NEVER passed back to decide_action or risk_gate. Default None
+    # so non-blocked bars and pre-PR-#20 traces keep the same shape.
+    blocked_future_return_24h_pct: float | None = None
+    blocked_future_return_24h_if_buy_pct: float | None = None
+    blocked_future_return_24h_if_sell_pct: float | None = None
+    # `UP` / `DOWN` / `FLAT`. Threshold for FLAT is
+    # `_SHADOW_OUTCOME_THRESHOLD_PCT` (default 0.3%) in
+    # decision_trace_build.py — observation constant, NOT in
+    # PARAMETER_BASELINE_V1 (would change baseline hash).
+    blocked_outcome_direction: str | None = None
+    # Bucket relative to `decision.technical_only_action`:
+    #   STRONG_FOR / FOR / NEUTRAL / AGAINST / STRONG_AGAINST.
+    # Used by `r_candidates_v1` to compute PROTECTED / COST_OPPORTUNITY.
+    blocked_outcome_bucket: str | None = None
 
     def to_dict(self) -> dict:
         return _scalar_dict(self.__dict__)
