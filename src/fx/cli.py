@@ -103,6 +103,57 @@ _CALENDAR_POLICY_DISABLED_UNREADABLE = "disabled_unreadable"
 _CALENDAR_POLICY_DISABLED_EMPTY      = "disabled_empty"
 
 
+# PR #19: Literature parameter baseline catalog. Always emitted into
+# `run_metadata.parameters` from the research backtest path so a stored
+# trace can be reconciled with the catalog version that produced it.
+# `--parameter-profile` only flips which profile name appears in
+# `parameter_profile`; `applied_to_runtime` is always False because no
+# value here is wired into decide_action / risk_gate. Pinned by
+# `tests/test_parameter_defaults.py::test_parameter_profile_metadata_only_trade_results_identical`.
+def _build_parameters_metadata(
+    requested_profile: str | None,
+) -> dict:
+    """Build the run_metadata.parameters block.
+
+    `requested_profile` comes from `--parameter-profile`. If None,
+    `parameter_profile` is null and `runtime_profile` is the literal
+    `current_runtime` (i.e. existing constants in decision_engine /
+    risk_gate). If a known profile name is given, it is recorded
+    verbatim — but `applied_to_runtime` stays False until a future PR
+    explicitly wires the catalog into the runtime gate.
+    """
+    from .parameter_defaults import (
+        PARAMETER_BASELINE_V1,
+        PARAMETER_BASELINE_ID,
+        PARAMETER_BASELINE_VERSION,
+        PARAMETER_SWEEP_SPACE_V1,
+        baseline_payload_hash,
+        KNOWN_PARAMETER_PROFILES,
+    )
+    if (
+        requested_profile is not None
+        and requested_profile not in KNOWN_PARAMETER_PROFILES
+    ):
+        raise ValueError(
+            f"unknown --parameter-profile: {requested_profile!r}. "
+            f"Known profiles: {list(KNOWN_PARAMETER_PROFILES)}"
+        )
+    return {
+        "parameter_profile": requested_profile,
+        "runtime_profile": "current_runtime",
+        "baseline_id": PARAMETER_BASELINE_ID,
+        "baseline_version": PARAMETER_BASELINE_VERSION,
+        "baseline_payload_hash": baseline_payload_hash(PARAMETER_BASELINE_V1),
+        "baseline_reference": PARAMETER_BASELINE_ID,
+        "baseline_values": dict(PARAMETER_BASELINE_V1),
+        "sweep_space_reference": PARAMETER_SWEEP_SPACE_V1.get("sweep_space_id"),
+        # Always False in PR #19. The catalog is metadata-only; nothing
+        # here flows into decide_action / risk_gate. A future PR that
+        # connects a profile to the runtime gate will flip this to True.
+        "applied_to_runtime": False,
+    }
+
+
 def _load_events_for_run(
     *,
     events_path: Path,
@@ -1108,6 +1159,18 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
             waveform_library, str(lib_path),
         )
 
+    # PR #19: build the literature_baseline_v1 metadata block. This is
+    # ALWAYS emitted (regardless of --parameter-profile) so a stored
+    # trace records which catalog version was current at run time. The
+    # block is metadata-only; nothing here flows into decide_action.
+    try:
+        parameters_metadata = _build_parameters_metadata(
+            getattr(args, "parameter_profile", None),
+        )
+    except ValueError as e:
+        print(f"[error] {e}", file=sys.stderr)
+        return 2
+
     result = run_engine_backtest(
         df,
         symbol=args.symbol,
@@ -1124,6 +1187,7 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
         df_context=df_context,
         context_days=context_days,
         calendar=calendar_metadata,
+        parameters=parameters_metadata,
     )
     metrics = result.metrics()
     start_date = str(df.index[0])
@@ -2173,6 +2237,19 @@ def build_parser() -> argparse.ArgumentParser:
                          "it. Default 0 (legacy behaviour). For "
                          "`--interval 1h`, context_days + test span "
                          "must be ≤730 (yfinance hard limit).")
+    be.add_argument("--parameter-profile", default=None,
+                    help="Literature parameter catalog profile to record "
+                         "in run_metadata.parameters. PR #19: "
+                         "METADATA-ONLY. Even with "
+                         "`--parameter-profile literature_baseline_v1` "
+                         "the runtime gate / decide_action / risk_gate "
+                         "values are unchanged — `applied_to_runtime` "
+                         "stays False. trade list / metrics / "
+                         "hold_reasons / equity_curve are byte-identical "
+                         "with or without this flag (pinned by "
+                         "test_parameter_profile_metadata_only_trade_"
+                         "results_identical). Unknown profile names are "
+                         "rejected with exit code 2.")
     be.add_argument("--trace-out", default=None,
                     help="Directory to write run_metadata.json / "
                          "decision_traces.jsonl / summary.json. Skip the "
