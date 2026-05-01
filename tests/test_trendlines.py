@@ -82,6 +82,64 @@ def test_to_dict_emits_schema_version():
     assert "reason" in d
 
 
+def test_trendline_with_three_or_more_touches_is_marked_strong():
+    """An ascending series with multiple climbing lows must produce
+    `is_strong=True` and `touch_count >= 3` for the ascending_support
+    line. confidence must rise above the 2-touch baseline (0.5)."""
+    rng = np.random.default_rng(7)
+    n = 150
+    idx = pd.date_range("2025-01-01", periods=n, freq="1h", tz="UTC")
+    closes = []
+    for k in range(n):
+        base = 100 + 0.05 * k                 # rising baseline
+        osc = 3.0 * np.sin(k * 0.3)           # oscillation
+        closes.append(base + osc + rng.normal(0, 0.1))
+    closes = np.array(closes)
+    df = pd.DataFrame({
+        "open": closes - 0.05, "high": closes + 0.5,
+        "low": closes - 0.5, "close": closes, "volume": [1000] * n,
+    }, index=idx)
+    atr_v = float(compute_atr(df, 14).iloc[-1])
+    c = detect_trendlines(
+        df, atr_value=atr_v, last_close=float(df["close"].iloc[-1]),
+    )
+    assert c.ascending_support is not None
+    asc = c.ascending_support
+    assert asc.touch_count >= 3, (
+        f"expected >=3 touches on the ascending support line, got {asc.touch_count}"
+    )
+    assert asc.is_strong is True
+    assert asc.confidence > 0.5, (
+        f"3+ touch line confidence ({asc.confidence}) must exceed 2-touch "
+        f"baseline of 0.5"
+    )
+    assert len(asc.confirming_touch_indices) == asc.touch_count
+
+
+def test_two_touch_line_has_lower_confidence_than_three_plus():
+    """Direct invocation: a 2-touch only line must report
+    is_strong=False and confidence=0.5. Uses `_fit_two_anchor_line`
+    directly with synthetic Swing objects so the test is fully
+    deterministic (no swing detection involved)."""
+    from src.fx.patterns import Swing
+    from src.fx.trendlines import _fit_two_anchor_line
+    sw_a = Swing(index=10, ts=pd.Timestamp("2025-01-01", tz="UTC"),
+                 price=100.0, kind="L")
+    sw_b = Swing(index=50, ts=pd.Timestamp("2025-01-02", tz="UTC"),
+                 price=102.0, kind="L")
+    # closes_array: 60 bars, irrelevant content (line stays away from them)
+    closes = np.full(60, 105.0)
+    tl = _fit_two_anchor_line(
+        sw_a, sw_b,
+        closes=closes, atr_value=1.0, kind="ascending_support",
+        candidate_swings=[sw_a, sw_b],   # exactly two swings, no extras
+    )
+    assert tl is not None
+    assert tl.touch_count == 2
+    assert tl.is_strong is False
+    assert tl.confidence == pytest.approx(0.5)
+
+
 def test_no_future_leak_consistent_with_partial_window():
     df = _ascending_df(n=200)
     atr_v = float(compute_atr(df, 14).iloc[-1])

@@ -367,6 +367,16 @@ def _detect_flag(closes: np.ndarray, atr_value: float) -> PatternMatch | None:
         consol_range = float(np.ptp(consol_window))
         if consol_range <= 0:
             continue
+        # Breakout reference uses bars BEFORE the current bar so the
+        # current close can be strictly greater than (or less than) the
+        # prior consol high (or low). If we included the current bar
+        # the comparison `last_close > max(consol_window)` would always
+        # be False because last_close is in consol_window.
+        consol_window_excl_last = closes[consol_start:n - 1]
+        if len(consol_window_excl_last) < 1:
+            continue
+        consol_high_excl = float(np.max(consol_window_excl_last))
+        consol_low_excl = float(np.min(consol_window_excl_last))
         # Try a few impulse lengths immediately before the consolidation.
         best_impulse: tuple[int, int, float] | None = None  # (start, end, range)
         for imp_len in range(_FLAG_MIN_IMPULSE_BARS, _FLAG_MAX_IMPULSE_BARS + 1):
@@ -387,8 +397,8 @@ def _detect_flag(closes: np.ndarray, atr_value: float) -> PatternMatch | None:
         impulse_window = closes[imp_start:imp_end]
         direction = "BUY" if impulse_window[-1] > impulse_window[0] else "SELL"
         last_close = float(closes[-1])
-        consol_high = float(np.max(consol_window))
-        consol_low = float(np.min(consol_window))
+        consol_high = consol_high_excl
+        consol_low = consol_low_excl
         if direction == "BUY":
             kind: PatternKind = "flag_bullish"
             neckline = consol_high

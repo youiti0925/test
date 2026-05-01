@@ -146,23 +146,33 @@ def test_retest_does_not_look_past_closes_array():
 
 
 def test_flag_match_exposes_formation_impulse_consolidation_fields():
-    """A bull flag fixture must populate formation_bars / impulse_bars /
-    consolidation_bars / upper_line / lower_line / convergence_score /
-    breakout_direction / pattern_quality_score / reason."""
-    # Synthetic: a clear strong impulse up followed by a tight pullback,
-    # and a final breakout bar above the consolidation high.
+    """A bull flag fixture MUST match deterministically — no skip.
+
+    Construction:
+      - 30 bars of flat baseline at 100 (history for ATR + swings)
+      - 8 bars linear impulse 100 -> 120 (range = 20 >> 1.5 ATR)
+      - 10 bars tight consolidation near 120 (range ~0.5)
+      - 1 breakout bar at 122 (close > consol_high)
+
+    The detector's flag check walks adaptive consol / impulse lengths
+    and must find this combination.
+    """
     closes = (
-        [100.0] * 5
-        + list(np.linspace(100, 120, 8))    # impulse up (>= 1.5 ATR)
-        + [120.0, 119.5, 119.8, 119.9, 119.7, 119.95, 120.1, 119.9, 120.0]  # tight consol
-        + [121.0]                            # breakout up
+        [100.0] * 30
+        + list(np.linspace(100, 120, 8))
+        + [120.1, 119.6, 119.9, 120.0, 119.7, 119.95, 119.9, 119.8, 120.05, 119.7]
+        + [122.0]
     )
     df = _df(closes)
     atr_v = float(compute_atr(df, 14).iloc[-1] or 1.0)
     s = detect_patterns(df, atr_value=atr_v, last_close=float(df["close"].iloc[-1]))
     flag = s.flag
-    if flag is None:
-        pytest.skip("flag detector did not match this fixture; checked elsewhere")
+    assert flag is not None, (
+        "deterministic flag fixture (30 base + 8 impulse + 10 consol + 1 break) "
+        "must produce a flag match"
+    )
+    assert flag.side_bias == "BUY"
+    assert flag.neckline_broken is True
     d = flag.to_dict()
     for key in (
         "formation_start_index", "formation_end_index",
@@ -184,54 +194,58 @@ def test_flag_match_exposes_formation_impulse_consolidation_fields():
 
 
 def test_wedge_match_exposes_convergence_and_lines():
-    """A converging wedge fixture must populate upper_line / lower_line
-    / convergence_score / breakout_direction / pattern_quality_score."""
-    rng = np.random.default_rng(13)
+    """A deterministic falling wedge fixture must populate upper_line /
+    lower_line / convergence_score / pattern_quality_score / reason."""
+    n = 200
     closes = []
-    base = 100.0
-    for k in range(120):
-        # narrowing oscillation around base
-        amp = max(0.2, 5.0 - 0.04 * k)
-        closes.append(base + amp * np.sin(k * 0.6) + rng.normal(0, 0.05))
+    for k in range(n):
+        base = 110 - 0.04 * k
+        amp = max(0.5, 5.0 - 0.025 * k)
+        closes.append(base + amp * np.sin(k * 0.4))
     df = _df(closes)
     atr_v = float(compute_atr(df, 14).iloc[-1] or 1.0)
     s = detect_patterns(df, atr_value=atr_v, last_close=float(df["close"].iloc[-1]))
-    if s.wedge is None:
-        pytest.skip("wedge detector did not match; covered by other fixtures")
+    assert s.wedge is not None, (
+        "deterministic falling wedge fixture (200 bars, declining baseline + "
+        "narrowing oscillation) must produce a wedge match"
+    )
     d = s.wedge.to_dict()
+    assert d["kind"] == "wedge_falling"
     assert d["upper_line"] is not None
     assert d["lower_line"] is not None
+    assert d["upper_line"]["slope"] < 0
+    assert d["lower_line"]["slope"] < 0
     assert d["convergence_score"] is not None
-    assert d["pattern_quality_score"] >= 0.0
+    assert d["pattern_quality_score"] > 0.0
     assert d["breakout_direction"] in ("BUY", "SELL", "UNKNOWN")
     assert d["reason"]
 
 
 def test_triangle_match_categorises_kind():
-    """A triangle fixture must classify ascending / descending / symmetric
-    via the upper_line / lower_line slope signs."""
-    rng = np.random.default_rng(14)
+    """A deterministic symmetric triangle fixture (narrowing sin
+    oscillation around a constant baseline) must produce
+    triangle_symmetric with upper_line.kind=descending and
+    lower_line.kind=ascending."""
+    n = 200
     closes = []
-    for k in range(120):
-        upper = 105.0 - 0.02 * k
-        lower = 95.0 + 0.02 * k
-        if k % 2 == 0:
-            closes.append(upper + rng.normal(0, 0.2))
-        else:
-            closes.append(lower + rng.normal(0, 0.2))
+    for k in range(n):
+        base = 100.0
+        amp = max(0.3, 8.0 - 0.04 * k)
+        closes.append(base + amp * np.sin(k * 0.5))
     df = _df(closes)
     atr_v = float(compute_atr(df, 14).iloc[-1] or 1.0)
     s = detect_patterns(df, atr_value=atr_v, last_close=float(df["close"].iloc[-1]))
-    if s.triangle is None:
-        pytest.skip("triangle detector did not match this synthetic fixture")
+    assert s.triangle is not None, (
+        "deterministic symmetric triangle fixture must match"
+    )
     d = s.triangle.to_dict()
+    assert d["kind"] == "triangle_symmetric"
     assert d["upper_line"] is not None
     assert d["lower_line"] is not None
-    upper_kind = d["upper_line"]["kind"]
-    lower_kind = d["lower_line"]["kind"]
-    # symmetric: upper descending, lower ascending
-    assert upper_kind in ("ascending", "descending", "flat")
-    assert lower_kind in ("ascending", "descending", "flat")
+    assert d["upper_line"]["kind"] == "descending"
+    assert d["lower_line"]["kind"] == "ascending"
+    assert d["upper_line"]["slope"] < 0
+    assert d["lower_line"]["slope"] > 0
 
 
 def test_no_future_leak_partial_window_does_not_crash():
