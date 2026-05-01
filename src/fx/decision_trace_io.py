@@ -98,6 +98,14 @@ def _build_summary(
         )
     except Exception as e:  # noqa: BLE001
         summary["technical_confluence_error"] = f"{type(e).__name__}: {e}"
+    # PR-V2: royal_road_v2_summary. Same fail-soft pattern.
+    try:
+        from .royal_road_v2_summary import compute_royal_road_v2_summary
+        summary["royal_road_v2_summary"] = compute_royal_road_v2_summary(
+            traces=result.decision_traces,
+        )
+    except Exception as e:  # noqa: BLE001
+        summary["royal_road_v2_summary_error"] = f"{type(e).__name__}: {e}"
     return summary
 
 

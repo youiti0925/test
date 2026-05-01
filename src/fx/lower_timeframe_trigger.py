@@ -24,12 +24,15 @@ from typing import Final
 import numpy as np
 import pandas as pd
 
+from .retest_detection import detect_retest
 from .technical_confluence import _candlestick_signal
 
 
 _MICRO_LOOKBACK_BARS: Final[int] = 8
 _MICRO_DOUBLE_TOL_PCT: Final[float] = 0.0005   # 0.05%
-_RETEST_TOL_PCT: Final[float] = 0.0008         # 0.08%
+_RETEST_TOL_ATR: Final[float] = 0.3   # shared helper convention
+_RETEST_CONTINUATION_ATR: Final[float] = 0.2
+_RETEST_MAX_BARS: Final[int] = 10
 
 
 @dataclass(frozen=True)
@@ -137,21 +140,46 @@ def detect_lower_tf_trigger(
         prior_high = float(np.max(highs[-n - 1:-1]))
         prior_low = float(np.min(lows[-n - 1:-1]))
         # breakout = current close beyond prior N-bar high/low
+        # Use a per-window ATR proxy so the shared helper works on
+        # lower-TF data (no ATR(14) computed here).
+        atr_proxy = max(
+            float(np.std(closes[-_MICRO_LOOKBACK_BARS:])) * 1.5,
+            float(prior_high - prior_low) * 0.1,
+            1e-9,
+        )
+        ts_index = list(visible.index)
         if last_close > prior_high:
             breakout = True
-            # retest if the most recent low touches close to broken level
-            recent_low = float(np.min(lows[-3:]))
-            retest = bool(
-                abs(recent_low - prior_high) / prior_high
-                <= _RETEST_TOL_PCT
+            res = detect_retest(
+                closes=closes, highs=highs, lows=lows,
+                timestamps=ts_index,
+                level=prior_high, side="BUY",
+                breakout_search_start=max(0, len(closes) - _MICRO_LOOKBACK_BARS),
+                atr_value=atr_proxy,
+                parent_bar_ts=base_bar_close_ts,
+                tolerance_atr=_RETEST_TOL_ATR,
+                continuation_atr=_RETEST_CONTINUATION_ATR,
+                max_retest_bars=_RETEST_MAX_BARS,
+                wick_allowed=True,           # lower-TF wick retests count
+                close_confirm_required=True,
             )
+            retest = bool(res.retest_confirmed)
         elif last_close < prior_low:
             breakout = True
-            recent_high = float(np.max(highs[-3:]))
-            retest = bool(
-                abs(recent_high - prior_low) / prior_low
-                <= _RETEST_TOL_PCT
+            res = detect_retest(
+                closes=closes, highs=highs, lows=lows,
+                timestamps=ts_index,
+                level=prior_low, side="SELL",
+                breakout_search_start=max(0, len(closes) - _MICRO_LOOKBACK_BARS),
+                atr_value=atr_proxy,
+                parent_bar_ts=base_bar_close_ts,
+                tolerance_atr=_RETEST_TOL_ATR,
+                continuation_atr=_RETEST_CONTINUATION_ATR,
+                max_retest_bars=_RETEST_MAX_BARS,
+                wick_allowed=True,
+                close_confirm_required=True,
             )
+            retest = bool(res.retest_confirmed)
 
     # Micro double bottom: two recent lows close to each other with a
     # peak between them, and current price has rebounded.

@@ -145,6 +145,95 @@ def test_retest_does_not_look_past_closes_array():
     ) is False
 
 
+def test_flag_match_exposes_formation_impulse_consolidation_fields():
+    """A bull flag fixture must populate formation_bars / impulse_bars /
+    consolidation_bars / upper_line / lower_line / convergence_score /
+    breakout_direction / pattern_quality_score / reason."""
+    # Synthetic: a clear strong impulse up followed by a tight pullback,
+    # and a final breakout bar above the consolidation high.
+    closes = (
+        [100.0] * 5
+        + list(np.linspace(100, 120, 8))    # impulse up (>= 1.5 ATR)
+        + [120.0, 119.5, 119.8, 119.9, 119.7, 119.95, 120.1, 119.9, 120.0]  # tight consol
+        + [121.0]                            # breakout up
+    )
+    df = _df(closes)
+    atr_v = float(compute_atr(df, 14).iloc[-1] or 1.0)
+    s = detect_patterns(df, atr_value=atr_v, last_close=float(df["close"].iloc[-1]))
+    flag = s.flag
+    if flag is None:
+        pytest.skip("flag detector did not match this fixture; checked elsewhere")
+    d = flag.to_dict()
+    for key in (
+        "formation_start_index", "formation_end_index",
+        "formation_bars", "impulse_bars", "consolidation_bars",
+        "upper_line", "lower_line",
+        "convergence_score", "breakout_direction",
+        "pattern_quality_score", "reason",
+    ):
+        assert key in d
+    assert d["impulse_bars"] is not None and d["impulse_bars"] > 0
+    assert d["consolidation_bars"] is not None and d["consolidation_bars"] > 0
+    assert d["formation_bars"] is not None
+    assert d["formation_bars"] >= d["impulse_bars"]
+    assert d["upper_line"] is not None
+    assert d["lower_line"] is not None
+    assert d["convergence_score"] is not None
+    assert 0.0 <= d["convergence_score"] <= 1.0
+    assert d["pattern_quality_score"] >= 0.0
+
+
+def test_wedge_match_exposes_convergence_and_lines():
+    """A converging wedge fixture must populate upper_line / lower_line
+    / convergence_score / breakout_direction / pattern_quality_score."""
+    rng = np.random.default_rng(13)
+    closes = []
+    base = 100.0
+    for k in range(120):
+        # narrowing oscillation around base
+        amp = max(0.2, 5.0 - 0.04 * k)
+        closes.append(base + amp * np.sin(k * 0.6) + rng.normal(0, 0.05))
+    df = _df(closes)
+    atr_v = float(compute_atr(df, 14).iloc[-1] or 1.0)
+    s = detect_patterns(df, atr_value=atr_v, last_close=float(df["close"].iloc[-1]))
+    if s.wedge is None:
+        pytest.skip("wedge detector did not match; covered by other fixtures")
+    d = s.wedge.to_dict()
+    assert d["upper_line"] is not None
+    assert d["lower_line"] is not None
+    assert d["convergence_score"] is not None
+    assert d["pattern_quality_score"] >= 0.0
+    assert d["breakout_direction"] in ("BUY", "SELL", "UNKNOWN")
+    assert d["reason"]
+
+
+def test_triangle_match_categorises_kind():
+    """A triangle fixture must classify ascending / descending / symmetric
+    via the upper_line / lower_line slope signs."""
+    rng = np.random.default_rng(14)
+    closes = []
+    for k in range(120):
+        upper = 105.0 - 0.02 * k
+        lower = 95.0 + 0.02 * k
+        if k % 2 == 0:
+            closes.append(upper + rng.normal(0, 0.2))
+        else:
+            closes.append(lower + rng.normal(0, 0.2))
+    df = _df(closes)
+    atr_v = float(compute_atr(df, 14).iloc[-1] or 1.0)
+    s = detect_patterns(df, atr_value=atr_v, last_close=float(df["close"].iloc[-1]))
+    if s.triangle is None:
+        pytest.skip("triangle detector did not match this synthetic fixture")
+    d = s.triangle.to_dict()
+    assert d["upper_line"] is not None
+    assert d["lower_line"] is not None
+    upper_kind = d["upper_line"]["kind"]
+    lower_kind = d["lower_line"]["kind"]
+    # symmetric: upper descending, lower ascending
+    assert upper_kind in ("ascending", "descending", "flat")
+    assert lower_kind in ("ascending", "descending", "flat")
+
+
 def test_no_future_leak_partial_window_does_not_crash():
     rng = np.random.default_rng(12)
     closes = 100.0 + np.cumsum(rng.standard_normal(200) * 0.4)

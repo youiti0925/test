@@ -26,24 +26,22 @@ import numpy as np
 import pandas as pd
 
 from .patterns import detect_swings
+from .retest_detection import detect_retest
 
 
 _HS_SHOULDER_TOL_ATR: Final[float] = 0.6   # shoulder height symmetry
 _HS_HEAD_PROMINENCE_ATR: Final[float] = 0.5
-_FLAG_MIN_BARS: Final[int] = 5
-_FLAG_MAX_BARS: Final[int] = 30
-_WEDGE_MIN_SWINGS: Final[int] = 4
+# flag formation parameters: adaptive, not fixed N=3.
+_FLAG_MIN_CONSOL_BARS: Final[int] = 5
+_FLAG_MAX_CONSOL_BARS: Final[int] = 30
+_FLAG_MIN_IMPULSE_BARS: Final[int] = 3
+_FLAG_MAX_IMPULSE_BARS: Final[int] = 20
+_FLAG_MIN_IMPULSE_ATR: Final[float] = 1.5  # impulse range >= 1.5 ATR
+_FLAG_MAX_CONSOL_TO_IMPULSE_RATIO: Final[float] = 0.6
+# wedge / triangle: minimum anchors per side
+_WEDGE_MIN_SWINGS: Final[int] = 3
+_TRIANGLE_MIN_SWINGS: Final[int] = 3
 _TRIANGLE_TOL_ATR: Final[float] = 0.4
-
-# Retest detection. After a confirmed neckline break, scan forward
-# (NEVER beyond the current bar — `closes` is already truncated)
-# looking for a return to within `_RETEST_TOL_ATR * ATR` of the
-# neckline followed by a continuation move in the breakout direction
-# of at least `_RETEST_CONTINUATION_ATR * ATR`. Both bars must be
-# within `_RETEST_MAX_BARS` of the breakout.
-_RETEST_TOL_ATR: Final[float] = 0.3
-_RETEST_CONTINUATION_ATR: Final[float] = 0.2
-_RETEST_MAX_BARS: Final[int] = 20
 
 
 PatternKind = Literal[
@@ -70,6 +68,20 @@ class PatternMatch:
     confidence: float
     anchor_indices: tuple[int, ...]
     side_bias: Literal["BUY", "SELL", "NEUTRAL"]
+    # v2.1: formation / line / quality breakdown — defaults preserve
+    # backward compat with existing callers that construct PatternMatch
+    # with only the v1 fields.
+    formation_start_index: int | None = None
+    formation_end_index: int | None = None
+    formation_bars: int | None = None
+    impulse_bars: int | None = None
+    consolidation_bars: int | None = None
+    upper_line: dict | None = None       # {"slope": ..., "intercept": ..., "anchors": [...]}
+    lower_line: dict | None = None
+    convergence_score: float | None = None
+    breakout_direction: str = "UNKNOWN"   # BUY | SELL | NEUTRAL | UNKNOWN
+    pattern_quality_score: float = 0.0
+    reason: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -90,6 +102,24 @@ class PatternMatch:
             "confidence": float(self.confidence),
             "anchor_indices": [int(i) for i in self.anchor_indices],
             "side_bias": self.side_bias,
+            "formation_start_index": self.formation_start_index,
+            "formation_end_index": self.formation_end_index,
+            "formation_bars": self.formation_bars,
+            "impulse_bars": self.impulse_bars,
+            "consolidation_bars": self.consolidation_bars,
+            "upper_line": (
+                dict(self.upper_line) if self.upper_line is not None else None
+            ),
+            "lower_line": (
+                dict(self.lower_line) if self.lower_line is not None else None
+            ),
+            "convergence_score": (
+                float(self.convergence_score)
+                if self.convergence_score is not None else None
+            ),
+            "breakout_direction": self.breakout_direction,
+            "pattern_quality_score": float(self.pattern_quality_score),
+            "reason": self.reason,
         }
 
 
@@ -153,60 +183,35 @@ def _retest_confirmed(
     side_bias: str,
     breakout_search_start: int,
     atr_value: float,
+    highs: np.ndarray | None = None,
+    lows: np.ndarray | None = None,
+    timestamps=None,
+    parent_bar_ts: pd.Timestamp | None = None,
+    wick_allowed: bool = False,
 ) -> bool:
-    """Did price retest the broken neckline and continue in the
-    breakout direction?
+    """Backward-compatible wrapper around `retest_detection.detect_retest`.
 
-    For SELL (head_and_shoulders, descending breaks):
-      breakout = first bar where close < neckline at index >=
-                 breakout_search_start
-      retest   = a later close within [_RETEST_TOL_ATR * atr] of the
-                 neckline (return UP toward neckline)
-      continuation = the bar after retest closes BELOW retest_close by
-                     at least [_RETEST_CONTINUATION_ATR * atr]
-
-    For BUY (inverse_head_and_shoulders, ascending breaks):
-      mirror.
-
-    Future-leak safe: only walks the supplied `closes` array (which
-    is already truncated to the current bar by the caller).
+    By default (wick_allowed=False) it preserves the v2.0 close-based
+    behaviour. Callers can opt into wick-based detection. Future-leak
+    safety is enforced by the shared helper when `parent_bar_ts` /
+    `timestamps` are supplied.
     """
-    if (
-        neckline is None or atr_value <= 0
-        or breakout_search_start < 0
-        or breakout_search_start >= len(closes)
-        or side_bias not in ("BUY", "SELL")
-    ):
+    if side_bias not in ("BUY", "SELL"):
         return False
-
-    breakout_bar: int | None = None
-    for i in range(breakout_search_start, len(closes)):
-        c = float(closes[i])
-        if side_bias == "SELL" and c < neckline:
-            breakout_bar = i
-            break
-        if side_bias == "BUY" and c > neckline:
-            breakout_bar = i
-            break
-    if breakout_bar is None:
-        return False
-
-    tol = _RETEST_TOL_ATR * atr_value
-    cont = _RETEST_CONTINUATION_ATR * atr_value
-    end = min(len(closes), breakout_bar + 1 + _RETEST_MAX_BARS)
-    for j in range(breakout_bar + 1, end - 1):
-        c_j = float(closes[j])
-        c_next = float(closes[j + 1])
-        # Retest = price returned within tolerance of neckline.
-        if abs(c_j - neckline) > tol:
-            continue
-        # Continuation = next close moves further in the breakout
-        # direction by at least `cont`.
-        if side_bias == "SELL" and c_next <= c_j - cont:
-            return True
-        if side_bias == "BUY" and c_next >= c_j + cont:
-            return True
-    return False
+    res = detect_retest(
+        closes=closes,
+        highs=highs,
+        lows=lows,
+        timestamps=timestamps,
+        level=neckline,
+        side=side_bias,
+        breakout_search_start=breakout_search_start,
+        atr_value=atr_value,
+        parent_bar_ts=parent_bar_ts,
+        wick_allowed=wick_allowed,
+        close_confirm_required=True,
+    )
+    return bool(res.retest_confirmed)
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +247,11 @@ def _detect_head_and_shoulders(highs, lows, atr_value, closes) -> PatternMatch |
         closes=closes, neckline=neckline, side_bias="SELL",
         breakout_search_start=int(h3.index), atr_value=atr_value,
     ) if broken else False
+    formation_bars = int(h3.index - h1.index)
+    quality = float(min(0.95,
+        confidence * (1.0 + (0.1 if broken else 0.0))
+                   * (1.0 + (0.1 if retested else 0.0))
+    ))
     return PatternMatch(
         kind="head_and_shoulders",
         neckline=neckline,
@@ -252,6 +262,20 @@ def _detect_head_and_shoulders(highs, lows, atr_value, closes) -> PatternMatch |
         confidence=float(min(0.95, confidence)),
         anchor_indices=(h1.index, h2.index, h3.index),
         side_bias="SELL",
+        formation_start_index=int(h1.index),
+        formation_end_index=int(h3.index),
+        formation_bars=formation_bars,
+        impulse_bars=None,
+        consolidation_bars=None,
+        upper_line=None,
+        lower_line=None,
+        convergence_score=None,
+        breakout_direction="SELL" if broken else "UNKNOWN",
+        pattern_quality_score=quality,
+        reason=(
+            f"3H@{h1.price:.4f}/{h2.price:.4f}/{h3.price:.4f} "
+            f"neckline={neckline:.4f} broken={broken} retested={retested}"
+        ),
     )
 
 
@@ -279,6 +303,11 @@ def _detect_inverse_head_and_shoulders(highs, lows, atr_value, closes) -> Patter
         closes=closes, neckline=neckline, side_bias="BUY",
         breakout_search_start=int(l3.index), atr_value=atr_value,
     ) if broken else False
+    formation_bars = int(l3.index - l1.index)
+    quality = float(min(0.95,
+        confidence * (1.0 + (0.1 if broken else 0.0))
+                   * (1.0 + (0.1 if retested else 0.0))
+    ))
     return PatternMatch(
         kind="inverse_head_and_shoulders",
         neckline=neckline,
@@ -289,64 +318,146 @@ def _detect_inverse_head_and_shoulders(highs, lows, atr_value, closes) -> Patter
         confidence=float(min(0.95, confidence)),
         anchor_indices=(l1.index, l2.index, l3.index),
         side_bias="BUY",
+        formation_start_index=int(l1.index),
+        formation_end_index=int(l3.index),
+        formation_bars=formation_bars,
+        impulse_bars=None,
+        consolidation_bars=None,
+        upper_line=None,
+        lower_line=None,
+        convergence_score=None,
+        breakout_direction="BUY" if broken else "UNKNOWN",
+        pattern_quality_score=quality,
+        reason=(
+            f"3L@{l1.price:.4f}/{l2.price:.4f}/{l3.price:.4f} "
+            f"neckline={neckline:.4f} broken={broken} retested={retested}"
+        ),
     )
 
 
 def _detect_flag(closes: np.ndarray, atr_value: float) -> PatternMatch | None:
-    """Bull flag: a strong impulse leg followed by a tight pullback in a
-    narrow range. Bear flag: mirror. v2-minimal: looks at the last
-    `_FLAG_MAX_BARS` for a tight range preceded by a wide-range leg.
+    """Bull / bear flag with ADAPTIVE impulse + consolidation windows.
+
+    Algorithm (v2.1):
+      1. Walk backward from the current bar to find the END of the
+         consolidation: the most recent bar whose price-range over the
+         next K bars (K=_FLAG_MIN_CONSOL_BARS) is small relative to
+         its precursor.
+      2. From that consolidation start, walk further back to find the
+         IMPULSE: a window where ptp >= _FLAG_MIN_IMPULSE_ATR * atr.
+      3. Verify consol_range / impulse_range <=
+         _FLAG_MAX_CONSOL_TO_IMPULSE_RATIO.
+      4. Detect breakout direction at the current bar and compute
+         retest via the shared helper.
+
+    Returns None when the conditions are not met (no fixed N).
     """
-    if len(closes) < _FLAG_MAX_BARS + 5 or atr_value <= 0:
+    if len(closes) < _FLAG_MIN_CONSOL_BARS + _FLAG_MIN_IMPULSE_BARS + 2 or atr_value <= 0:
         return None
-    impulse_window = closes[-_FLAG_MAX_BARS - 5:-_FLAG_MAX_BARS]
-    consol_window = closes[-_FLAG_MAX_BARS:]
-    if len(impulse_window) < 3 or len(consol_window) < _FLAG_MIN_BARS:
-        return None
-    impulse_range = float(np.ptp(impulse_window))
-    consol_range = float(np.ptp(consol_window))
-    if impulse_range <= 0:
-        return None
-    if consol_range > 0.6 * impulse_range:
-        return None  # consolidation is too wide for a flag
-    if impulse_range < 1.5 * atr_value:
-        return None  # not a strong enough impulse
-    direction = (
-        "BUY" if impulse_window[-1] > impulse_window[0] else "SELL"
-    )
-    last_close = float(closes[-1])
-    consol_high = float(np.max(consol_window))
-    consol_low = float(np.min(consol_window))
-    if direction == "BUY":
-        kind: PatternKind = "flag_bullish"
-        neckline = consol_high
-        invalidation = consol_low
-        broken = bool(last_close > consol_high)
-        target = consol_high + impulse_range  # measured-move
-        side_bias = "BUY"
-    else:
-        kind = "flag_bearish"
-        neckline = consol_low
-        invalidation = consol_high
-        broken = bool(last_close < consol_low)
-        target = consol_low - impulse_range
-        side_bias = "SELL"
-    retested = _retest_confirmed(
-        closes=closes, neckline=neckline, side_bias=side_bias,
-        breakout_search_start=len(closes) - _FLAG_MAX_BARS,
-        atr_value=atr_value,
-    ) if broken else False
-    return PatternMatch(
-        kind=kind,
-        neckline=float(neckline),
-        neckline_broken=broken,
-        retested=retested,
-        invalidation_price=float(invalidation),
-        target_price=float(target),
-        confidence=0.55 + 0.1 * min(1.0, impulse_range / (3 * atr_value)),
-        anchor_indices=(len(closes) - _FLAG_MAX_BARS, len(closes) - 1),
-        side_bias=side_bias,
-    )
+
+    n = len(closes)
+    # Try a few candidate consolidation lengths from the smallest valid
+    # to _FLAG_MAX_CONSOL_BARS, picking the first that satisfies the
+    # impulse + ratio constraints.
+    for consol_len in range(_FLAG_MIN_CONSOL_BARS, _FLAG_MAX_CONSOL_BARS + 1):
+        consol_start = n - consol_len
+        if consol_start <= _FLAG_MIN_IMPULSE_BARS:
+            break
+        consol_window = closes[consol_start:n]
+        consol_range = float(np.ptp(consol_window))
+        if consol_range <= 0:
+            continue
+        # Try a few impulse lengths immediately before the consolidation.
+        best_impulse: tuple[int, int, float] | None = None  # (start, end, range)
+        for imp_len in range(_FLAG_MIN_IMPULSE_BARS, _FLAG_MAX_IMPULSE_BARS + 1):
+            imp_start = consol_start - imp_len
+            if imp_start < 0:
+                break
+            imp_window = closes[imp_start:consol_start]
+            imp_range = float(np.ptp(imp_window))
+            if imp_range >= _FLAG_MIN_IMPULSE_ATR * atr_value:
+                if best_impulse is None or imp_range > best_impulse[2]:
+                    best_impulse = (imp_start, consol_start, imp_range)
+        if best_impulse is None:
+            continue
+        imp_start, imp_end, imp_range = best_impulse
+        if consol_range > _FLAG_MAX_CONSOL_TO_IMPULSE_RATIO * imp_range:
+            continue
+        # Direction is the impulse leg sign.
+        impulse_window = closes[imp_start:imp_end]
+        direction = "BUY" if impulse_window[-1] > impulse_window[0] else "SELL"
+        last_close = float(closes[-1])
+        consol_high = float(np.max(consol_window))
+        consol_low = float(np.min(consol_window))
+        if direction == "BUY":
+            kind: PatternKind = "flag_bullish"
+            neckline = consol_high
+            invalidation = consol_low
+            broken = bool(last_close > consol_high)
+            target = consol_high + imp_range
+            side_bias = "BUY"
+        else:
+            kind = "flag_bearish"
+            neckline = consol_low
+            invalidation = consol_high
+            broken = bool(last_close < consol_low)
+            target = consol_low - imp_range
+            side_bias = "SELL"
+        retested = _retest_confirmed(
+            closes=closes, neckline=neckline, side_bias=side_bias,
+            breakout_search_start=imp_end,
+            atr_value=atr_value,
+        ) if broken else False
+        # Lines: upper / lower bounds of the consolidation channel
+        upper_line = {
+            "slope": 0.0,
+            "intercept": consol_high,
+            "anchors": [int(consol_start), int(n - 1)],
+            "kind": "horizontal_high",
+        }
+        lower_line = {
+            "slope": 0.0,
+            "intercept": consol_low,
+            "anchors": [int(consol_start), int(n - 1)],
+            "kind": "horizontal_low",
+        }
+        # convergence_score for a flag is low (parallel channel by definition);
+        # set it to 1 - (consol_range / imp_range) so tighter consolidation = higher.
+        convergence = max(0.0, 1.0 - (consol_range / imp_range))
+        # pattern_quality_score: combine impulse strength + consolidation tightness
+        # + breakout confirmation.
+        quality = (
+            min(1.0, imp_range / (3 * atr_value)) * 0.5
+            + (1.0 - consol_range / max(imp_range, 1e-9)) * 0.3
+            + (0.2 if broken else 0.0)
+        )
+        return PatternMatch(
+            kind=kind,
+            neckline=float(neckline),
+            neckline_broken=broken,
+            retested=retested,
+            invalidation_price=float(invalidation),
+            target_price=float(target),
+            confidence=0.55 + 0.1 * min(1.0, imp_range / (3 * atr_value)),
+            anchor_indices=(int(imp_start), int(imp_end), int(n - 1)),
+            side_bias=side_bias,
+            formation_start_index=int(imp_start),
+            formation_end_index=int(n - 1),
+            formation_bars=int(n - imp_start),
+            impulse_bars=int(imp_end - imp_start),
+            consolidation_bars=int(n - consol_start),
+            upper_line=upper_line,
+            lower_line=lower_line,
+            convergence_score=float(convergence),
+            breakout_direction=side_bias if broken else "UNKNOWN",
+            pattern_quality_score=float(min(0.95, quality)),
+            reason=(
+                f"impulse={imp_range:.4f}({imp_end - imp_start}b) "
+                f"consol={consol_range:.4f}({n - consol_start}b) "
+                f"ratio={consol_range / imp_range:.3f}"
+            ),
+        )
+    return None
 
 
 def _fit_envelope(swings, *, kind: str) -> tuple[float, float] | None:
@@ -406,6 +517,29 @@ def _detect_wedge(highs, lows, atr_value, closes) -> PatternMatch | None:
         breakout_search_start=int(wedge_anchor_idx),
         atr_value=atr_value,
     ) if broken else False
+    upper_line = {
+        "slope": float(su),
+        "intercept": float(_iu),
+        "anchors": [int(s.index) for s in highs[-_WEDGE_MIN_SWINGS:]],
+        "kind": "ascending" if su > 0 else "descending",
+    }
+    lower_line = {
+        "slope": float(sl),
+        "intercept": float(_il),
+        "anchors": [int(s.index) for s in lows[-_WEDGE_MIN_SWINGS:]],
+        "kind": "ascending" if sl > 0 else "descending",
+    }
+    # convergence_score = how much the gap between the lines shrinks
+    # over the wedge. Computed as 1 - (current_gap / initial_gap), capped
+    # to [0, 1]. Higher = stronger convergence.
+    initial_gap = max(1e-9, abs(
+        (su * wedge_anchor_idx + _iu) - (sl * wedge_anchor_idx + _il)
+    ))
+    current_gap = max(0.0, abs(upper_at_last - lower_at_last))
+    convergence = float(max(0.0, min(1.0, 1.0 - (current_gap / initial_gap))))
+    quality = float(min(0.95,
+        0.5 + 0.3 * convergence + (0.15 if broken else 0.0)
+    ))
     return PatternMatch(
         kind=kind,
         neckline=neckline,
@@ -416,6 +550,20 @@ def _detect_wedge(highs, lows, atr_value, closes) -> PatternMatch | None:
         confidence=0.55,
         anchor_indices=tuple(s.index for s in highs[-_WEDGE_MIN_SWINGS:]),
         side_bias=side_bias,
+        formation_start_index=int(wedge_anchor_idx),
+        formation_end_index=int(len(closes) - 1),
+        formation_bars=int(len(closes) - 1 - wedge_anchor_idx),
+        impulse_bars=None,
+        consolidation_bars=None,
+        upper_line=upper_line,
+        lower_line=lower_line,
+        convergence_score=convergence,
+        breakout_direction=side_bias if broken else "UNKNOWN",
+        pattern_quality_score=quality,
+        reason=(
+            f"{kind} su={su:.6f} sl={sl:.6f} "
+            f"convergence={convergence:.3f} broken={broken}"
+        ),
     )
 
 
@@ -472,6 +620,30 @@ def _detect_triangle(highs, lows, atr_value, closes) -> PatternMatch | None:
         breakout_search_start=int(triangle_anchor_idx),
         atr_value=atr_value,
     ) if (broken and side_bias in ("BUY", "SELL")) else False
+    upper_line = {
+        "slope": float(su),
+        "intercept": float(_iu),
+        "anchors": [int(s.index) for s in highs[-3:]],
+        "kind": "flat" if abs(su) <= flat_thr else (
+            "ascending" if su > 0 else "descending"
+        ),
+    }
+    lower_line = {
+        "slope": float(sl),
+        "intercept": float(_il),
+        "anchors": [int(s.index) for s in lows[-3:]],
+        "kind": "flat" if abs(sl) <= flat_thr else (
+            "ascending" if sl > 0 else "descending"
+        ),
+    }
+    initial_gap = max(1e-9, abs(
+        (su * triangle_anchor_idx + _iu) - (sl * triangle_anchor_idx + _il)
+    ))
+    current_gap = max(0.0, abs(upper_at_last - lower_at_last))
+    convergence = float(max(0.0, min(1.0, 1.0 - (current_gap / initial_gap))))
+    quality = float(min(0.95,
+        0.5 + 0.3 * convergence + (0.15 if broken else 0.0)
+    ))
     return PatternMatch(
         kind=kind,
         neckline=neckline,
@@ -482,6 +654,23 @@ def _detect_triangle(highs, lows, atr_value, closes) -> PatternMatch | None:
         confidence=0.55,
         anchor_indices=tuple(s.index for s in highs[-3:]),
         side_bias=side_bias,
+        formation_start_index=int(triangle_anchor_idx),
+        formation_end_index=int(len(closes) - 1),
+        formation_bars=int(len(closes) - 1 - triangle_anchor_idx),
+        impulse_bars=None,
+        consolidation_bars=None,
+        upper_line=upper_line,
+        lower_line=lower_line,
+        convergence_score=convergence,
+        breakout_direction=(
+            side_bias if broken and side_bias in ("BUY", "SELL")
+            else "NEUTRAL"
+        ),
+        pattern_quality_score=quality,
+        reason=(
+            f"{kind} su={su:.6f} sl={sl:.6f} "
+            f"convergence={convergence:.3f} broken={broken}"
+        ),
     )
 
 

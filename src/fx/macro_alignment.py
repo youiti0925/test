@@ -63,6 +63,14 @@ class MacroAlignmentSnapshot:
     macro_block_reasons: list = field(default_factory=list)
     macro_strong_against: AlignmentLabel = "UNKNOWN"
     unavailable_reasons: list = field(default_factory=list)
+    # Hawkish / dovish tone of central bank events. v2 has NO data
+    # source for this — we always emit UNKNOWN with an explicit
+    # unavailable_reason so consumers don't mistake "implicit NEUTRAL"
+    # for "no data". Implementing tone extraction (FOMC statement
+    # parsing, ECB dovish/hawkish classifier) is future work; pinned
+    # in `docs/royal_road_decision_v2.md`.
+    event_tone: Literal["HAWKISH", "DOVISH", "NEUTRAL", "UNKNOWN"] = "UNKNOWN"
+    event_tone_unavailable_reason: str = "tone_extraction_not_implemented"
 
     def to_dict(self) -> dict:
         return {
@@ -78,6 +86,8 @@ class MacroAlignmentSnapshot:
             "macro_block_reasons": list(self.macro_block_reasons),
             "macro_strong_against": self.macro_strong_against,
             "unavailable_reasons": list(self.unavailable_reasons),
+            "event_tone": self.event_tone,
+            "event_tone_unavailable_reason": self.event_tone_unavailable_reason,
         }
 
 
