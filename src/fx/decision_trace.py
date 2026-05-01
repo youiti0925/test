@@ -670,6 +670,61 @@ class TechnicalConfluenceSlice:
 
 
 @dataclass(frozen=True)
+class RoyalRoadDecisionSlice:
+    """Royal-road profile decision audit (PR royal_road_decision_v1).
+
+    Emitted ONLY when `run_engine_backtest(decision_profile=
+    "royal_road_decision_v1")` is requested. The default profile
+    (`current_runtime`) leaves `BarDecisionTrace.royal_road_decision`
+    as None — preserving byte-identical trace output for legacy /
+    default callers.
+
+    The slice records the royal-road profile's BUY/SELL/HOLD output
+    AND a comparison block so post-hoc analyses can identify trades
+    where the two profiles disagreed.
+    """
+
+    profile: str
+    action: str
+    confidence: float
+    score: float
+    reasons: list
+    block_reasons: list
+    compared_to_current_runtime: dict
+
+    def to_dict(self) -> dict:
+        return {
+            "profile": self.profile,
+            "action": self.action,
+            "confidence": float(self.confidence),
+            "score": float(self.score),
+            "reasons": list(self.reasons),
+            "block_reasons": list(self.block_reasons),
+            "compared_to_current_runtime": dict(
+                self.compared_to_current_runtime
+            ),
+        }
+
+    @classmethod
+    def from_decision(
+        cls,
+        *,
+        royal_decision,
+        comparison: dict,
+    ) -> "RoyalRoadDecisionSlice":
+        adv = royal_decision.advisory or {}
+        return cls(
+            profile=str(adv.get("profile", "royal_road_decision_v1")),
+            action=royal_decision.action,
+            confidence=float(royal_decision.confidence),
+            score=float(adv.get("score", 0.0)),
+            reasons=list(adv.get("reasons") or []),
+            block_reasons=list(adv.get("block_reasons") or []),
+            compared_to_current_runtime=dict(comparison),
+        )
+
+
+@dataclass(frozen=True)
 class FundamentalSlice:
     nearby_events: tuple[dict, ...]
     blocking_events: tuple[dict, ...]
@@ -893,6 +948,13 @@ class BarDecisionTrace:
     # and for live cmd_trace export paths that have not been wired yet.
     # OBSERVATION-ONLY — never read by decide_action / risk_gate.
     technical_confluence: TechnicalConfluenceSlice | None = None
+    # Optional royal-road decision audit (royal_road_decision_v1
+    # profile). Emitted ONLY when `run_engine_backtest(decision_profile
+    # ="royal_road_decision_v1")` is requested. None when the default
+    # `current_runtime` profile is in effect, which preserves
+    # byte-identical trace output for legacy callers and the live
+    # cmd_trade export path.
+    royal_road_decision: RoyalRoadDecisionSlice | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -924,6 +986,10 @@ class BarDecisionTrace:
             "technical_confluence": (
                 self.technical_confluence.to_dict()
                 if self.technical_confluence else None
+            ),
+            "royal_road_decision": (
+                self.royal_road_decision.to_dict()
+                if self.royal_road_decision else None
             ),
         }
 
@@ -996,6 +1062,7 @@ __all__ = [
     "LongTermTrendSlice",
     "MacroContextSlice",
     "TechnicalConfluenceSlice",
+    "RoyalRoadDecisionSlice",
     "FundamentalSlice",
     "ExecutionAssumptionSlice",
     "ExecutionTraceSlice",

@@ -492,3 +492,20 @@ Third step: only then connect proven concepts to decision logic.
 - Intended for win/loss analysis and future A/B design only.
 - Decision pipeline output is byte-identical to PR #21 (pinned by
   `tests/test_technical_confluence_trace_observation_only.py`).
+
+## 11. Implementation Status (royal_road_decision_v1)
+
+- `royal_road_decision_v1` decision profile added as **opt-in**.
+  See [`docs/royal_road_decision_v1.md`](royal_road_decision_v1.md).
+- Default `current_runtime` remains unchanged (byte-identical pin).
+- `royal_road_decision_v1` uses `technical_confluence_v1` to produce
+  BUY / SELL / HOLD via royal-road rules (STRONG_BUY_SETUP +
+  invalidation_clear + structure_stop + bullish evidence + not
+  near_resistance + no avoid_reasons; mirror for SELL; everything else
+  HOLD).
+- Designed for A/B comparison against `current_runtime`. Each trace
+  carries `royal_road_decision.compared_to_current_runtime` so
+  post-hoc analyses can find where the two profiles diverged.
+- Live / OANDA / paper paths are unaffected — `run_engine_backtest`
+  is the sole entry point for the profile flag and live cmd_trade
+  does not call it.

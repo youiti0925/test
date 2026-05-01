@@ -30,6 +30,7 @@ from .decision_trace import (
     MacroContextSlice,
     MarketSlice,
     RULE_TAXONOMY,
+    RoyalRoadDecisionSlice,
     RuleCheck,
     TRACE_SCHEMA_VERSION,
     TechnicalConfluenceSlice,
@@ -1845,6 +1846,8 @@ def build_full_trace(
     waveform_bias: dict | None = None,
     long_term_trend_override: LongTermTrendSlice | None = None,
     runtime_overrides: dict | None = None,
+    royal_road_decision=None,
+    royal_road_compare: dict | None = None,
 ) -> BarDecisionTrace:
     """Full trace for a normally processed bar.
 
@@ -1927,6 +1930,13 @@ def build_full_trace(
         runtime_overrides=runtime_overrides,
     )
 
+    royal_slice: RoyalRoadDecisionSlice | None = None
+    if royal_road_decision is not None and royal_road_compare is not None:
+        royal_slice = RoyalRoadDecisionSlice.from_decision(
+            royal_decision=royal_road_decision,
+            comparison=royal_road_compare,
+        )
+
     return BarDecisionTrace(
         run_id=run_id,
         trace_schema_version=TRACE_SCHEMA_VERSION,
@@ -1942,6 +1952,7 @@ def build_full_trace(
         long_term_trend=long_term,
         macro_context=macro_ctx,
         technical_confluence=confluence,
+        royal_road_decision=royal_slice,
     )
 
 

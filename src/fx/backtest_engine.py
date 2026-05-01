@@ -41,6 +41,14 @@ import pandas as pd
 
 from .calendar import Event
 from .decision_engine import Decision, decide as decide_action
+from .royal_road_decision import (
+    PROFILE_NAME as ROYAL_ROAD_PROFILE,
+    SUPPORTED_DECISION_PROFILES,
+    compare_decisions as compare_royal_decisions,
+    decide_royal_road,
+    validate_decision_profile,
+)
+from .technical_confluence import build_technical_confluence
 from .macro import MacroSnapshot
 from .waveform_library import WaveformSample
 from .decision_trace import (
@@ -561,6 +569,15 @@ def run_engine_backtest(
     bb_period: int | None = None,
     bb_std: float | None = None,
     atr_period: int | None = None,
+    # royal_road_decision_v1: opt-in decision profile. When equal to
+    # the default "current_runtime", the decide_action chain is the
+    # sole BUY/SELL/HOLD source (engine output byte-identical to
+    # PR #21 main). When set to "royal_road_decision_v1", the
+    # technical_confluence dict drives an alternative decision and
+    # the trace gains a `royal_road_decision` slice with comparison
+    # metadata. Live / OANDA / paper paths do not call this function
+    # so this kwarg cannot affect live trading.
+    decision_profile: str = "current_runtime",
 ) -> EngineBacktestResult:
     """Run a Decision Engine-driven backtest over `df`.
 
@@ -636,6 +653,14 @@ def run_engine_backtest(
         # full frame is df_context (length n_context_bars) followed by df,
         # so test bar i_test corresponds to full bar i_test + n_context_bars.
         return _long_term_trend_slice(df_full, i_test + n_context_bars)
+
+    # royal_road_decision_v1: validate the requested decision profile.
+    # Unknown profile names raise — the CLI is expected to catch and
+    # surface this with exit code 2. Default `current_runtime` keeps
+    # the legacy path; other names route through the corresponding
+    # profile module after the existing decide_action call.
+    _decision_profile = validate_decision_profile(decision_profile)
+    _royal_road_active = (_decision_profile == ROYAL_ROAD_PROFILE)
 
     # PR #21: resolve indicator-period overrides. None → existing
     # current_runtime defaults, non-None → flowed through.
@@ -909,7 +934,7 @@ def run_engine_backtest(
 
         llm_signal = llm_signal_fn(window) if llm_signal_fn is not None else None
 
-        decision = decide_action(
+        decision_current = decide_action(
             technical_signal=tech,
             pattern=pattern,
             higher_timeframe_trend=higher_tf,
@@ -917,6 +942,40 @@ def run_engine_backtest(
             risk_state=risk_state,
             llm_signal=llm_signal,  # type: ignore[arg-type]
         )
+
+        # royal_road_decision_v1: when the profile is active, we
+        # additionally compute the royal-road decision from the
+        # technical_confluence dict and use IT as the entry / exit
+        # driver for this bar. The current_runtime decision is kept so
+        # the trace can record what the legacy profile would have done
+        # — this is what `compared_to_current_runtime` exposes.
+        decision_royal: Decision | None = None
+        royal_compare: dict | None = None
+        if _royal_road_active:
+            confluence_dict = build_technical_confluence(
+                df_window=df.iloc[: i + 1],
+                snapshot=snap,
+                pattern=pattern,
+                atr_value=float(atr_value),
+                technical_only_action=tech,
+                stop_atr_mult=stop_atr_mult,
+                tp_atr_mult=tp_atr_mult,
+            )
+            decision_royal = decide_royal_road(
+                technical_signal=tech,
+                pattern=pattern,
+                higher_timeframe_trend=higher_tf,
+                risk_reward=risk_reward,
+                risk_state=risk_state,
+                technical_confluence=confluence_dict,
+            )
+            royal_compare = compare_royal_decisions(
+                decision_current=decision_current,
+                decision_royal=decision_royal,
+            )
+            decision = decision_royal
+        else:
+            decision = decision_current
 
         # Categorise the HOLD reason — the gate's blocked_by codes are
         # already a closed taxonomy; otherwise bucket by the last rule
@@ -1023,6 +1082,8 @@ def run_engine_backtest(
                 ),
                 long_term_trend_override=_long_term_trend_for_bar(i),
                 runtime_overrides=_runtime_overrides_for_trace,
+                royal_road_decision=decision_royal,
+                royal_road_compare=royal_compare,
             )
             result.decision_traces.append(trace)
 

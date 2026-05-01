@@ -1240,6 +1240,7 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
         bb_period=runtime_kwargs.get("bb_period"),
         bb_std=runtime_kwargs.get("bb_std"),
         atr_period=runtime_kwargs.get("atr_period"),
+        decision_profile=getattr(args, "decision_profile", "current_runtime"),
     )
     metrics = result.metrics()
     start_date = str(df.index[0])
@@ -2320,6 +2321,23 @@ def build_parser() -> argparse.ArgumentParser:
                          "stop_atr_mult (1.5 vs 2.0); other "
                          "indicator periods / thresholds already "
                          "match current defaults.")
+    be.add_argument(
+        "--decision-profile",
+        default="current_runtime",
+        choices=("current_runtime", "royal_road_decision_v1"),
+        help=(
+            "Which decision profile drives BUY/SELL/HOLD. Default "
+            "`current_runtime` is byte-identical to PR #21 main. "
+            "`royal_road_decision_v1` (opt-in) reads "
+            "technical_confluence_v1 and applies royal-road rules "
+            "(STRONG_BUY_SETUP + invalidation_clear + structure_stop + "
+            "bullish evidence + not near_resistance + no avoid_reasons). "
+            "Backtest-only — live cmd_trade does not call "
+            "run_engine_backtest, so this flag cannot affect live "
+            "trading. The trace gains a `royal_road_decision` slice "
+            "with comparison metadata when the profile is non-default."
+        ),
+    )
     be.add_argument("--trace-out", default=None,
                     help="Directory to write run_metadata.json / "
                          "decision_traces.jsonl / summary.json. Skip the "
