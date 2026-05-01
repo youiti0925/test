@@ -65,6 +65,20 @@ class Level:
     strength_score: float
     recency_score: float
     distance_to_close_atr: float | None
+    # v2.2: zone-based level (band, not single price). Defaults preserve
+    # backward compat for any caller that constructs Level with v1 fields.
+    zone_low: float | None = None
+    zone_high: float | None = None
+    zone_width_atr: float | None = None
+    wick_touch_count: int = 0
+    close_touch_count: int = 0
+    body_break_count: int = 0
+    wick_fakeout_count: int = 0
+    rejection_count: int = 0
+    confidence: float = 0.0
+    reasons: list = field(default_factory=list)
+    # rejection bookkeeping (set when the level is in `rejected_level_zones`)
+    reject_reason: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -92,6 +106,24 @@ class Level:
                 float(self.distance_to_close_atr)
                 if self.distance_to_close_atr is not None else None
             ),
+            "zone_low": (
+                float(self.zone_low) if self.zone_low is not None else None
+            ),
+            "zone_high": (
+                float(self.zone_high) if self.zone_high is not None else None
+            ),
+            "zone_width_atr": (
+                float(self.zone_width_atr)
+                if self.zone_width_atr is not None else None
+            ),
+            "wick_touch_count": int(self.wick_touch_count),
+            "close_touch_count": int(self.close_touch_count),
+            "body_break_count": int(self.body_break_count),
+            "wick_fakeout_count": int(self.wick_fakeout_count),
+            "rejection_count": int(self.rejection_count),
+            "confidence": float(self.confidence),
+            "reasons": list(self.reasons),
+            "reject_reason": self.reject_reason,
         }
 
 
@@ -110,6 +142,11 @@ class SRSnapshot:
     fake_breakout: bool
     reason: str
     schema_version: str = "support_resistance_v2"
+    # v2.2 candidate ranking:
+    #   selected = top-N by strength_score, with confidence + reasons populated
+    #   rejected = the rest, each with `reject_reason` set
+    selected_level_zones_top5: tuple[Level, ...] = ()
+    rejected_level_zones: tuple[Level, ...] = ()
 
     def to_dict(self) -> dict:
         return {
@@ -130,6 +167,12 @@ class SRSnapshot:
             "role_reversal": bool(self.role_reversal),
             "fake_breakout": bool(self.fake_breakout),
             "reason": self.reason,
+            "selected_level_zones_top5": [
+                lvl.to_dict() for lvl in self.selected_level_zones_top5
+            ],
+            "rejected_level_zones": [
+                lvl.to_dict() for lvl in self.rejected_level_zones
+            ],
         }
 
 
@@ -146,6 +189,104 @@ def empty_snapshot(reason: str = "insufficient_data") -> SRSnapshot:
         fake_breakout=False,
         reason=reason,
     )
+
+
+def _zone_history_counts(
+    *,
+    closes: np.ndarray,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    zone_low: float,
+    zone_high: float,
+    first_touch_index: int,
+    kind: str,
+) -> dict[str, int]:
+    """Walk visible OHLC and count per-zone interactions.
+
+    Definitions:
+      - close_touch  : zone_low <= close[i] <= zone_high
+      - wick_touch   : (low[i] <= zone_high and high[i] >= zone_low)
+                       AND not close_touch
+      - body_break   : close[i] crossed THROUGH the zone since the prior
+                       close (prior on one side, current on the OTHER side)
+      - wick_fakeout : wick exceeded the zone but close finished back
+                       inside (or on the same side as before)
+      - rejection    : wick poked into the zone from one side and the
+                       close moved AWAY from the zone in the role
+                       direction (support: close > zone_high after wick
+                       touch; resistance: close < zone_low after wick touch)
+
+    Future-leak safe: only consults the supplied arrays. The caller
+    truncates closes/highs/lows to the visible bar window.
+    """
+    out = {
+        "close_touch": 0,
+        "wick_touch": 0,
+        "body_break": 0,
+        "wick_fakeout": 0,
+        "rejection": 0,
+    }
+    n = len(closes)
+    if n < 2:
+        return out
+    start = max(0, int(first_touch_index))
+    if start >= n:
+        return out
+    for i in range(start, n):
+        c = float(closes[i])
+        h = float(highs[i])
+        l = float(lows[i])
+        wick_in = (l <= zone_high) and (h >= zone_low)
+        close_in = zone_low <= c <= zone_high
+        if close_in:
+            out["close_touch"] += 1
+        elif wick_in:
+            out["wick_touch"] += 1
+            # Wick fakeout: the wick exceeded the zone (high > zone_high
+            # OR low < zone_low) but the close did not finish inside.
+            if h > zone_high or l < zone_low:
+                out["wick_fakeout"] += 1
+            # Rejection: kind-aware. For "support" / "both": wick dipped
+            # below zone but close stayed above zone (rebounded).
+            # For "resistance" / "both": wick poked above but close
+            # stayed below.
+            if kind in ("support", "both") and l < zone_low and c > zone_high:
+                out["rejection"] += 1
+            if kind in ("resistance", "both") and h > zone_high and c < zone_low:
+                out["rejection"] += 1
+        # Body break: prev close on one side, current close on opposite.
+        if i > 0:
+            prev_c = float(closes[i - 1])
+            if prev_c > zone_high and c < zone_low:
+                out["body_break"] += 1
+            if prev_c < zone_low and c > zone_high:
+                out["body_break"] += 1
+    return out
+
+
+def _classify_reject_reason(
+    *,
+    lvl: Level,
+    n_bars: int,
+    rank_in_kind: int,
+    near_strong_top: bool,
+) -> str | None:
+    """Return a reject_reason string for a level that did not make the
+    top-5 selection. None means no reject reason (level is selected)."""
+    if lvl.touch_count < 2:
+        return "too_few_touches"
+    bars_since = max(0, n_bars - 1 - lvl.last_touch_index)
+    if bars_since > 500:
+        return "too_old"
+    if lvl.distance_to_close_atr is not None and lvl.distance_to_close_atr > 5.0:
+        return "too_far_from_price"
+    if lvl.broken_count >= 3 and lvl.role_reversal_count == 0:
+        return "already_broken"
+    if lvl.confidence < 0.3:
+        return "low_quality"
+    if rank_in_kind > 5:
+        return "low_quality"
+    return None
 
 
 def _level_history_counts(
@@ -280,9 +421,15 @@ def _cluster_swings(
         last_touch = max(cluster, key=lambda s: s.index)
         bars_since_last = max(0, n_bars - 1 - last_touch.index)
         recency_score = math.exp(-bars_since_last / _RECENCY_HALF_LIFE_BARS)
-        # broken / false_breakout / role_reversal counts are computed
-        # in detect_levels via _level_history_counts (needs closes
-        # + atr_value not available here). Initialised to 0.
+        # Zone defined by the price range of swings in the cluster.
+        # When the cluster has only one swing, zone collapses to a thin
+        # band around the price (use bucket_size as a fallback width).
+        z_min = float(min(prices))
+        z_max = float(max(prices))
+        if z_max - z_min < 1e-12:
+            half = bucket_size * 0.5
+            z_min -= half
+            z_max += half
         levels.append(Level(
             price=float(np.mean(prices)),
             kind=kind,
@@ -297,6 +444,16 @@ def _cluster_swings(
             strength_score=0.0,            # filled in detect_levels
             recency_score=float(recency_score),
             distance_to_close_atr=None,    # filled in detect_levels
+            zone_low=float(z_min),
+            zone_high=float(z_max),
+            zone_width_atr=None,           # filled in detect_levels (needs atr)
+            wick_touch_count=0,
+            close_touch_count=0,
+            body_break_count=0,
+            wick_fakeout_count=0,
+            rejection_count=0,
+            confidence=0.0,
+            reasons=[],
         ))
     return levels
 
@@ -333,8 +490,10 @@ def detect_levels(
         return empty_snapshot("clustering_produced_no_levels")
 
     closes = df["close"].to_numpy()
+    highs_arr = df["high"].to_numpy()
+    lows_arr = df["low"].to_numpy()
     # Compute distance_to_close_atr + per-level history counts +
-    # final strength_score per level (counts feed back into score).
+    # zone-based counts + final strength_score / confidence / reasons.
     enriched: list[Level] = []
     for lvl in levels:
         dist_atr = abs(last_close - lvl.price) / atr_value
@@ -345,10 +504,19 @@ def detect_levels(
             first_touch_index=lvl.first_touch_index,
             last_touch_index=lvl.last_touch_index,
         )
-        # strength_score: log(touches) × recency
-        # × (1 + role_reversal_count × 0.1)             ← genuine flips raise
-        # × max(0.1, 1 − 0.15 × false_breakouts)        ← false breaks lower
-        # × max(0.2, 1 − 0.05 × max(0, broken − role_rev))  ← raw breaks lower
+        zone_counts = _zone_history_counts(
+            closes=closes, highs=highs_arr, lows=lows_arr,
+            zone_low=lvl.zone_low if lvl.zone_low is not None else lvl.price,
+            zone_high=lvl.zone_high if lvl.zone_high is not None else lvl.price,
+            first_touch_index=lvl.first_touch_index,
+            kind=lvl.kind,
+        )
+        zone_width_atr = (
+            ((lvl.zone_high or lvl.price) - (lvl.zone_low or lvl.price))
+            / atr_value
+            if (lvl.zone_high is not None and lvl.zone_low is not None)
+            else None
+        )
         score = (
             math.log1p(lvl.touch_count)
             * lvl.recency_score
@@ -356,6 +524,29 @@ def detect_levels(
             * max(0.1, 1.0 - 0.15 * false_brk)
             * max(0.2, 1.0 - 0.05 * max(0, broken - role_rev))
         )
+        # confidence ∈ [0, 1] derived from the zone scan:
+        # rewards close_touch + rejection, penalises body_break + wick_fakeout.
+        denom = (
+            zone_counts["close_touch"]
+            + zone_counts["body_break"] * 2
+            + zone_counts["wick_fakeout"]
+            + 1
+        )
+        confidence = (
+            (zone_counts["close_touch"] + zone_counts["rejection"]) / denom
+        )
+        confidence = max(0.0, min(1.0, float(confidence)))
+        reasons: list[str] = []
+        if lvl.touch_count >= _STRONG_TOUCH_THRESHOLD:
+            reasons.append("strong_multi_touch")
+        if zone_counts["rejection"] >= 2:
+            reasons.append("multiple_rejections")
+        if role_rev > 0:
+            reasons.append("role_reversal_history")
+        if zone_counts["wick_fakeout"] >= 2:
+            reasons.append("noisy_wick_fakeouts")
+        if broken >= 3 and role_rev == 0:
+            reasons.append("repeatedly_broken")
         enriched.append(Level(
             price=lvl.price,
             kind=lvl.kind,
@@ -370,6 +561,16 @@ def detect_levels(
             strength_score=float(score),
             recency_score=lvl.recency_score,
             distance_to_close_atr=dist_atr,
+            zone_low=lvl.zone_low,
+            zone_high=lvl.zone_high,
+            zone_width_atr=zone_width_atr,
+            wick_touch_count=int(zone_counts["wick_touch"]),
+            close_touch_count=int(zone_counts["close_touch"]),
+            body_break_count=int(zone_counts["body_break"]),
+            wick_fakeout_count=int(zone_counts["wick_fakeout"]),
+            rejection_count=int(zone_counts["rejection"]),
+            confidence=float(confidence),
+            reasons=reasons,
         ))
     levels = enriched
 
@@ -411,6 +612,21 @@ def detect_levels(
         )
     )
 
+    # Rank by strength_score and split into selected_top5 / rejected.
+    ranked = sorted(levels, key=lambda l: l.strength_score, reverse=True)
+    selected: list[Level] = []
+    rejected: list[Level] = []
+    for rank_idx, lvl in enumerate(ranked, start=1):
+        rj = _classify_reject_reason(
+            lvl=lvl, n_bars=len(df), rank_in_kind=rank_idx,
+            near_strong_top=False,
+        )
+        if rj is None and len(selected) < 5:
+            selected.append(lvl)
+        else:
+            rj_final = rj or "outside_top5"
+            rejected.append(_with_reject_reason(lvl, rj_final))
+
     return SRSnapshot(
         levels=tuple(levels),
         nearest_support=nearest_support,
@@ -422,6 +638,34 @@ def detect_levels(
         role_reversal=role_reversal,
         fake_breakout=fake_breakout,
         reason=reason,
+        selected_level_zones_top5=tuple(selected),
+        rejected_level_zones=tuple(rejected),
+    )
+
+
+def _with_reject_reason(lvl: Level, reason: str) -> Level:
+    """Return a copy of `lvl` with `reject_reason` populated."""
+    return Level(
+        price=lvl.price, kind=lvl.kind, touch_count=lvl.touch_count,
+        first_touch_ts=lvl.first_touch_ts, last_touch_ts=lvl.last_touch_ts,
+        first_touch_index=lvl.first_touch_index,
+        last_touch_index=lvl.last_touch_index,
+        broken_count=lvl.broken_count,
+        role_reversal_count=lvl.role_reversal_count,
+        false_breakout_count=lvl.false_breakout_count,
+        strength_score=lvl.strength_score,
+        recency_score=lvl.recency_score,
+        distance_to_close_atr=lvl.distance_to_close_atr,
+        zone_low=lvl.zone_low, zone_high=lvl.zone_high,
+        zone_width_atr=lvl.zone_width_atr,
+        wick_touch_count=lvl.wick_touch_count,
+        close_touch_count=lvl.close_touch_count,
+        body_break_count=lvl.body_break_count,
+        wick_fakeout_count=lvl.wick_fakeout_count,
+        rejection_count=lvl.rejection_count,
+        confidence=lvl.confidence,
+        reasons=list(lvl.reasons),
+        reject_reason=reason,
     )
 
 

@@ -124,6 +124,20 @@ class PatternMatch:
 
 
 @dataclass(frozen=True)
+class PatternCandidate:
+    pattern: PatternMatch
+    selected: bool
+    reject_reason: str | None
+
+    def to_dict(self) -> dict:
+        return {
+            "pattern": self.pattern.to_dict(),
+            "selected": bool(self.selected),
+            "reject_reason": self.reject_reason,
+        }
+
+
+@dataclass(frozen=True)
 class ChartPatternSnapshot:
     schema_version: str
     matches: tuple[PatternMatch, ...]
@@ -135,6 +149,8 @@ class ChartPatternSnapshot:
     bullish_breakout_confirmed: bool
     bearish_breakout_confirmed: bool
     reason: str
+    selected_patterns_top5: tuple[PatternMatch, ...] = ()
+    rejected_patterns: tuple[PatternCandidate, ...] = ()
 
     def to_dict(self) -> dict:
         return {
@@ -158,7 +174,23 @@ class ChartPatternSnapshot:
             "bearish_breakout_confirmed":
                 bool(self.bearish_breakout_confirmed),
             "reason": self.reason,
+            "selected_patterns_top5": [
+                m.to_dict() for m in self.selected_patterns_top5
+            ],
+            "rejected_patterns": [
+                rj.to_dict() for rj in self.rejected_patterns
+            ],
         }
+
+
+def _classify_pattern_reject(p: PatternMatch) -> str | None:
+    if p.confidence < 0.55:
+        return "low_quality"
+    if not p.neckline_broken and p.kind not in (
+        "triangle_symmetric",   # symmetric triangles can be NEUTRAL pre-break
+    ):
+        return "neckline_not_broken"
+    return None
 
 
 def empty_snapshot(reason: str = "insufficient_data") -> ChartPatternSnapshot:
@@ -718,6 +750,23 @@ def detect_patterns(
     bearish_breakout = any(
         m.neckline_broken and m.side_bias == "SELL" for m in matches
     )
+    # Rank matches by pattern_quality_score (then confidence) and split.
+    ranked = sorted(
+        matches,
+        key=lambda m: (m.pattern_quality_score, m.confidence),
+        reverse=True,
+    )
+    selected_top5: list[PatternMatch] = []
+    rejected: list[PatternCandidate] = []
+    for m in ranked:
+        rj = _classify_pattern_reject(m)
+        if rj is None and len(selected_top5) < 5:
+            selected_top5.append(m)
+        else:
+            rejected.append(PatternCandidate(
+                pattern=m, selected=False,
+                reject_reason=rj or "outside_top5",
+            ))
     reason = (
         ", ".join(m.kind + ("(broken)" if m.neckline_broken else "")
                   for m in matches)
@@ -734,6 +783,8 @@ def detect_patterns(
         bullish_breakout_confirmed=bullish_breakout,
         bearish_breakout_confirmed=bearish_breakout,
         reason=reason,
+        selected_patterns_top5=tuple(selected_top5),
+        rejected_patterns=tuple(rejected),
     )
 
 

@@ -132,7 +132,12 @@ def _patch_detectors(
 
 
 def _strong_bullish_sr(near_support: bool = True, near_resistance: bool = False) -> SRSnapshot:
-    """An SR snapshot with strong bullish bias (near strong support)."""
+    """An SR snapshot with strong bullish bias (near strong support).
+
+    confidence=0.85 + selected_level_zones_top5 populated so the v2
+    reconstruction_quality computation rates this snapshot as strong
+    enough to clear the _MIN_RECONSTRUCTION_SCORE gate.
+    """
     lvl_sup = Level(
         price=99.0, kind="support", touch_count=5,
         first_touch_ts=None, last_touch_ts=None,
@@ -140,6 +145,10 @@ def _strong_bullish_sr(near_support: bool = True, near_resistance: bool = False)
         broken_count=0, role_reversal_count=0, false_breakout_count=0,
         strength_score=4.0, recency_score=0.9,
         distance_to_close_atr=0.3,
+        zone_low=98.7, zone_high=99.3, zone_width_atr=0.6,
+        wick_touch_count=4, close_touch_count=5, body_break_count=0,
+        wick_fakeout_count=1, rejection_count=3, confidence=0.85,
+        reasons=["strong_multi_touch", "multiple_rejections"],
     )
     return SRSnapshot(
         levels=(lvl_sup,),
@@ -149,6 +158,8 @@ def _strong_bullish_sr(near_support: bool = True, near_resistance: bool = False)
         near_strong_resistance=near_resistance,
         breakout=False, pullback=False, role_reversal=False,
         fake_breakout=False, reason="ok",
+        selected_level_zones_top5=(lvl_sup,) if near_support else (),
+        rejected_level_zones=(),
     )
 
 
@@ -160,6 +171,10 @@ def _strong_bearish_sr() -> SRSnapshot:
         broken_count=0, role_reversal_count=0, false_breakout_count=0,
         strength_score=4.0, recency_score=0.9,
         distance_to_close_atr=0.3,
+        zone_low=100.7, zone_high=101.3, zone_width_atr=0.6,
+        wick_touch_count=4, close_touch_count=5, body_break_count=0,
+        wick_fakeout_count=1, rejection_count=3, confidence=0.85,
+        reasons=["strong_multi_touch"],
     )
     return SRSnapshot(
         levels=(lvl_res,),
@@ -169,6 +184,8 @@ def _strong_bearish_sr() -> SRSnapshot:
         near_strong_resistance=True,
         breakout=False, pullback=False, role_reversal=False,
         fake_breakout=False, reason="ok",
+        selected_level_zones_top5=(lvl_res,),
+        rejected_level_zones=(),
     )
 
 

@@ -82,6 +82,21 @@ class Trendline:
 
 
 @dataclass(frozen=True)
+class TrendlineCandidate:
+    """Lightweight wrapper for ranking + reject reasons."""
+    trendline: Trendline
+    selected: bool
+    reject_reason: str | None
+
+    def to_dict(self) -> dict:
+        return {
+            "trendline": self.trendline.to_dict(),
+            "selected": bool(self.selected),
+            "reject_reason": self.reject_reason,
+        }
+
+
+@dataclass(frozen=True)
 class TrendlineContext:
     schema_version: str
     ascending_support: Trendline | None
@@ -89,6 +104,8 @@ class TrendlineContext:
     bullish_signal: bool        # near asc support OR descending resistance broken up
     bearish_signal: bool        # near desc resistance OR ascending support broken down
     reason: str
+    selected_trendlines_top3: tuple[Trendline, ...] = ()
+    rejected_trendlines: tuple[TrendlineCandidate, ...] = ()
 
     def to_dict(self) -> dict:
         return {
@@ -104,6 +121,12 @@ class TrendlineContext:
             "bullish_signal": bool(self.bullish_signal),
             "bearish_signal": bool(self.bearish_signal),
             "reason": self.reason,
+            "selected_trendlines_top3": [
+                tl.to_dict() for tl in self.selected_trendlines_top3
+            ],
+            "rejected_trendlines": [
+                rj.to_dict() for rj in self.rejected_trendlines
+            ],
         }
 
 
@@ -115,7 +138,26 @@ def empty_context(reason: str = "insufficient_data") -> TrendlineContext:
         bullish_signal=False,
         bearish_signal=False,
         reason=reason,
+        selected_trendlines_top3=(),
+        rejected_trendlines=(),
     )
+
+
+def _classify_trendline_reject(tl: Trendline) -> str | None:
+    if tl.touch_count < 2:
+        return "too_few_touches"
+    if abs(tl.slope) > 5.0:
+        return "too_steep"
+    if tl.broken:
+        return "already_broken"
+    if (
+        tl.distance_to_line_atr is not None
+        and tl.distance_to_line_atr > 5.0
+    ):
+        return "too_far_from_price"
+    if tl.confidence < 0.5:
+        return "low_quality"
+    return None
 
 
 def _count_touches(
@@ -226,14 +268,14 @@ def detect_trendlines(
     highs, lows = detect_swings(df, lookback=lookback)
     closes = df["close"].to_numpy()
 
-    # Pick the best 2-anchor pair by touch count across all confirmed
-    # same-kind swings. This is how 3+ anchor confirmation surfaces:
-    # the chosen pair is the one whose line has the most touches.
-    def _best_pair(swings, kind: TrendlineKind) -> Trendline | None:
-        best: Trendline | None = None
+    # Walk all 2-anchor candidates per kind, score by touch_count, and
+    # split into selected_top3 + rejected.
+    def _all_candidates(swings, kind: TrendlineKind) -> list[Trendline]:
+        out: list[Trendline] = []
         n_sw = len(swings)
         if n_sw < 2:
-            return None
+            return out
+        seen_anchors: set[tuple[int, int]] = set()
         for i in range(n_sw):
             for j in range(i + 1, n_sw):
                 tl = _fit_two_anchor_line(
@@ -243,12 +285,36 @@ def detect_trendlines(
                 )
                 if tl is None:
                     continue
-                if best is None or tl.touch_count > best.touch_count:
-                    best = tl
-        return best
+                key = tl.anchor_indices
+                if key in seen_anchors:
+                    continue
+                seen_anchors.add(key)
+                out.append(tl)
+        return out
 
-    asc = _best_pair(lows, "ascending_support") if len(lows) >= 2 else None
-    desc = _best_pair(highs, "descending_resistance") if len(highs) >= 2 else None
+    asc_candidates = _all_candidates(lows, "ascending_support")
+    desc_candidates = _all_candidates(highs, "descending_resistance")
+    all_candidates = asc_candidates + desc_candidates
+    # Sort by touch_count, then confidence
+    all_candidates.sort(
+        key=lambda t: (t.touch_count, t.confidence),
+        reverse=True,
+    )
+    selected_top3: list[Trendline] = []
+    rejected: list[TrendlineCandidate] = []
+    for tl in all_candidates:
+        rj = _classify_trendline_reject(tl)
+        if rj is None and len(selected_top3) < 3:
+            selected_top3.append(tl)
+        else:
+            rejected.append(TrendlineCandidate(
+                trendline=tl, selected=False,
+                reject_reason=rj or "outside_top3",
+            ))
+
+    # Best per-side line (used by bullish_signal / bearish_signal logic).
+    asc = max(asc_candidates, key=lambda t: t.touch_count) if asc_candidates else None
+    desc = max(desc_candidates, key=lambda t: t.touch_count) if desc_candidates else None
 
     if asc is None and desc is None:
         return empty_context("no_valid_trendlines")
@@ -290,6 +356,8 @@ def detect_trendlines(
         bullish_signal=bullish_signal,
         bearish_signal=bearish_signal,
         reason=reason,
+        selected_trendlines_top3=tuple(selected_top3),
+        rejected_trendlines=tuple(rejected),
     )
 
 

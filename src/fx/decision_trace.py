@@ -794,6 +794,11 @@ class RoyalRoadDecisionV2Slice:
     structure_stop_plan: dict | None
     compared_to_current_runtime: dict
     compared_to_royal_road_v1: dict | None
+    # v2.2: extended trace fields. Defaults preserve backward compat.
+    setup_candidates: list = field(default_factory=list)
+    best_setup: dict | None = None
+    reconstruction_quality: dict = field(default_factory=dict)
+    multi_scale_chart: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -826,6 +831,12 @@ class RoyalRoadDecisionV2Slice:
                 dict(self.compared_to_royal_road_v1)
                 if self.compared_to_royal_road_v1 is not None else None
             ),
+            "setup_candidates": list(self.setup_candidates),
+            "best_setup": (
+                dict(self.best_setup) if self.best_setup is not None else None
+            ),
+            "reconstruction_quality": dict(self.reconstruction_quality),
+            "multi_scale_chart": dict(self.multi_scale_chart),
         }
 
     @classmethod
@@ -863,6 +874,10 @@ class RoyalRoadDecisionV2Slice:
             compared_to_royal_road_v1=(
                 dict(comparison_vs_v1) if comparison_vs_v1 else None
             ),
+            setup_candidates=list(adv.get("setup_candidates") or []),
+            best_setup=adv.get("best_setup"),
+            reconstruction_quality=dict(adv.get("reconstruction_quality") or {}),
+            multi_scale_chart=dict(adv.get("multi_scale_chart") or {}),
         )
 
 

@@ -38,6 +38,7 @@ from typing import Final
 import pandas as pd
 
 from .chart_patterns import ChartPatternSnapshot, detect_patterns
+from .chart_reconstruction import reconstruct_chart_multi_scale
 from .decision_engine import Decision, MIN_RISK_REWARD, _hold
 from .lower_timeframe_trigger import (
     LowerTimeframeTrigger,
@@ -72,6 +73,12 @@ _MACRO_BLOCK_THRESHOLD: Final[float] = -0.7   # ≤ this → strong against trad
 
 # Strong S/R near-side touch threshold mirrors support_resistance
 _NEAR_LEVEL_ATR: Final[float] = 0.5
+
+# v2.2: minimum total reconstruction_score for an entry to be allowed.
+# Below this, even a "STRONG_BUY_SETUP + axes" entry is HOLDed with
+# reason "insufficient_royal_road_reconstruction_quality". Tunable
+# heuristic, NOT in PARAMETER_BASELINE_V1.
+_MIN_RECONSTRUCTION_SCORE: Final[float] = 0.40
 
 
 def _confidence_from_score(score: float | None) -> float:
@@ -158,6 +165,155 @@ def _label_to_side(label: str) -> str | None:
     return None
 
 
+def _reconstruction_quality(
+    *,
+    sr: SRSnapshot,
+    tl: TrendlineContext,
+    cp: ChartPatternSnapshot,
+    ltf: LowerTimeframeTrigger,
+    macro: MacroAlignmentSnapshot,
+    stop_plan: StopPlan | None,
+) -> dict:
+    """Compute per-axis reconstruction quality + total score.
+
+    Each axis ∈ [0, 1]; total is a weighted average. The total is
+    consulted by the v2 decision: insufficient quality → HOLD with
+    reason `insufficient_royal_road_reconstruction_quality`.
+    """
+    # level: highest-confidence selected zone, or 0
+    if sr.selected_level_zones_top5:
+        level_q = max(lvl.confidence for lvl in sr.selected_level_zones_top5)
+    else:
+        level_q = 0.0
+    # trendline: highest confidence among selected
+    if tl.selected_trendlines_top3:
+        tl_q = max(t.confidence for t in tl.selected_trendlines_top3)
+    else:
+        tl_q = 0.0
+    # pattern: highest pattern_quality_score among selected
+    if cp.selected_patterns_top5:
+        cp_q = max(p.pattern_quality_score for p in cp.selected_patterns_top5)
+    else:
+        cp_q = 0.0
+    # lower-TF: trigger.confidence (0 if unavailable)
+    ltf_q = float(getattr(ltf, "confidence", 0.0)) if ltf.available else 0.0
+    # macro: |macro_score| (caps at 1)
+    macro_q = float(min(1.0, abs(macro.macro_score)))
+    # stop-plan: 1.0 if rr_realized >= 1.5 and stop is valid, 0.5 if
+    # plan exists with rr<1.5, 0 if invalid/None
+    stop_q = 0.0
+    if stop_plan is not None and stop_plan.stop_price is not None:
+        rr = stop_plan.rr_realized
+        if rr is not None and rr >= 1.5:
+            stop_q = 1.0
+        else:
+            stop_q = 0.5
+    weights = {
+        "level": 0.25, "trendline": 0.10, "pattern": 0.15,
+        "lower_tf": 0.15, "macro": 0.15, "stop_plan": 0.20,
+    }
+    total = (
+        level_q * weights["level"]
+        + tl_q * weights["trendline"]
+        + cp_q * weights["pattern"]
+        + ltf_q * weights["lower_tf"]
+        + macro_q * weights["macro"]
+        + stop_q * weights["stop_plan"]
+    )
+    return {
+        "level_quality_score": float(level_q),
+        "trendline_quality_score": float(tl_q),
+        "pattern_quality_score": float(cp_q),
+        "lower_tf_quality_score": float(ltf_q),
+        "macro_quality_score": float(macro_q),
+        "stop_plan_quality_score": float(stop_q),
+        "total_reconstruction_score": float(total),
+        "weights": dict(weights),
+    }
+
+
+def _build_setup_candidates(
+    *,
+    side: str,
+    bullish_axes: dict,
+    bearish_axes: dict,
+    sr: SRSnapshot,
+    tl: TrendlineContext,
+    cp: ChartPatternSnapshot,
+    ltf: LowerTimeframeTrigger,
+    macro: MacroAlignmentSnapshot,
+    stop_plan: StopPlan | None,
+    label: str,
+    score: float,
+    reasons_template: list[str],
+    block_reasons_template: list[str],
+    rr: float | None,
+) -> list[dict]:
+    """Generate a list of setup candidate dicts (1+ per side at most).
+
+    A candidate aggregates the v2 evidence axes that fired for this
+    side along with the per-axis context, the stop plan, and a
+    scalar score. The caller can then pick the best one.
+    """
+    cands: list[dict] = []
+    if side not in ("BUY", "SELL"):
+        return cands
+    axes = bullish_axes if side == "BUY" else bearish_axes
+    n_axes = sum(1 for v in axes.values() if v)
+    cand_score = float(score) + 0.05 * n_axes
+    if rr is not None:
+        cand_score += min(0.2, max(0.0, (rr - 1.5) * 0.1))
+    cands.append({
+        "side": side,
+        "score": float(cand_score),
+        "confidence": float(min(0.95, 0.55 + 0.2 * n_axes / max(1, len(axes)))),
+        "label": label,
+        "level_context": {
+            "near_strong_support": bool(sr.near_strong_support),
+            "near_strong_resistance": bool(sr.near_strong_resistance),
+            "n_selected_level_zones": len(sr.selected_level_zones_top5),
+        },
+        "trendline_context": {
+            "bullish_signal": bool(tl.bullish_signal),
+            "bearish_signal": bool(tl.bearish_signal),
+            "n_selected_trendlines": len(tl.selected_trendlines_top3),
+        },
+        "pattern_context": {
+            "bullish_breakout_confirmed": bool(cp.bullish_breakout_confirmed),
+            "bearish_breakout_confirmed": bool(cp.bearish_breakout_confirmed),
+            "n_selected_patterns": len(cp.selected_patterns_top5),
+        },
+        "lower_tf_context": {
+            "available": bool(ltf.available),
+            "bullish_trigger": bool(ltf.bullish_trigger),
+            "bearish_trigger": bool(ltf.bearish_trigger),
+            "trigger_type": getattr(ltf, "trigger_type", None),
+            "trigger_strength": getattr(ltf, "trigger_strength", None),
+        },
+        "macro_context": {
+            "currency_bias": macro.currency_bias,
+            "macro_score": float(macro.macro_score),
+            "macro_strong_against": macro.macro_strong_against,
+        },
+        "stop_plan": (
+            stop_plan.to_dict() if stop_plan is not None else None
+        ),
+        "rr": rr,
+        "reasons": list(reasons_template),
+        "reject_reasons": list(block_reasons_template),
+    })
+    return cands
+
+
+def _select_best_setup(candidates: list[dict]) -> dict | None:
+    """Pick the candidate with the highest score that has no
+    reject_reasons. Returns None when nothing passes."""
+    eligible = [c for c in candidates if not c.get("reject_reasons")]
+    if not eligible:
+        return None
+    return max(eligible, key=lambda c: c.get("score", 0.0))
+
+
 def _build_v2_advisory(
     *,
     score: float,
@@ -174,6 +330,10 @@ def _build_v2_advisory(
     lower_tf: LowerTimeframeTrigger,
     macro: MacroAlignmentSnapshot,
     stop_plan: StopPlan | None,
+    setup_candidates: list[dict] | None = None,
+    best_setup: dict | None = None,
+    reconstruction_quality: dict | None = None,
+    multi_scale_chart: dict | None = None,
 ) -> dict:
     cfg = get_royal_road_mode_config(mode)
     return {
@@ -202,6 +362,10 @@ def _build_v2_advisory(
         "structure_stop_plan": (
             stop_plan.to_dict() if stop_plan is not None else None
         ),
+        "setup_candidates": list(setup_candidates or []),
+        "best_setup": best_setup,
+        "reconstruction_quality": dict(reconstruction_quality or {}),
+        "multi_scale_chart": dict(multi_scale_chart or {}),
         "source": "technical_confluence_v1+v2_modules",
     }
 
@@ -281,6 +445,25 @@ def decide_royal_road_v2(
         cp=chart_pattern, ltf=lower_tf, macro=macro,
     )
 
+    # Always compute reconstruction quality + multi-scale (cheap),
+    # so HOLD paths can also surface them in the trace.
+    _early_stop_plan = plan_stop(
+        mode=stop_mode, side="BUY", entry=last_close, atr=atr_value,
+        stop_atr_mult=stop_atr_mult, tp_atr_mult=tp_atr_mult,
+        structure_stop_price=(
+            (technical_confluence or {}).get("risk_plan_obs", {}).get(
+                "structure_stop_price"
+            )
+        ),
+    )
+    early_reconstruction = _reconstruction_quality(
+        sr=sr_snapshot, tl=trendline_ctx, cp=chart_pattern,
+        ltf=lower_tf, macro=macro, stop_plan=_early_stop_plan,
+    )
+    early_multi_scale = reconstruct_chart_multi_scale(
+        df_window, atr_value=atr_value, last_close=last_close,
+    )
+
     # Risk gate (always)
     gate = evaluate_gate(risk_state)
     if not gate.allow_trade:
@@ -298,6 +481,8 @@ def decide_royal_road_v2(
                 sr_snapshot=sr_snapshot, trendline_ctx=trendline_ctx,
                 chart_pattern=chart_pattern, lower_tf=lower_tf,
                 macro=macro, stop_plan=None,
+                reconstruction_quality=early_reconstruction,
+                multi_scale_chart=early_multi_scale,
             ),
         )
 
@@ -319,6 +504,8 @@ def decide_royal_road_v2(
                 min_axes_required=None, sr_snapshot=sr_snapshot,
                 trendline_ctx=trendline_ctx, chart_pattern=chart_pattern,
                 lower_tf=lower_tf, macro=macro, stop_plan=None,
+                reconstruction_quality=early_reconstruction,
+                multi_scale_chart=early_multi_scale,
             ),
         )
 
@@ -397,12 +584,42 @@ def decide_royal_road_v2(
             f"stop_plan_invalid:{stop_plan.invalidation_reason}"
         )
 
+    # Reconstruction quality + multi-scale snapshot (always built, even
+    # on HOLD bars, so the trace can correlate quality with outcome).
+    reconstruction = _reconstruction_quality(
+        sr=sr_snapshot, tl=trendline_ctx, cp=chart_pattern,
+        ltf=lower_tf, macro=macro, stop_plan=stop_plan,
+    )
+    multi_scale = reconstruct_chart_multi_scale(
+        df_window, atr_value=atr_value, last_close=last_close,
+    )
+    # If reconstruction quality is below the threshold, block the entry
+    # even when label / axes / SR / macro / stop all agree.
+    if reconstruction["total_reconstruction_score"] < _MIN_RECONSTRUCTION_SCORE:
+        block_reasons.append("insufficient_royal_road_reconstruction_quality")
+
+    # Build setup candidate(s). v2.2 emits at most one candidate per
+    # bar (the directional one). Future v2.3 could enumerate
+    # alternatives (different stop modes, different evidence subsets).
+    setup_candidates = _build_setup_candidates(
+        side=side,
+        bullish_axes=bullish_axes, bearish_axes=bearish_axes,
+        sr=sr_snapshot, tl=trendline_ctx, cp=chart_pattern,
+        ltf=lower_tf, macro=macro, stop_plan=stop_plan,
+        label=label, score=score,
+        reasons_template=[],
+        block_reasons_template=block_reasons,
+        rr=stop_plan.rr_realized,
+    )
+    best_setup = _select_best_setup(setup_candidates)
+
     if block_reasons:
         return _hold(
             reason="; ".join(block_reasons),
             blocked_by=tuple(block_reasons),
             chain=tuple(chain + [
-                "macro_check", "sr_check", "evidence_v2_check", "stop_plan_check",
+                "macro_check", "sr_check", "evidence_v2_check",
+                "stop_plan_check", "reconstruction_quality_check",
             ]),
             confidence=0.0,
             advisory=_build_v2_advisory(
@@ -412,6 +629,10 @@ def decide_royal_road_v2(
                 min_axes_required=min_axes, sr_snapshot=sr_snapshot,
                 trendline_ctx=trendline_ctx, chart_pattern=chart_pattern,
                 lower_tf=lower_tf, macro=macro, stop_plan=stop_plan,
+                setup_candidates=setup_candidates,
+                best_setup=best_setup,
+                reconstruction_quality=reconstruction,
+                multi_scale_chart=multi_scale,
             ),
         )
 
@@ -433,7 +654,8 @@ def decide_royal_road_v2(
         reason=f"royal_road_decision_v2[{cfg.name}]: {side}",
         blocked_by=(),
         rule_chain=tuple(chain + [
-            "macro_check", "sr_check", "evidence_v2_check", "stop_plan_check",
+            "macro_check", "sr_check", "evidence_v2_check",
+            "stop_plan_check", "reconstruction_quality_check",
         ]),
         advisory=_build_v2_advisory(
             score=score, reasons=reasons, block_reasons=[],
@@ -442,6 +664,10 @@ def decide_royal_road_v2(
             min_axes_required=min_axes, sr_snapshot=sr_snapshot,
             trendline_ctx=trendline_ctx, chart_pattern=chart_pattern,
             lower_tf=lower_tf, macro=macro, stop_plan=stop_plan,
+            setup_candidates=setup_candidates,
+            best_setup=best_setup,
+            reconstruction_quality=reconstruction,
+            multi_scale_chart=multi_scale,
         ),
     )
 

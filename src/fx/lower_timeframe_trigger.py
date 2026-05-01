@@ -53,6 +53,16 @@ class LowerTimeframeTrigger:
     bullish_trigger: bool
     bearish_trigger: bool
     unavailable_reason: str | None
+    # v2.2 trigger metadata (defaults preserve backward compat).
+    parent_bar_ts: str | None = None
+    used_bars_start_ts: str | None = None
+    used_bars_end_ts: str | None = None
+    trigger_ts: str | None = None
+    trigger_price: float | None = None
+    trigger_type: str | None = None
+    trigger_strength: float | None = None
+    confidence: float = 0.0
+    reason: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -72,6 +82,21 @@ class LowerTimeframeTrigger:
             "bullish_trigger": bool(self.bullish_trigger),
             "bearish_trigger": bool(self.bearish_trigger),
             "unavailable_reason": self.unavailable_reason,
+            "parent_bar_ts": self.parent_bar_ts,
+            "used_bars_start_ts": self.used_bars_start_ts,
+            "used_bars_end_ts": self.used_bars_end_ts,
+            "trigger_ts": self.trigger_ts,
+            "trigger_price": (
+                float(self.trigger_price)
+                if self.trigger_price is not None else None
+            ),
+            "trigger_type": self.trigger_type,
+            "trigger_strength": (
+                float(self.trigger_strength)
+                if self.trigger_strength is not None else None
+            ),
+            "confidence": float(self.confidence),
+            "reason": self.reason,
         }
 
 
@@ -223,6 +248,68 @@ def detect_lower_tf_trigger(
         or (breakout and last_close < closes[-2])
     )
 
+    # Trigger metadata: pin which lower-TF bar fired the trigger and
+    # what kind. The "trigger" is conceptually the most recent visible
+    # lower-TF bar (the one used for engulfing / pinbar / breakout
+    # detection). For breakout we also record the actual breakout bar
+    # being the LAST visible bar.
+    trigger_idx = len(visible) - 1
+    trigger_ts = last_ts
+    trigger_price = float(closes[-1])
+    trigger_type: str | None = None
+    if bull_eng:
+        trigger_type = "bullish_engulfing"
+    elif bear_eng:
+        trigger_type = "bearish_engulfing"
+    elif bull_pin:
+        trigger_type = "bullish_pinbar"
+    elif bear_pin:
+        trigger_type = "bearish_pinbar"
+    elif breakout and last_close > closes[-2]:
+        trigger_type = "breakout_up"
+    elif breakout and last_close < closes[-2]:
+        trigger_type = "breakout_down"
+    elif micro_dbottom:
+        trigger_type = "micro_double_bottom"
+    elif micro_dtop:
+        trigger_type = "micro_double_top"
+    else:
+        trigger_type = "no_trigger"
+    # Trigger strength: candle body / range proxy for engulfing & pinbar,
+    # else 0.5 default for breakout / micro_double, else 0.
+    body = abs(closes[-1] - float(visible["open"].iloc[-1]))
+    bar_range = (
+        float(visible["high"].iloc[-1]) - float(visible["low"].iloc[-1])
+    )
+    body_ratio = body / bar_range if bar_range > 0 else 0.0
+    if trigger_type in ("bullish_engulfing", "bearish_engulfing"):
+        trigger_strength = float(min(1.0, body_ratio + 0.2))
+    elif trigger_type in ("bullish_pinbar", "bearish_pinbar"):
+        trigger_strength = float(min(1.0, 1.0 - body_ratio))  # smaller body = stronger pinbar
+    elif trigger_type in ("breakout_up", "breakout_down"):
+        trigger_strength = 0.55 + (0.2 if retest else 0.0)
+    elif trigger_type in ("micro_double_bottom", "micro_double_top"):
+        trigger_strength = 0.5
+    else:
+        trigger_strength = 0.0
+    confidence = (
+        0.5 + 0.3 * trigger_strength + (0.1 if retest else 0.0)
+    )
+    confidence = float(max(0.0, min(0.95, confidence)))
+    reason = trigger_type or "no_trigger"
+
+    used_bars_start_ts = (
+        visible.index[0].isoformat() if len(visible) > 0 else None
+    )
+    used_bars_end_ts = (
+        visible.index[-1].isoformat() if len(visible) > 0 else None
+    )
+    parent_iso = (
+        base_bar_close_ts.isoformat()
+        if isinstance(base_bar_close_ts, pd.Timestamp)
+        else str(base_bar_close_ts)
+    )
+
     return LowerTimeframeTrigger(
         schema_version="lower_tf_trigger_v2",
         interval=lower_tf_interval,
@@ -240,6 +327,15 @@ def detect_lower_tf_trigger(
         bullish_trigger=bullish_trigger,
         bearish_trigger=bearish_trigger,
         unavailable_reason=None,
+        parent_bar_ts=parent_iso,
+        used_bars_start_ts=used_bars_start_ts,
+        used_bars_end_ts=used_bars_end_ts,
+        trigger_ts=trigger_ts,
+        trigger_price=trigger_price,
+        trigger_type=trigger_type,
+        trigger_strength=trigger_strength,
+        confidence=confidence,
+        reason=reason,
     )
 
 
