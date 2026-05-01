@@ -604,6 +604,72 @@ class MacroContextSlice:
 
 
 @dataclass(frozen=True)
+class TechnicalConfluenceSlice:
+    """Royal-road technical confluence observation (PR-C1).
+
+    Wraps the dict returned by `technical_confluence.build_technical_confluence`.
+    Stored on `BarDecisionTrace.technical_confluence` (Optional). All
+    fields are observation-only: they are NEVER read by `decide_action`,
+    `risk_gate`, or any RuleCheck. Adding/removing fields here MUST NOT
+    change `result.trades` or `BarDecisionTrace.decision.final_action`
+    — pinned by `tests/test_technical_confluence_trace_observation_only.py`.
+
+    Schema (each value is itself a JSON-serializable dict; see
+    `technical_confluence.py` for the canonical key list):
+      policy_version       — str, e.g. "technical_confluence_v1"
+      market_regime        — TREND_UP|TREND_DOWN|RANGE|VOLATILE|UNKNOWN
+      dow_structure        — last swing levels, structure_code, BOS flags
+      support_resistance   — nearest levels, distances, near/breakout flags
+      candlestick_signal   — pinbar / engulfing / harami / strong body
+      chart_pattern        — mirror of pattern.detected_pattern + neckline
+      indicator_context    — RSI regime / BB lifecycle / MACD momentum
+      risk_plan_obs        — ATR stop vs structure stop, RR observations
+      vote_breakdown       — indicator vote audit + per-source alignment
+      final_confluence     — STRONG_BUY_SETUP / WEAK_BUY_SETUP / NO_TRADE / ...
+    """
+
+    policy_version: str
+    market_regime: str
+    dow_structure: dict
+    support_resistance: dict
+    candlestick_signal: dict
+    chart_pattern: dict
+    indicator_context: dict
+    risk_plan_obs: dict
+    vote_breakdown: dict
+    final_confluence: dict
+
+    def to_dict(self) -> dict:
+        return {
+            "policy_version": self.policy_version,
+            "market_regime": self.market_regime,
+            "dow_structure": dict(self.dow_structure),
+            "support_resistance": dict(self.support_resistance),
+            "candlestick_signal": dict(self.candlestick_signal),
+            "chart_pattern": dict(self.chart_pattern),
+            "indicator_context": dict(self.indicator_context),
+            "risk_plan_obs": dict(self.risk_plan_obs),
+            "vote_breakdown": dict(self.vote_breakdown),
+            "final_confluence": dict(self.final_confluence),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TechnicalConfluenceSlice":
+        return cls(
+            policy_version=str(d.get("policy_version", "technical_confluence_v1")),
+            market_regime=str(d.get("market_regime", "UNKNOWN")),
+            dow_structure=dict(d.get("dow_structure", {})),
+            support_resistance=dict(d.get("support_resistance", {})),
+            candlestick_signal=dict(d.get("candlestick_signal", {})),
+            chart_pattern=dict(d.get("chart_pattern", {})),
+            indicator_context=dict(d.get("indicator_context", {})),
+            risk_plan_obs=dict(d.get("risk_plan_obs", {})),
+            vote_breakdown=dict(d.get("vote_breakdown", {})),
+            final_confluence=dict(d.get("final_confluence", {})),
+        )
+
+
+@dataclass(frozen=True)
 class FundamentalSlice:
     nearby_events: tuple[dict, ...]
     blocking_events: tuple[dict, ...]
@@ -819,6 +885,14 @@ class BarDecisionTrace:
     # Populated when backtest_engine receives a MacroSnapshot. Optional
     # for backward compat and for runs where macro fetch failed.
     macro_context: MacroContextSlice | None = None
+    # Optional royal-road technical confluence observation (PR-C1).
+    # Populated unconditionally by decision_trace_build for every bar
+    # the trace is built (warmup bars get an `UNKNOWN`-shaped dict via
+    # `technical_confluence.empty_technical_confluence`). Default None
+    # preserves backward compatibility for older trace JSONL readers
+    # and for live cmd_trace export paths that have not been wired yet.
+    # OBSERVATION-ONLY — never read by decide_action / risk_gate.
+    technical_confluence: TechnicalConfluenceSlice | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -846,6 +920,10 @@ class BarDecisionTrace:
             "decision": self.decision.to_dict(),
             "future_outcome": (
                 self.future_outcome.to_dict() if self.future_outcome else None
+            ),
+            "technical_confluence": (
+                self.technical_confluence.to_dict()
+                if self.technical_confluence else None
             ),
         }
 
@@ -917,6 +995,7 @@ __all__ = [
     "HigherTimeframeSlice",
     "LongTermTrendSlice",
     "MacroContextSlice",
+    "TechnicalConfluenceSlice",
     "FundamentalSlice",
     "ExecutionAssumptionSlice",
     "ExecutionTraceSlice",

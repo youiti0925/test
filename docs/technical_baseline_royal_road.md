@@ -480,3 +480,15 @@ First step: observe royal-road concepts in trace.
 Second step: verify which concepts separate winners from losers.
 
 Third step: only then connect proven concepts to decision logic.
+
+---
+
+## 10. Implementation Status
+
+- `technical_confluence_v1` observation-only implementation added.
+  See [`docs/technical_confluence_v1.md`](technical_confluence_v1.md).
+- Not connected to `decision_engine.decide_action`.
+- Not connected to `risk_gate`.
+- Intended for win/loss analysis and future A/B design only.
+- Decision pipeline output is byte-identical to PR #21 (pinned by
+  `tests/test_technical_confluence_trace_observation_only.py`).
