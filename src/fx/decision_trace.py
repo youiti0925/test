@@ -691,6 +691,18 @@ class RoyalRoadDecisionSlice:
     reasons: list
     block_reasons: list
     compared_to_current_runtime: dict
+    # royal_road_decision_v1 mode metadata (added when the profile is
+    # split into strict / balanced / exploratory). Defaults preserve
+    # backward compat for any caller that constructs the slice without
+    # them — e.g. live cmd_trade legacy export paths that never produce
+    # this slice anyway.
+    mode: str = "balanced"
+    mode_status: str = "heuristic_not_validated_default"
+    mode_needs_validation: bool = True
+    cautions: list = field(default_factory=list)
+    evidence_axes: dict = field(default_factory=dict)
+    evidence_axes_count: dict = field(default_factory=dict)
+    min_evidence_axes_required: int | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -703,6 +715,13 @@ class RoyalRoadDecisionSlice:
             "compared_to_current_runtime": dict(
                 self.compared_to_current_runtime
             ),
+            "mode": self.mode,
+            "mode_status": self.mode_status,
+            "mode_needs_validation": bool(self.mode_needs_validation),
+            "cautions": list(self.cautions),
+            "evidence_axes": dict(self.evidence_axes),
+            "evidence_axes_count": dict(self.evidence_axes_count),
+            "min_evidence_axes_required": self.min_evidence_axes_required,
         }
 
     @classmethod
@@ -721,6 +740,17 @@ class RoyalRoadDecisionSlice:
             reasons=list(adv.get("reasons") or []),
             block_reasons=list(adv.get("block_reasons") or []),
             compared_to_current_runtime=dict(comparison),
+            mode=str(adv.get("mode", "balanced")),
+            mode_status=str(
+                adv.get("mode_status", "heuristic_not_validated_default")
+            ),
+            mode_needs_validation=bool(
+                adv.get("mode_needs_validation", True)
+            ),
+            cautions=list(adv.get("cautions") or []),
+            evidence_axes=dict(adv.get("evidence_axes") or {}),
+            evidence_axes_count=dict(adv.get("evidence_axes_count") or {}),
+            min_evidence_axes_required=adv.get("min_evidence_axes_required"),
         )
 
 

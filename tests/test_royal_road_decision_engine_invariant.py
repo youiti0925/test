@@ -116,9 +116,17 @@ def test_royal_road_profile_emits_royal_slice_on_every_bar():
         slice_ = tr.royal_road_decision
         assert slice_.profile == "royal_road_decision_v1"
         assert slice_.action in ("BUY", "SELL", "HOLD")
+        # The active profile is royal-road, so tr.decision.final_action
+        # is the royal-road action. compared_to_current_runtime stores
+        # what current_runtime would have produced for the same bar —
+        # equality with current_action is NOT guaranteed (and is in
+        # fact the discovery surface).
         cmp_ = slice_.compared_to_current_runtime
-        assert cmp_["current_action"] == tr.decision.final_action
         assert cmp_["royal_road_action"] == slice_.action
+        assert cmp_["royal_road_action"] == tr.decision.final_action
+        # Mode metadata must always be present.
+        assert slice_.mode in ("strict", "balanced", "exploratory")
+        assert slice_.mode_needs_validation is True
 
 
 def test_royal_road_profile_runs_to_completion():

@@ -48,6 +48,10 @@ from .royal_road_decision import (
     decide_royal_road,
     validate_decision_profile,
 )
+from .royal_road_decision_modes import (
+    DEFAULT_ROYAL_ROAD_MODE,
+    get_royal_road_mode_config,
+)
 from .technical_confluence import build_technical_confluence
 from .macro import MacroSnapshot
 from .waveform_library import WaveformSample
@@ -578,6 +582,12 @@ def run_engine_backtest(
     # metadata. Live / OANDA / paper paths do not call this function
     # so this kwarg cannot affect live trading.
     decision_profile: str = "current_runtime",
+    # royal_road_decision_v1 mode selector. Only consulted when
+    # decision_profile == "royal_road_decision_v1". Defaults to
+    # `balanced` (research candidate); `strict` reproduces the original
+    # diagnostic heuristic; `exploratory` is for discovery and not for
+    # adoption. See `royal_road_decision_modes.py`.
+    royal_road_mode: str = DEFAULT_ROYAL_ROAD_MODE,
 ) -> EngineBacktestResult:
     """Run a Decision Engine-driven backtest over `df`.
 
@@ -661,6 +671,11 @@ def run_engine_backtest(
     # profile module after the existing decide_action call.
     _decision_profile = validate_decision_profile(decision_profile)
     _royal_road_active = (_decision_profile == ROYAL_ROAD_PROFILE)
+    # Validate the mode upfront (raises ValueError on unknown values).
+    # The kwarg is harmless when the profile is current_runtime, but we
+    # still want unknown values to surface immediately rather than
+    # waiting for the first royal-road bar.
+    _royal_road_mode = get_royal_road_mode_config(royal_road_mode).name
 
     # PR #21: resolve indicator-period overrides. None → existing
     # current_runtime defaults, non-None → flowed through.
@@ -968,6 +983,7 @@ def run_engine_backtest(
                 risk_reward=risk_reward,
                 risk_state=risk_state,
                 technical_confluence=confluence_dict,
+                mode=_royal_road_mode,
             )
             royal_compare = compare_royal_decisions(
                 decision_current=decision_current,

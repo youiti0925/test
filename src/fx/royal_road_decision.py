@@ -67,33 +67,36 @@ def _bearish_candle(tc: dict) -> bool:
     return bool(cs.get("bearish_pinbar") or cs.get("bearish_engulfing") or cs.get("strong_bear_body"))
 
 
-def _evidence_axes(tc: dict, side: str) -> list[str]:
+def _evidence_axes_dict(tc: dict, side: str) -> dict[str, bool]:
+    """Per-axis booleans for the requested side ("BUY"|"SELL")."""
     sr = tc.get("support_resistance") or {}
     chart = tc.get("chart_pattern") or {}
-    axes: list[str] = []
     if side == "BUY":
-        if _structure_says_bullish(tc):
-            axes.append("bullish_structure")
-        if sr.get("near_support"):
-            axes.append("near_support")
-        if sr.get("role_reversal"):
-            axes.append("role_reversal_support_candidate")
-        if _bullish_candle(tc):
-            axes.append("bullish_candlestick")
-        if chart.get("neckline_broken") and (chart.get("double_bottom") or chart.get("triple_bottom")):
-            axes.append("bullish_neckline_break")
-    else:
-        if _structure_says_bearish(tc):
-            axes.append("bearish_structure")
-        if sr.get("near_resistance"):
-            axes.append("near_resistance")
-        if sr.get("role_reversal"):
-            axes.append("role_reversal_resistance_candidate")
-        if _bearish_candle(tc):
-            axes.append("bearish_candlestick")
-        if chart.get("neckline_broken") and (chart.get("double_top") or chart.get("triple_top")):
-            axes.append("bearish_neckline_break")
-    return axes
+        return {
+            "bullish_structure": _structure_says_bullish(tc),
+            "near_support": bool(sr.get("near_support")),
+            "role_reversal_support_candidate": bool(sr.get("role_reversal")),
+            "bullish_candlestick": _bullish_candle(tc),
+            "bullish_neckline_break": bool(
+                chart.get("neckline_broken")
+                and (chart.get("double_bottom") or chart.get("triple_bottom"))
+            ),
+        }
+    return {
+        "bearish_structure": _structure_says_bearish(tc),
+        "near_resistance": bool(sr.get("near_resistance")),
+        "role_reversal_resistance_candidate": bool(sr.get("role_reversal")),
+        "bearish_candlestick": _bearish_candle(tc),
+        "bearish_neckline_break": bool(
+            chart.get("neckline_broken")
+            and (chart.get("double_top") or chart.get("triple_top"))
+        ),
+    }
+
+
+def _evidence_axes(tc: dict, side: str) -> list[str]:
+    """Backward-compat list-of-names form (used by reasons output)."""
+    return [k for k, v in _evidence_axes_dict(tc, side).items() if v]
 
 
 def _label_to_side(label: str) -> str | None:
@@ -125,6 +128,9 @@ def _build_advisory(
     block_reasons: list[str],
     mode: str,
     cautions: list[str] | None = None,
+    evidence_axes: dict[str, dict[str, bool]] | None = None,
+    evidence_axes_count: dict[str, int] | None = None,
+    min_evidence_axes_required: int | None = None,
 ) -> dict:
     cfg = get_royal_road_mode_config(mode)
     return {
@@ -136,6 +142,9 @@ def _build_advisory(
         "reasons": list(reasons),
         "block_reasons": list(block_reasons),
         "cautions": list(cautions or []),
+        "evidence_axes": dict(evidence_axes or {}),
+        "evidence_axes_count": dict(evidence_axes_count or {}),
+        "min_evidence_axes_required": min_evidence_axes_required,
         "source": "technical_confluence_v1",
     }
 
@@ -163,6 +172,16 @@ def decide_royal_road(
     block_reasons: list[str] = []
     cautions: list[str] = []
 
+    # Compute both sides' axes up front so the advisory can always
+    # carry the full evidence picture, even on HOLD bars where the
+    # decision never reached the directional path.
+    bullish_axes_dict = _evidence_axes_dict(tc, "BUY")
+    bearish_axes_dict = _evidence_axes_dict(tc, "SELL")
+    n_bull = sum(1 for v in bullish_axes_dict.values() if v)
+    n_bear = sum(1 for v in bearish_axes_dict.values() if v)
+    evidence_axes = {"bullish": bullish_axes_dict, "bearish": bearish_axes_dict}
+    evidence_axes_count = {"bullish": n_bull, "bearish": n_bear}
+
     gate = evaluate_gate(risk_state)
     if not gate.allow_trade:
         codes = tuple(gate.blocked_codes)
@@ -176,6 +195,9 @@ def decide_royal_road(
                 reasons=[],
                 block_reasons=[f"gate:{c}" for c in codes],
                 mode=cfg.name,
+                evidence_axes=evidence_axes,
+                evidence_axes_count=evidence_axes_count,
+                min_evidence_axes_required=None,
             ),
         )
 
@@ -190,7 +212,13 @@ def decide_royal_road(
             blocked_by=tuple(block_reasons),
             chain=tuple(chain + ["non_directional_label"]),
             confidence=0.0,
-            advisory=_build_advisory(score=score, reasons=[], block_reasons=block_reasons, mode=cfg.name),
+            advisory=_build_advisory(
+                score=score, reasons=[], block_reasons=block_reasons,
+                mode=cfg.name,
+                evidence_axes=evidence_axes,
+                evidence_axes_count=evidence_axes_count,
+                min_evidence_axes_required=None,
+            ),
         )
 
     is_weak = label.startswith("WEAK_")
@@ -229,10 +257,13 @@ def decide_royal_road(
         if htf_block:
             block_reasons.append(htf_block)
 
-    axes = _evidence_axes(tc, side)
+    axes_for_side = bullish_axes_dict if side == "BUY" else bearish_axes_dict
+    axes = [k for k, v in axes_for_side.items() if v]
     min_axes = cfg.min_evidence_axes_weak if is_weak else cfg.min_evidence_axes_strong
     if len(axes) < min_axes:
-        block_reasons.append(f"insufficient_{side.lower()}_evidence_axes:{len(axes)}<{min_axes}")
+        block_reasons.append(
+            f"insufficient_{side.lower()}_evidence_axes:{len(axes)}<{min_axes}"
+        )
 
     if block_reasons:
         return _hold(
@@ -246,6 +277,9 @@ def decide_royal_road(
                 block_reasons=block_reasons,
                 cautions=cautions,
                 mode=cfg.name,
+                evidence_axes=evidence_axes,
+                evidence_axes_count=evidence_axes_count,
+                min_evidence_axes_required=min_axes,
             ),
         )
 
@@ -263,7 +297,13 @@ def decide_royal_road(
         reason=f"royal_road_decision_v1[{cfg.name}]: {side}",
         blocked_by=(),
         rule_chain=tuple(chain + ["risk_quality_check", "evidence_axis_check"]),
-        advisory=_build_advisory(score=score, reasons=reasons, block_reasons=[], cautions=cautions, mode=cfg.name),
+        advisory=_build_advisory(
+            score=score, reasons=reasons, block_reasons=[],
+            cautions=cautions, mode=cfg.name,
+            evidence_axes=evidence_axes,
+            evidence_axes_count=evidence_axes_count,
+            min_evidence_axes_required=min_axes,
+        ),
     )
 
 
@@ -303,10 +343,20 @@ def validate_decision_profile(name: str) -> str:
     return name
 
 
+def validate_royal_road_mode(name: str) -> str:
+    """Re-export of `royal_road_decision_modes.get_royal_road_mode_config`
+    that returns the canonical name (or raises ValueError).
+
+    Useful for callers that only want validation and the resolved name,
+    not the full dataclass."""
+    return get_royal_road_mode_config(name).name
+
+
 __all__ = [
     "PROFILE_NAME",
     "SUPPORTED_DECISION_PROFILES",
     "decide_royal_road",
     "compare_decisions",
     "validate_decision_profile",
+    "validate_royal_road_mode",
 ]

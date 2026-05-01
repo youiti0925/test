@@ -1241,6 +1241,7 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
         bb_std=runtime_kwargs.get("bb_std"),
         atr_period=runtime_kwargs.get("atr_period"),
         decision_profile=getattr(args, "decision_profile", "current_runtime"),
+        royal_road_mode=getattr(args, "royal_road_mode", "balanced"),
     )
     metrics = result.metrics()
     start_date = str(df.index[0])
@@ -2330,12 +2331,33 @@ def build_parser() -> argparse.ArgumentParser:
             "`current_runtime` is byte-identical to PR #21 main. "
             "`royal_road_decision_v1` (opt-in) reads "
             "technical_confluence_v1 and applies royal-road rules "
-            "(STRONG_BUY_SETUP + invalidation_clear + structure_stop + "
-            "bullish evidence + not near_resistance + no avoid_reasons). "
+            "with strictness selected by --royal-road-mode. "
             "Backtest-only — live cmd_trade does not call "
             "run_engine_backtest, so this flag cannot affect live "
             "trading. The trace gains a `royal_road_decision` slice "
             "with comparison metadata when the profile is non-default."
+        ),
+    )
+    from .royal_road_decision_modes import (
+        DEFAULT_ROYAL_ROAD_MODE as _DEFAULT_ROYAL_ROAD_MODE,
+        supported_royal_road_modes as _supported_royal_road_modes,
+    )
+    be.add_argument(
+        "--royal-road-mode",
+        default=_DEFAULT_ROYAL_ROAD_MODE,
+        choices=_supported_royal_road_modes(),
+        help=(
+            "Strictness mode for `royal_road_decision_v1`. Only "
+            "consulted when --decision-profile is "
+            "royal_road_decision_v1. `balanced` (default) is the "
+            "research candidate (STRONG enters with >=1 axis, WEAK "
+            "with >=2 axes; invalidation_clear / structure_stop "
+            "missing become cautions). `strict` is a diagnostic "
+            "baseline (STRONG only, WEAK -> HOLD, missing "
+            "invalidation/structure_stop -> block). `exploratory` "
+            "is for discovering adjacent rules (WEAK with >=1 axis) "
+            "and is NOT a candidate for adoption. All three modes "
+            "are heuristic and pending validation."
         ),
     )
     be.add_argument("--trace-out", default=None,
