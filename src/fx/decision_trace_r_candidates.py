@@ -350,6 +350,198 @@ def _r11_monthly_return_waveform_hold_outcome(trades: Sequence[Any]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# R12-R16: technical_confluence_v1 hypothesis cells (PR-C2)
+#
+# These read trade['entry_trace']['technical_confluence']. When the
+# slice is missing (legacy traces, live cmd_trade) the trade is simply
+# excluded from the relevant cell.
+# ---------------------------------------------------------------------------
+
+
+_CONFLUENCE_LABELS: tuple[str, ...] = (
+    "STRONG_BUY_SETUP",
+    "WEAK_BUY_SETUP",
+    "STRONG_SELL_SETUP",
+    "WEAK_SELL_SETUP",
+    "NO_TRADE",
+    "AVOID_TRADE",
+    "UNKNOWN",
+)
+
+_BULLISH_CANDLE_FLAGS: tuple[str, ...] = (
+    "bullish_pinbar", "bullish_engulfing", "strong_bull_body",
+)
+_BEARISH_CANDLE_FLAGS: tuple[str, ...] = (
+    "bearish_pinbar", "bearish_engulfing", "strong_bear_body",
+)
+
+
+def _tc(trade: Any) -> dict:
+    """Trade's technical_confluence dict (or empty dict if absent)."""
+    tr = _trace_of(trade)
+    return _safe_get(tr, "technical_confluence", {}) or {}
+
+
+def _tc_label(trade: Any) -> str:
+    return (_tc(trade).get("final_confluence") or {}).get("label") or "UNKNOWN"
+
+
+def _tc_sr(trade: Any) -> dict:
+    return _tc(trade).get("support_resistance") or {}
+
+
+def _tc_candle(trade: Any) -> dict:
+    return _tc(trade).get("candlestick_signal") or {}
+
+
+def _tc_indicator(trade: Any) -> dict:
+    return _tc(trade).get("indicator_context") or {}
+
+
+def _tc_risk(trade: Any) -> dict:
+    return _tc(trade).get("risk_plan_obs") or {}
+
+
+def _has_any_flag(d: dict, flags: tuple[str, ...]) -> bool:
+    return any(bool(d.get(f)) for f in flags)
+
+
+def _structure_stop_bucket(distance_atr: Any) -> str:
+    if not isinstance(distance_atr, (int, float)):
+        return "structure_stop_missing"
+    d = float(distance_atr)
+    if d < 0.5:                 return "structure_stop_lt_0_5_atr"
+    if d < 1.5:                 return "structure_stop_0_5_to_1_5_atr"
+    if d < 3.0:                 return "structure_stop_1_5_to_3_0_atr"
+    return "structure_stop_gt_3_0_atr"
+
+
+def _r12_confluence_label_outcome(trades: Sequence[Any]) -> dict:
+    """Bucket trades by `final_confluence.label` and report W/L/WR/PF."""
+    cells = []
+    for label in _CONFLUENCE_LABELS:
+        rows = [t for t in trades if _tc_label(t) == label]
+        cells.append(_cell(rows, label=f"label={label}"))
+    return {
+        "hypothesis": (
+            "technical_confluence label separates winners from losers (R12)"
+        ),
+        "policy_version": "r12_v1",
+        "cells": cells,
+    }
+
+
+def _r13_sr_proximity_outcome(trades: Sequence[Any]) -> dict:
+    """Trades pivoted by support/resistance proximity at entry."""
+    near_support = [t for t in trades if _tc_sr(t).get("near_support")]
+    near_resistance = [t for t in trades if _tc_sr(t).get("near_resistance")]
+    not_near_any = [
+        t for t in trades
+        if not _tc_sr(t).get("near_support")
+        and not _tc_sr(t).get("near_resistance")
+    ]
+    return {
+        "hypothesis": (
+            "near_support / near_resistance entries differ in WR vs "
+            "level-agnostic entries (R13)"
+        ),
+        "policy_version": "r13_v1",
+        "cells": [
+            _cell(near_support,    label="near_support"),
+            _cell(near_resistance, label="near_resistance"),
+            _cell(not_near_any,    label="not_near_any_level"),
+        ],
+    }
+
+
+def _r14_candlestick_confirmation_outcome(trades: Sequence[Any]) -> dict:
+    """Compare entries with vs without a candlestick confirmation."""
+    bullish = [
+        t for t in trades
+        if _has_any_flag(_tc_candle(t), _BULLISH_CANDLE_FLAGS)
+    ]
+    bearish = [
+        t for t in trades
+        if _has_any_flag(_tc_candle(t), _BEARISH_CANDLE_FLAGS)
+    ]
+    any_conf = [
+        t for t in trades
+        if (
+            _has_any_flag(_tc_candle(t), _BULLISH_CANDLE_FLAGS)
+            or _has_any_flag(_tc_candle(t), _BEARISH_CANDLE_FLAGS)
+        )
+    ]
+    none_conf = [
+        t for t in trades
+        if not _has_any_flag(_tc_candle(t), _BULLISH_CANDLE_FLAGS)
+        and not _has_any_flag(_tc_candle(t), _BEARISH_CANDLE_FLAGS)
+    ]
+    return {
+        "hypothesis": (
+            "lower-TF candlestick confirmation improves WR (R14)"
+        ),
+        "policy_version": "r14_v1",
+        "cells": [
+            _cell(bullish,   label="bullish_candle_confirmation"),
+            _cell(bearish,   label="bearish_candle_confirmation"),
+            _cell(any_conf,  label="any_candlestick_confirmation"),
+            _cell(none_conf, label="no_candlestick_confirmation"),
+        ],
+    }
+
+
+def _r15_rsi_regime_danger_outcome(trades: Sequence[Any]) -> dict:
+    """Pivot trades by RSI regime danger flag."""
+    danger_true = [
+        t for t in trades if _tc_indicator(t).get("rsi_trend_danger") is True
+    ]
+    danger_false = [
+        t for t in trades if _tc_indicator(t).get("rsi_trend_danger") is False
+    ]
+    range_valid = [
+        t for t in trades if _tc_indicator(t).get("rsi_range_valid") is True
+    ]
+    return {
+        "hypothesis": (
+            "rsi_trend_danger=True (counter-trend RSI extreme during a "
+            "directional regime) entries underperform (R15)"
+        ),
+        "policy_version": "r15_v1",
+        "cells": [
+            _cell(danger_true,  label="rsi_trend_danger_true"),
+            _cell(danger_false, label="rsi_trend_danger_false"),
+            _cell(range_valid,  label="rsi_range_valid_true"),
+        ],
+    }
+
+
+def _r16_structure_stop_distance_outcome(trades: Sequence[Any]) -> dict:
+    """Bucket trades by structure_stop_distance_atr."""
+    buckets: dict[str, list] = defaultdict(list)
+    for t in trades:
+        b = _structure_stop_bucket(
+            _tc_risk(t).get("structure_stop_distance_atr")
+        )
+        buckets[b].append(t)
+    bucket_order = (
+        "structure_stop_missing",
+        "structure_stop_lt_0_5_atr",
+        "structure_stop_0_5_to_1_5_atr",
+        "structure_stop_1_5_to_3_0_atr",
+        "structure_stop_gt_3_0_atr",
+    )
+    return {
+        "hypothesis": (
+            "structure-stop distance band predicts trade quality (R16)"
+        ),
+        "policy_version": "r16_v1",
+        "cells": [
+            _cell(buckets[b], label=b) for b in bucket_order
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -412,4 +604,15 @@ def compute_r_candidates_summary(
         "r10_near_sma200_buy_outcome":         _r10_near_sma200_buy_outcome(trades),
         "r11_monthly_return_waveform_hold_outcome":
             _r11_monthly_return_waveform_hold_outcome(trades),
+        # PR-C2: technical_confluence_v1 hypothesis cells.
+        "r12_confluence_label_outcome":
+            _r12_confluence_label_outcome(trades),
+        "r13_sr_proximity_outcome":
+            _r13_sr_proximity_outcome(trades),
+        "r14_candlestick_confirmation_outcome":
+            _r14_candlestick_confirmation_outcome(trades),
+        "r15_rsi_regime_danger_outcome":
+            _r15_rsi_regime_danger_outcome(trades),
+        "r16_structure_stop_distance_outcome":
+            _r16_structure_stop_distance_outcome(trades),
     }
