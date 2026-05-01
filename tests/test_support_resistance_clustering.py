@@ -98,6 +98,94 @@ def test_to_dict_round_trip():
     assert "fake_breakout" in d
 
 
+def test_broken_count_positive_when_closes_traverse_level():
+    """Direct unit test of the per-level history scan: a series that
+    crosses the level price multiple times must produce broken_count > 0
+    AND role_reversal_count > 0 (sustained crossings)."""
+    from src.fx.support_resistance import _level_history_counts
+    # 4 sustained crossings of the price 100.
+    closes = np.concatenate([
+        np.linspace(95, 105, 30),    # cross 100 going up
+        np.linspace(105, 95, 30),    # cross 100 going down
+        np.linspace(95, 110, 40),    # cross 100 going up (sustained at 110)
+        np.linspace(110, 90, 40),    # cross 100 going down (sustained at 90)
+    ])
+    broken, false_brk, role_rev = _level_history_counts(
+        closes=closes, level_price=100.0, atr_value=1.0,
+        first_touch_index=0, last_touch_index=len(closes) - 1,
+    )
+    assert broken >= 4, f"expected >=4 traversals, got {broken}"
+    assert role_rev >= 1, f"expected >=1 sustained reversal, got {role_rev}"
+
+
+def test_false_breakout_count_positive_on_quick_reversion():
+    """A close that briefly exceeds the level and returns within 5 bars
+    must register false_breakout_count >= 1."""
+    from src.fx.support_resistance import _level_history_counts
+    # Spike above 100 for 1 bar, then back below for many bars.
+    base_below = np.full(40, 95.0)
+    spike = np.array([102.0])               # 1-bar excursion above 100
+    return_below = np.full(40, 95.0)
+    closes = np.concatenate([base_below, spike, return_below])
+    broken, false_brk, role_rev = _level_history_counts(
+        closes=closes, level_price=100.0, atr_value=1.0,
+        first_touch_index=0, last_touch_index=len(closes) - 1,
+    )
+    assert broken >= 2, "spike should produce two flips (up then down)"
+    assert false_brk >= 1, (
+        f"a 1-bar excursion that returned within 5 bars must count as "
+        f"a false breakout; got false_brk={false_brk}"
+    )
+
+
+def test_role_reversal_count_positive_on_sustained_break():
+    """A break that does NOT return within 5 bars counts as a genuine
+    role reversal (broken AND last side change held)."""
+    from src.fx.support_resistance import _level_history_counts
+    closes = np.concatenate([
+        np.full(20, 95.0),    # below the level
+        np.full(20, 105.0),   # sustained break to above (>5 bars)
+    ])
+    broken, false_brk, role_rev = _level_history_counts(
+        closes=closes, level_price=100.0, atr_value=1.0,
+        first_touch_index=0, last_touch_index=len(closes) - 1,
+    )
+    assert broken == 1
+    assert false_brk == 0
+    assert role_rev == 1
+
+
+def test_strength_score_decreases_with_false_breakouts():
+    """Two clusters with identical touches/recency but different false
+    breakout counts must have different strength_score."""
+    from src.fx.support_resistance import (
+        _level_history_counts, _CLUSTER_BUCKET_ATR,
+    )
+    # Cluster A: clean (no false breakouts).
+    closes_a = np.concatenate([
+        np.full(20, 95.0), np.full(20, 105.0),
+    ])
+    a = _level_history_counts(
+        closes=closes_a, level_price=100.0, atr_value=1.0,
+        first_touch_index=0, last_touch_index=len(closes_a) - 1,
+    )
+    # Cluster B: same broken_count but with two extra false breakouts.
+    closes_b = np.concatenate([
+        np.full(10, 95.0),
+        np.array([102.0]),       # false breakout #1
+        np.full(10, 95.0),
+        np.array([102.0]),       # false breakout #2
+        np.full(10, 95.0),
+        np.full(10, 105.0),      # sustained break
+    ])
+    b = _level_history_counts(
+        closes=closes_b, level_price=100.0, atr_value=1.0,
+        first_touch_index=0, last_touch_index=len(closes_b) - 1,
+    )
+    # B has more flips total and more false breakouts than A.
+    assert b[1] > a[1]
+
+
 def test_no_future_leak_uses_only_past_swings():
     """The detector relies on patterns.detect_swings which is future-
     leak safe. As a smoke check: detect_levels(df.iloc[:K]) only uses

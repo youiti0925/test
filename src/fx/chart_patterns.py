@@ -35,6 +35,16 @@ _FLAG_MAX_BARS: Final[int] = 30
 _WEDGE_MIN_SWINGS: Final[int] = 4
 _TRIANGLE_TOL_ATR: Final[float] = 0.4
 
+# Retest detection. After a confirmed neckline break, scan forward
+# (NEVER beyond the current bar — `closes` is already truncated)
+# looking for a return to within `_RETEST_TOL_ATR * ATR` of the
+# neckline followed by a continuation move in the breakout direction
+# of at least `_RETEST_CONTINUATION_ATR * ATR`. Both bars must be
+# within `_RETEST_MAX_BARS` of the breakout.
+_RETEST_TOL_ATR: Final[float] = 0.3
+_RETEST_CONTINUATION_ATR: Final[float] = 0.2
+_RETEST_MAX_BARS: Final[int] = 20
+
 
 PatternKind = Literal[
     "head_and_shoulders",
@@ -136,6 +146,69 @@ def empty_snapshot(reason: str = "insufficient_data") -> ChartPatternSnapshot:
     )
 
 
+def _retest_confirmed(
+    *,
+    closes: np.ndarray,
+    neckline: float | None,
+    side_bias: str,
+    breakout_search_start: int,
+    atr_value: float,
+) -> bool:
+    """Did price retest the broken neckline and continue in the
+    breakout direction?
+
+    For SELL (head_and_shoulders, descending breaks):
+      breakout = first bar where close < neckline at index >=
+                 breakout_search_start
+      retest   = a later close within [_RETEST_TOL_ATR * atr] of the
+                 neckline (return UP toward neckline)
+      continuation = the bar after retest closes BELOW retest_close by
+                     at least [_RETEST_CONTINUATION_ATR * atr]
+
+    For BUY (inverse_head_and_shoulders, ascending breaks):
+      mirror.
+
+    Future-leak safe: only walks the supplied `closes` array (which
+    is already truncated to the current bar by the caller).
+    """
+    if (
+        neckline is None or atr_value <= 0
+        or breakout_search_start < 0
+        or breakout_search_start >= len(closes)
+        or side_bias not in ("BUY", "SELL")
+    ):
+        return False
+
+    breakout_bar: int | None = None
+    for i in range(breakout_search_start, len(closes)):
+        c = float(closes[i])
+        if side_bias == "SELL" and c < neckline:
+            breakout_bar = i
+            break
+        if side_bias == "BUY" and c > neckline:
+            breakout_bar = i
+            break
+    if breakout_bar is None:
+        return False
+
+    tol = _RETEST_TOL_ATR * atr_value
+    cont = _RETEST_CONTINUATION_ATR * atr_value
+    end = min(len(closes), breakout_bar + 1 + _RETEST_MAX_BARS)
+    for j in range(breakout_bar + 1, end - 1):
+        c_j = float(closes[j])
+        c_next = float(closes[j + 1])
+        # Retest = price returned within tolerance of neckline.
+        if abs(c_j - neckline) > tol:
+            continue
+        # Continuation = next close moves further in the breakout
+        # direction by at least `cont`.
+        if side_bias == "SELL" and c_next <= c_j - cont:
+            return True
+        if side_bias == "BUY" and c_next >= c_j + cont:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Individual detectors
 # ---------------------------------------------------------------------------
@@ -165,11 +238,15 @@ def _detect_head_and_shoulders(highs, lows, atr_value, closes) -> PatternMatch |
     confidence = 0.65 + min(
         0.2, (h2.price - max(h1.price, h3.price)) / (3 * atr_value)
     )
+    retested = _retest_confirmed(
+        closes=closes, neckline=neckline, side_bias="SELL",
+        breakout_search_start=int(h3.index), atr_value=atr_value,
+    ) if broken else False
     return PatternMatch(
         kind="head_and_shoulders",
         neckline=neckline,
         neckline_broken=broken,
-        retested=False,
+        retested=retested,
         invalidation_price=float(h2.price),
         target_price=float(target),
         confidence=float(min(0.95, confidence)),
@@ -198,11 +275,15 @@ def _detect_inverse_head_and_shoulders(highs, lows, atr_value, closes) -> Patter
     confidence = 0.65 + min(
         0.2, (min(l1.price, l3.price) - l2.price) / (3 * atr_value)
     )
+    retested = _retest_confirmed(
+        closes=closes, neckline=neckline, side_bias="BUY",
+        breakout_search_start=int(l3.index), atr_value=atr_value,
+    ) if broken else False
     return PatternMatch(
         kind="inverse_head_and_shoulders",
         neckline=neckline,
         neckline_broken=broken,
-        retested=False,
+        retested=retested,
         invalidation_price=float(l2.price),
         target_price=float(target),
         confidence=float(min(0.95, confidence)),
@@ -250,11 +331,16 @@ def _detect_flag(closes: np.ndarray, atr_value: float) -> PatternMatch | None:
         broken = bool(last_close < consol_low)
         target = consol_low - impulse_range
         side_bias = "SELL"
+    retested = _retest_confirmed(
+        closes=closes, neckline=neckline, side_bias=side_bias,
+        breakout_search_start=len(closes) - _FLAG_MAX_BARS,
+        atr_value=atr_value,
+    ) if broken else False
     return PatternMatch(
         kind=kind,
         neckline=float(neckline),
         neckline_broken=broken,
-        retested=False,
+        retested=retested,
         invalidation_price=float(invalidation),
         target_price=float(target),
         confidence=0.55 + 0.1 * min(1.0, impulse_range / (3 * atr_value)),
@@ -311,11 +397,20 @@ def _detect_wedge(highs, lows, atr_value, closes) -> PatternMatch | None:
         neckline = float(upper_at_last)
         broken = bool(last_close > neckline)
         invalidation = float(lower_at_last)
+    wedge_anchor_idx = (
+        min(s.index for s in highs[-_WEDGE_MIN_SWINGS:])
+        if highs else len(closes) - 1
+    )
+    retested = _retest_confirmed(
+        closes=closes, neckline=neckline, side_bias=side_bias,
+        breakout_search_start=int(wedge_anchor_idx),
+        atr_value=atr_value,
+    ) if broken else False
     return PatternMatch(
         kind=kind,
         neckline=neckline,
         neckline_broken=broken,
-        retested=False,
+        retested=retested,
         invalidation_price=invalidation,
         target_price=None,
         confidence=0.55,
@@ -368,11 +463,20 @@ def _detect_triangle(highs, lows, atr_value, closes) -> PatternMatch | None:
         invalidation = float(0.5 * (upper_at_last + lower_at_last))
     else:
         return None
+    triangle_anchor_idx = (
+        min(s.index for s in highs[-3:]) if highs else len(closes) - 1
+    )
+    retested = _retest_confirmed(
+        closes=closes, neckline=neckline,
+        side_bias=side_bias if side_bias in ("BUY", "SELL") else "BUY",
+        breakout_search_start=int(triangle_anchor_idx),
+        atr_value=atr_value,
+    ) if (broken and side_bias in ("BUY", "SELL")) else False
     return PatternMatch(
         kind=kind,
         neckline=neckline,
         neckline_broken=broken,
-        retested=False,
+        retested=retested,
         invalidation_price=invalidation,
         target_price=None,
         confidence=0.55,

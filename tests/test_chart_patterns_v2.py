@@ -74,6 +74,77 @@ def test_to_dict_emits_required_keys():
         assert key in d
 
 
+def test_retest_confirmed_true_when_price_retests_then_continues():
+    """Direct unit test of the retest helper: simulate SELL break +
+    retest + continuation."""
+    from src.fx.chart_patterns import _retest_confirmed
+    closes = np.array([
+        102.0, 103.0, 104.0, 103.0, 102.0,    # forming the pattern
+        99.0,                                  # break (close < neckline=100)
+        99.5, 99.7, 99.9,                      # going back up toward neckline
+        99.95,                                 # within 0.3 ATR of neckline
+        99.6,                                  # continuation down by >=0.2 ATR
+    ])
+    assert _retest_confirmed(
+        closes=closes, neckline=100.0, side_bias="SELL",
+        breakout_search_start=0, atr_value=1.0,
+    ) is True
+
+
+def test_retest_confirmed_false_when_no_continuation():
+    """Retest occurs but the next bar does not continue the breakout
+    direction → retest NOT confirmed."""
+    from src.fx.chart_patterns import _retest_confirmed
+    closes = np.array([
+        102.0, 99.0,        # break
+        99.95, 99.95,       # retest with no continuation
+        99.95, 99.95,
+    ])
+    assert _retest_confirmed(
+        closes=closes, neckline=100.0, side_bias="SELL",
+        breakout_search_start=0, atr_value=1.0,
+    ) is False
+
+
+def test_retest_confirmed_buy_mirror():
+    """BUY-side retest: break above neckline, return down, continue up."""
+    from src.fx.chart_patterns import _retest_confirmed
+    closes = np.array([
+        98.0, 97.0, 96.0, 97.0, 98.0,
+        101.0,            # break above 100
+        100.5, 100.05, 100.05,
+        100.4,            # continuation up
+    ])
+    assert _retest_confirmed(
+        closes=closes, neckline=100.0, side_bias="BUY",
+        breakout_search_start=0, atr_value=1.0,
+    ) is True
+
+
+def test_retest_confirmed_no_breakout_returns_false():
+    """If the close never breaks the neckline, retest cannot fire."""
+    from src.fx.chart_patterns import _retest_confirmed
+    closes = np.array([102.0, 101.5, 101.0, 100.5, 100.2, 100.5])
+    assert _retest_confirmed(
+        closes=closes, neckline=100.0, side_bias="SELL",
+        breakout_search_start=0, atr_value=1.0,
+    ) is False
+
+
+def test_retest_does_not_look_past_closes_array():
+    """The closes array is the future-leak boundary. Bars beyond the
+    visible window are by construction unavailable. Caller passes
+    df['close'].iloc[:i+1].to_numpy() so future leak is impossible
+    at the data layer."""
+    from src.fx.chart_patterns import _retest_confirmed
+    short = np.array([102.0, 99.0, 99.5])
+    # Not enough bars after retest to confirm continuation → False.
+    assert _retest_confirmed(
+        closes=short, neckline=100.0, side_bias="SELL",
+        breakout_search_start=0, atr_value=1.0,
+    ) is False
+
+
 def test_no_future_leak_partial_window_does_not_crash():
     rng = np.random.default_rng(12)
     closes = 100.0 + np.cumsum(rng.standard_normal(200) * 0.4)

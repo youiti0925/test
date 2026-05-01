@@ -37,6 +37,14 @@ _NEAR_LEVEL_ATR: Final[float] = 0.5         # within 0.5 ATR of close = "near"
 _STRONG_TOUCH_THRESHOLD: Final[int] = 3     # >=3 touches = "strong"
 _RECENCY_HALF_LIFE_BARS: Final[float] = 200.0
 _FALSE_BREAKOUT_LOOKBACK_BARS: Final[int] = 5
+# Per-level history scan: a "side flip" is counted when the close
+# crosses the level price between consecutive bars by more than this
+# tolerance band (ATR-relative). This filters out tick-level noise
+# at the level price.
+_LEVEL_FLIP_TOLERANCE_ATR: Final[float] = 0.05
+# A "false breakout" is a side flip that reverts (flips back) within
+# this many bars.
+_LEVEL_FALSE_BREAKOUT_RETURN_BARS: Final[int] = 5
 
 
 LevelKind = Literal["support", "resistance", "both"]
@@ -49,6 +57,7 @@ class Level:
     touch_count: int
     first_touch_ts: pd.Timestamp | None
     last_touch_ts: pd.Timestamp | None
+    first_touch_index: int
     last_touch_index: int
     broken_count: int
     role_reversal_count: int
@@ -72,6 +81,7 @@ class Level:
                 if isinstance(self.last_touch_ts, pd.Timestamp)
                 else self.last_touch_ts
             ),
+            "first_touch_index": int(self.first_touch_index),
             "last_touch_index": int(self.last_touch_index),
             "broken_count": int(self.broken_count),
             "role_reversal_count": int(self.role_reversal_count),
@@ -138,6 +148,99 @@ def empty_snapshot(reason: str = "insufficient_data") -> SRSnapshot:
     )
 
 
+def _level_history_counts(
+    *,
+    closes: np.ndarray,
+    level_price: float,
+    atr_value: float,
+    first_touch_index: int,
+    last_touch_index: int,
+) -> tuple[int, int, int]:
+    """Walk visible history to count side flips at the level price.
+
+    Returns (broken_count, false_breakout_count, role_reversal_count).
+
+    Definitions:
+      - side(i): "above" if closes[i] > level + tol; "below" if
+        closes[i] < level - tol; "at" otherwise. Tol = `_LEVEL_FLIP_TOLERANCE_ATR
+        * atr_value`.
+      - broken_count: number of times consecutive non-"at" sides
+        differ over the scan window.
+      - false_breakout_count: a flip that returns to the original
+        side within `_LEVEL_FALSE_BREAKOUT_RETURN_BARS` bars.
+      - role_reversal_count: flips that did NOT revert within the
+        window — the level genuinely changed role and stayed there.
+
+    Future-leak safe: only `closes` (the visible history through the
+    current bar) is consulted. The first_touch_index marker means the
+    scan starts at or after that index — earlier bars cannot have
+    "broken" the level since the level didn't exist yet.
+    """
+    if len(closes) < 2 or atr_value <= 0:
+        return (0, 0, 0)
+    tol = max(_LEVEL_FLIP_TOLERANCE_ATR * atr_value, 1e-12)
+    start = max(0, int(first_touch_index))
+    if start >= len(closes) - 1:
+        return (0, 0, 0)
+    # Pre-compute side labels for the scan window.
+    sides: list[str] = []
+    for i in range(start, len(closes)):
+        c = float(closes[i])
+        if c > level_price + tol:
+            sides.append("above")
+        elif c < level_price - tol:
+            sides.append("below")
+        else:
+            sides.append("at")
+
+    # Walk consecutive non-"at" sides and count flips + reversions.
+    broken = 0
+    false_breakouts = 0
+    role_reversals = 0
+    last_side: str | None = None
+    flip_open_at: int | None = None  # index (within `sides`) where last flip occurred
+    flip_open_from: str | None = None  # the side we left from
+
+    for idx, s in enumerate(sides):
+        if s == "at":
+            continue
+        if last_side is None:
+            last_side = s
+            continue
+        if s != last_side:
+            broken += 1
+            # Check if this flip closes a previously open flip (i.e.
+            # we're returning to flip_open_from within the window).
+            if (
+                flip_open_at is not None
+                and flip_open_from is not None
+                and s == flip_open_from
+                and (idx - flip_open_at) <= _LEVEL_FALSE_BREAKOUT_RETURN_BARS
+            ):
+                false_breakouts += 1
+                flip_open_at = None
+                flip_open_from = None
+            else:
+                # If a previous flip was still open and exceeded the
+                # return window, count it as a genuine reversal.
+                if flip_open_at is not None and flip_open_from is not None:
+                    if (idx - flip_open_at) > _LEVEL_FALSE_BREAKOUT_RETURN_BARS:
+                        role_reversals += 1
+                flip_open_at = idx
+                flip_open_from = last_side
+            last_side = s
+    # Tail: if a flip is still open at the end of the scan window AND
+    # it has been open for more than the return window, count it as
+    # a confirmed role reversal.
+    if (
+        flip_open_at is not None
+        and flip_open_from is not None
+        and (len(sides) - 1 - flip_open_at) > _LEVEL_FALSE_BREAKOUT_RETURN_BARS
+    ):
+        role_reversals += 1
+    return (broken, false_breakouts, role_reversals)
+
+
 def _cluster_swings(
     swings: list[Swing],
     *,
@@ -177,31 +280,23 @@ def _cluster_swings(
         last_touch = max(cluster, key=lambda s: s.index)
         bars_since_last = max(0, n_bars - 1 - last_touch.index)
         recency_score = math.exp(-bars_since_last / _RECENCY_HALF_LIFE_BARS)
-        # role_reversal_count proxy: a "both" cluster has at least one
-        # reversal (a high that later acted as low or vice versa).
-        role_reversal_count = (
-            len(cluster) - 1 if kind == "both" else 0
-        )
-        # broken_count and false_breakout_count are computed in the
-        # bar-loop (not at clustering time) — kept at 0 here.
-        strength = (
-            math.log1p(len(cluster))
-            * recency_score
-            * (1.0 + role_reversal_count * 0.1)
-        )
+        # broken / false_breakout / role_reversal counts are computed
+        # in detect_levels via _level_history_counts (needs closes
+        # + atr_value not available here). Initialised to 0.
         levels.append(Level(
             price=float(np.mean(prices)),
             kind=kind,
             touch_count=len(cluster),
             first_touch_ts=getattr(first_touch, "ts", None),
             last_touch_ts=getattr(last_touch, "ts", None),
+            first_touch_index=int(first_touch.index),
             last_touch_index=int(last_touch.index),
             broken_count=0,
-            role_reversal_count=int(role_reversal_count),
+            role_reversal_count=0,
             false_breakout_count=0,
-            strength_score=float(strength),
+            strength_score=0.0,            # filled in detect_levels
             recency_score=float(recency_score),
-            distance_to_close_atr=None,  # filled in detect_levels
+            distance_to_close_atr=None,    # filled in detect_levels
         ))
     return levels
 
@@ -237,21 +332,42 @@ def detect_levels(
     if not levels:
         return empty_snapshot("clustering_produced_no_levels")
 
-    # Compute distance_to_close_atr per level
+    closes = df["close"].to_numpy()
+    # Compute distance_to_close_atr + per-level history counts +
+    # final strength_score per level (counts feed back into score).
     enriched: list[Level] = []
     for lvl in levels:
         dist_atr = abs(last_close - lvl.price) / atr_value
+        broken, false_brk, role_rev = _level_history_counts(
+            closes=closes,
+            level_price=lvl.price,
+            atr_value=atr_value,
+            first_touch_index=lvl.first_touch_index,
+            last_touch_index=lvl.last_touch_index,
+        )
+        # strength_score: log(touches) × recency
+        # × (1 + role_reversal_count × 0.1)             ← genuine flips raise
+        # × max(0.1, 1 − 0.15 × false_breakouts)        ← false breaks lower
+        # × max(0.2, 1 − 0.05 × max(0, broken − role_rev))  ← raw breaks lower
+        score = (
+            math.log1p(lvl.touch_count)
+            * lvl.recency_score
+            * (1.0 + role_rev * 0.1)
+            * max(0.1, 1.0 - 0.15 * false_brk)
+            * max(0.2, 1.0 - 0.05 * max(0, broken - role_rev))
+        )
         enriched.append(Level(
             price=lvl.price,
             kind=lvl.kind,
             touch_count=lvl.touch_count,
             first_touch_ts=lvl.first_touch_ts,
             last_touch_ts=lvl.last_touch_ts,
+            first_touch_index=lvl.first_touch_index,
             last_touch_index=lvl.last_touch_index,
-            broken_count=lvl.broken_count,
-            role_reversal_count=lvl.role_reversal_count,
-            false_breakout_count=lvl.false_breakout_count,
-            strength_score=lvl.strength_score,
+            broken_count=int(broken),
+            role_reversal_count=int(role_rev),
+            false_breakout_count=int(false_brk),
+            strength_score=float(score),
             recency_score=lvl.recency_score,
             distance_to_close_atr=dist_atr,
         ))

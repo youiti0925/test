@@ -1,4 +1,11 @@
-"""Unit tests for royal_road_decision_v2.decide_royal_road_v2."""
+"""Unit tests for royal_road_decision_v2.decide_royal_road_v2.
+
+Tests are DETERMINISTIC: each test monkeypatches the v2 sub-detectors
+(detect_levels / detect_trendlines / detect_patterns / lower-TF
+trigger / macro alignment) to return controlled snapshots. This
+eliminates ambiguity ("BUY or HOLD" assertions are forbidden) and
+makes the rule chain fully observable.
+"""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -7,6 +14,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from src.fx import royal_road_decision_v2 as mod
+from src.fx.chart_patterns import ChartPatternSnapshot, empty_snapshot as cp_empty
+from src.fx.lower_timeframe_trigger import (
+    LowerTimeframeTrigger,
+    empty_trigger as ltf_empty,
+)
+from src.fx.macro_alignment import MacroAlignmentSnapshot, empty_alignment
 from src.fx.risk import atr as compute_atr
 from src.fx.risk_gate import RiskState
 from src.fx.royal_road_decision_v2 import (
@@ -15,6 +29,11 @@ from src.fx.royal_road_decision_v2 import (
     compare_v2_vs_v1,
     decide_royal_road_v2,
 )
+from src.fx.support_resistance import Level, SRSnapshot, empty_snapshot as sr_empty
+from src.fx.trendlines import TrendlineContext, empty_context as tl_empty
+
+
+# ─────────── helpers ──────────────────────────────────────────────
 
 
 def _ohlcv(n: int = 250) -> pd.DataFrame:
@@ -91,6 +110,68 @@ def _confluence(
     }
 
 
+def _patch_detectors(
+    monkeypatch,
+    *,
+    sr: SRSnapshot,
+    tl: TrendlineContext,
+    cp: ChartPatternSnapshot,
+    ltf: LowerTimeframeTrigger | None = None,
+    macro: MacroAlignmentSnapshot | None = None,
+):
+    """Replace the v2 detector calls with constants."""
+    monkeypatch.setattr(mod, "detect_levels", lambda *a, **k: sr)
+    monkeypatch.setattr(mod, "detect_trendlines", lambda *a, **k: tl)
+    monkeypatch.setattr(mod, "detect_patterns", lambda *a, **k: cp)
+    if ltf is not None:
+        monkeypatch.setattr(mod, "detect_lower_tf_trigger", lambda *a, **k: ltf)
+    if macro is not None:
+        monkeypatch.setattr(
+            mod, "compute_macro_alignment", lambda *a, **k: macro,
+        )
+
+
+def _strong_bullish_sr(near_support: bool = True, near_resistance: bool = False) -> SRSnapshot:
+    """An SR snapshot with strong bullish bias (near strong support)."""
+    lvl_sup = Level(
+        price=99.0, kind="support", touch_count=5,
+        first_touch_ts=None, last_touch_ts=None,
+        first_touch_index=10, last_touch_index=80,
+        broken_count=0, role_reversal_count=0, false_breakout_count=0,
+        strength_score=4.0, recency_score=0.9,
+        distance_to_close_atr=0.3,
+    )
+    return SRSnapshot(
+        levels=(lvl_sup,),
+        nearest_support=lvl_sup if near_support else None,
+        nearest_resistance=None,
+        near_strong_support=near_support,
+        near_strong_resistance=near_resistance,
+        breakout=False, pullback=False, role_reversal=False,
+        fake_breakout=False, reason="ok",
+    )
+
+
+def _strong_bearish_sr() -> SRSnapshot:
+    lvl_res = Level(
+        price=101.0, kind="resistance", touch_count=5,
+        first_touch_ts=None, last_touch_ts=None,
+        first_touch_index=10, last_touch_index=80,
+        broken_count=0, role_reversal_count=0, false_breakout_count=0,
+        strength_score=4.0, recency_score=0.9,
+        distance_to_close_atr=0.3,
+    )
+    return SRSnapshot(
+        levels=(lvl_res,),
+        nearest_support=None,
+        nearest_resistance=lvl_res,
+        near_strong_support=False,
+        near_strong_resistance=True,
+        breakout=False, pullback=False, role_reversal=False,
+        fake_breakout=False, reason="ok",
+    )
+
+
 def _decide(tc: dict, **overrides):
     df = _ohlcv()
     kwargs = dict(
@@ -113,7 +194,16 @@ def _decide(tc: dict, **overrides):
     return decide_royal_road_v2(**kwargs)
 
 
-def test_v2_advisory_carries_required_keys():
+# ─────────── advisory shape ───────────────────────────────────────
+
+
+def test_v2_advisory_carries_required_keys(monkeypatch):
+    _patch_detectors(
+        monkeypatch,
+        sr=_strong_bullish_sr(),
+        tl=tl_empty("ok"),
+        cp=cp_empty("ok"),
+    )
     d = _decide(_confluence(label="STRONG_BUY_SETUP"))
     adv = d.advisory
     for key in (
@@ -129,41 +219,188 @@ def test_v2_advisory_carries_required_keys():
     assert adv["profile"] == PROFILE_NAME_V2
 
 
-def test_v2_macro_strong_against_blocks_buy():
-    """VIX VERY_HIGH on USDJPY with vix_align==SELL → blocks BUY."""
+# ─────────── deterministic BUY ─────────────────────────────────────
+
+
+def test_v2_strong_buy_with_strong_support_buys(monkeypatch):
+    """Strong bullish SR + bullish HTF + STRONG_BUY_SETUP → BUY."""
+    _patch_detectors(
+        monkeypatch,
+        sr=_strong_bullish_sr(),
+        tl=tl_empty("ok"),
+        cp=cp_empty("ok"),
+    )
+    d = _decide(_confluence(label="STRONG_BUY_SETUP"))
+    assert d.action == "BUY", (
+        f"expected BUY; got {d.action} with block_reasons={d.advisory['block_reasons']}"
+    )
+
+
+# ─────────── deterministic SELL ───────────────────────────────────
+
+
+def test_v2_strong_sell_with_strong_resistance_sells(monkeypatch):
+    _patch_detectors(
+        monkeypatch,
+        sr=_strong_bearish_sr(),
+        tl=tl_empty("ok"),
+        cp=cp_empty("ok"),
+    )
+    d = _decide(
+        _confluence(
+            label="STRONG_SELL_SETUP", score=-0.6,
+            near_support=False, near_resistance=True,
+            market_regime="TREND_DOWN", structure_code="LH",
+            candle_bull=False,
+        ),
+        higher_timeframe_trend="DOWNTREND",
+    )
+    assert d.action == "SELL", (
+        f"expected SELL; got {d.action} with block_reasons={d.advisory['block_reasons']}"
+    )
+
+
+# ─────────── deterministic HOLD paths ─────────────────────────────
+
+
+def test_v2_avoid_trade_label_holds(monkeypatch):
+    _patch_detectors(
+        monkeypatch,
+        sr=_strong_bullish_sr(),
+        tl=tl_empty("ok"),
+        cp=cp_empty("ok"),
+    )
+    d = _decide(_confluence(label="AVOID_TRADE"))
+    assert d.action == "HOLD"
+    assert any("label:AVOID_TRADE" in r for r in d.advisory["block_reasons"])
+
+
+def test_v2_no_trade_label_holds(monkeypatch):
+    _patch_detectors(
+        monkeypatch,
+        sr=_strong_bullish_sr(),
+        tl=tl_empty("ok"),
+        cp=cp_empty("ok"),
+    )
+    d = _decide(_confluence(label="NO_TRADE"))
+    assert d.action == "HOLD"
+    assert any("label:NO_TRADE" in r for r in d.advisory["block_reasons"])
+
+
+def test_v2_unknown_label_holds(monkeypatch):
+    _patch_detectors(
+        monkeypatch,
+        sr=_strong_bullish_sr(),
+        tl=tl_empty("ok"),
+        cp=cp_empty("ok"),
+    )
+    d = _decide(_confluence(label="UNKNOWN"))
+    assert d.action == "HOLD"
+
+
+def test_v2_near_strong_resistance_blocks_buy(monkeypatch):
+    """Even with STRONG_BUY_SETUP, near_strong_resistance blocks."""
+    _patch_detectors(
+        monkeypatch,
+        sr=_strong_bearish_sr(),     # near_strong_resistance = True
+        tl=tl_empty("ok"),
+        cp=cp_empty("ok"),
+    )
+    d = _decide(_confluence(label="STRONG_BUY_SETUP"))
+    assert d.action == "HOLD"
+    assert "near_strong_resistance_for_buy" in d.advisory["block_reasons"]
+
+
+def test_v2_near_strong_support_blocks_sell(monkeypatch):
+    _patch_detectors(
+        monkeypatch,
+        sr=_strong_bullish_sr(),      # near_strong_support = True
+        tl=tl_empty("ok"),
+        cp=cp_empty("ok"),
+    )
+    d = _decide(
+        _confluence(
+            label="STRONG_SELL_SETUP",
+            near_support=False, near_resistance=False,
+            candle_bull=False,
+        ),
+        higher_timeframe_trend="DOWNTREND",
+    )
+    assert d.action == "HOLD"
+    assert "near_strong_support_for_sell" in d.advisory["block_reasons"]
+
+
+def test_v2_macro_strong_against_blocks_buy(monkeypatch):
+    """USDJPY VERY_HIGH VIX → macro_strong_against=BUY → block."""
     macro_ctx = {
         "dxy_trend_5d_bucket": "FLAT",
         "us10y_change_24h_bp": 0,
         "vix": 35.0,
     }
+    _patch_detectors(
+        monkeypatch,
+        sr=_strong_bullish_sr(),
+        tl=tl_empty("ok"),
+        cp=cp_empty("ok"),
+    )
     d = _decide(
         _confluence(label="STRONG_BUY_SETUP"),
         symbol="USDJPY=X",
         macro_context=macro_ctx,
     )
     assert d.action == "HOLD"
-    assert any("vix_very_high" in r for r in d.advisory["block_reasons"])
+    assert any(
+        "vix_very_high" in r for r in d.advisory["block_reasons"]
+    )
 
 
-def test_v2_avoid_trade_label_blocks():
-    d = _decide(_confluence(label="AVOID_TRADE"))
+def test_v2_invalid_stop_plan_blocks_when_stop_mode_not_atr(monkeypatch):
+    _patch_detectors(
+        monkeypatch,
+        sr=_strong_bullish_sr(),
+        tl=tl_empty("ok"),
+        cp=cp_empty("ok"),
+    )
+    d = _decide(
+        _confluence(label="STRONG_BUY_SETUP", structure_stop=None),
+        stop_mode="structure",
+    )
     assert d.action == "HOLD"
-    assert any("label:AVOID_TRADE" in r for r in d.advisory["block_reasons"])
+    assert any(
+        "stop_plan_invalid" in r or "structure_stop_missing" in r
+        for r in d.advisory["block_reasons"]
+    )
 
 
-def test_v2_strong_setup_with_evidence_can_buy():
-    d = _decide(_confluence(
-        label="STRONG_BUY_SETUP",
-        market_regime="TREND_UP", structure_code="HL",
-        near_support=True, near_resistance=False,
-        candle_bull=True,
-    ))
-    # Default mode=balanced, axes count >= 1 should suffice. Action
-    # depends on derived snapshots from the random df, which provides
-    # neither a strong support nor a chart pattern; but the bullish
-    # structure axis is True. So expect either BUY or HOLD on
-    # insufficient_axes (n_bull >=1 → passes).
-    assert d.action in ("BUY", "HOLD")
+def test_v2_default_stop_mode_atr_does_not_invalidate_on_missing_structure(monkeypatch):
+    _patch_detectors(
+        monkeypatch,
+        sr=_strong_bullish_sr(),
+        tl=tl_empty("ok"),
+        cp=cp_empty("ok"),
+    )
+    d = _decide(
+        _confluence(label="STRONG_BUY_SETUP", structure_stop=None),
+        stop_mode="atr",
+    )
+    assert all(
+        "stop_plan_invalid" not in r for r in d.advisory["block_reasons"]
+    )
+
+
+def test_v2_htf_counter_trend_blocks(monkeypatch):
+    _patch_detectors(
+        monkeypatch,
+        sr=_strong_bullish_sr(),
+        tl=tl_empty("ok"),
+        cp=cp_empty("ok"),
+    )
+    d = _decide(
+        _confluence(label="STRONG_BUY_SETUP"),
+        higher_timeframe_trend="DOWNTREND",
+    )
+    assert d.action == "HOLD"
+    assert "htf_counter_trend_for_buy" in d.advisory["block_reasons"]
 
 
 def test_v2_compare_taxonomy_is_closed():
@@ -184,27 +421,3 @@ def test_v2_vs_v1_taxonomy():
         decision_v2=Dummy("BUY"),
     )
     assert out["difference_type"] == "v1_hold_v2_buy"
-
-
-def test_v2_invalid_stop_plan_blocks_when_stop_mode_not_atr():
-    # structure_stop missing + stop_mode=structure → block
-    d = _decide(
-        _confluence(label="STRONG_BUY_SETUP", structure_stop=None),
-        stop_mode="structure",
-    )
-    assert d.action == "HOLD"
-    assert any(
-        "stop_plan_invalid" in r or "structure_stop_missing" in r
-        for r in d.advisory["block_reasons"]
-    )
-
-
-def test_v2_default_stop_mode_atr_works_even_when_structure_missing():
-    d = _decide(
-        _confluence(label="STRONG_BUY_SETUP", structure_stop=None),
-        stop_mode="atr",
-    )
-    # Action depends on axes; key thing is no stop_plan_invalid block.
-    assert all(
-        "stop_plan_invalid" not in r for r in d.advisory["block_reasons"]
-    )
