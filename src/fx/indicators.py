@@ -80,11 +80,31 @@ class Snapshot:
         }
 
 
-def build_snapshot(symbol: str, df: pd.DataFrame) -> Snapshot:
-    """Compute all indicators and return a point-in-time snapshot."""
+def build_snapshot(
+    symbol: str, df: pd.DataFrame, *,
+    rsi_period: int = 14,
+    macd_fast: int = 12, macd_slow: int = 26, macd_signal: int = 9,
+    bb_period: int = 20, bb_std: float = 2.0,
+) -> Snapshot:
+    """Compute all indicators and return a point-in-time snapshot.
+
+    PR #21: indicator periods / Bollinger std are optional kwargs.
+    Defaults match the historical hard-coded values, so callers that
+    omit kwargs get byte-identical output to pre-PR-#21 (pinned by
+    `test_indicators_default_kwargs_unchanged`). When a runtime
+    profile is applied (only via backtest-engine
+    `--apply-parameter-profile`), the resolved kwargs flow in and the
+    snapshot reflects them.
+
+    `Snapshot.rsi_14` keeps its historical field name even when
+    `rsi_period != 14` — the value reflects whatever `rsi_period`
+    actually produced. Trace consumers must read the period from
+    `TechnicalSlice.rsi_period_used` (PR #21 audit field), not from
+    the literal "14" baked into the field name.
+    """
     close = df["close"]
-    macd_df = macd(close)
-    bb = bollinger(close)
+    macd_df = macd(close, fast=macd_fast, slow=macd_slow, signal=macd_signal)
+    bb = bollinger(close, period=bb_period, num_std=bb_std)
 
     last_close = float(close.iloc[-1])
     bb_upper = float(bb["bb_upper"].iloc[-1])
@@ -108,7 +128,7 @@ def build_snapshot(symbol: str, df: pd.DataFrame) -> Snapshot:
         sma_20=float(sma(close, 20).iloc[-1]),
         sma_50=float(sma(close, 50).iloc[-1]),
         ema_12=float(ema(close, 12).iloc[-1]),
-        rsi_14=float(rsi(close).iloc[-1]),
+        rsi_14=float(rsi(close, period=rsi_period).iloc[-1]),
         macd=float(macd_df["macd"].iloc[-1]),
         macd_signal=float(macd_df["signal"].iloc[-1]),
         macd_hist=float(macd_df["hist"].iloc[-1]),
@@ -118,17 +138,26 @@ def build_snapshot(symbol: str, df: pd.DataFrame) -> Snapshot:
     )
 
 
-def technical_signal(snap: Snapshot) -> str:
+def technical_signal(
+    snap: Snapshot, *,
+    rsi_overbought: float = 70.0,
+    rsi_oversold: float = 30.0,
+) -> str:
     """Simple rule-based signal used for backtests and as a sanity check.
 
     Returns one of: BUY | SELL | HOLD.
+
+    PR #21: RSI thresholds are optional kwargs, defaults match the
+    historical 70 / 30 so default-call behaviour is byte-identical
+    to pre-PR-#21 (pinned by
+    `test_indicators_default_kwargs_unchanged`).
     """
     buy_signals = 0
     sell_signals = 0
 
-    if snap.rsi_14 < 30:
+    if snap.rsi_14 < rsi_oversold:
         buy_signals += 1
-    elif snap.rsi_14 > 70:
+    elif snap.rsi_14 > rsi_overbought:
         sell_signals += 1
 
     if snap.macd_hist > 0 and snap.macd > snap.macd_signal:
@@ -153,21 +182,27 @@ def technical_signal(snap: Snapshot) -> str:
     return "HOLD"
 
 
-def technical_signal_reasons(snap: Snapshot) -> tuple[str, list[str]]:
+def technical_signal_reasons(
+    snap: Snapshot, *,
+    rsi_overbought: float = 70.0,
+    rsi_oversold: float = 30.0,
+) -> tuple[str, list[str]]:
     """Mirror of `technical_signal` that also returns the reason codes.
 
-    For decision-trace logging only. Action MUST equal `technical_signal(snap)`
-    for every Snapshot — pinned by
-    test_technical_signal_reasons_action_equals_technical_signal. The rule
-    chain inside this function intentionally duplicates the body of
-    `technical_signal` so the canonical decision path stays untouched.
+    For decision-trace logging only. Action MUST equal
+    `technical_signal(snap, rsi_overbought=..., rsi_oversold=...)` for
+    every Snapshot — pinned by
+    test_technical_signal_reasons_action_equals_technical_signal.
+    The rule chain inside this function intentionally duplicates the
+    body of `technical_signal` so the canonical decision path stays
+    untouched.
     """
     buy_codes: list[str] = []
     sell_codes: list[str] = []
 
-    if snap.rsi_14 < 30:
+    if snap.rsi_14 < rsi_oversold:
         buy_codes.append("rsi_oversold")
-    elif snap.rsi_14 > 70:
+    elif snap.rsi_14 > rsi_overbought:
         sell_codes.append("rsi_overbought")
 
     if snap.macd_hist > 0 and snap.macd > snap.macd_signal:
@@ -186,7 +221,9 @@ def technical_signal_reasons(snap: Snapshot) -> tuple[str, list[str]]:
         sell_codes.append("bb_position_above_0.8")
 
     # Action delegated to the canonical function so they cannot drift.
-    action = technical_signal(snap)
+    action = technical_signal(
+        snap, rsi_overbought=rsi_overbought, rsi_oversold=rsi_oversold,
+    )
     if action == "BUY":
         return action, buy_codes
     if action == "SELL":

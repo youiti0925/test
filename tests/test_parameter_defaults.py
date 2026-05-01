@@ -174,7 +174,11 @@ def test_parameter_baseline_payload_hash_stable():
 def test_run_metadata_parameters_emitted_without_profile():
     """No --parameter-profile: the catalog is still recorded, but
     `parameter_profile` is None and `applied_to_runtime` is False."""
-    block = _build_parameters_metadata(None)
+    # PR #21: _build_parameters_metadata now returns (metadata, runtime_kwargs).
+    # Without --apply-parameter-profile, runtime_kwargs is empty and metadata
+    # carries applied_to_runtime=False (PR #19 invariant preserved).
+    block, runtime_kwargs = _build_parameters_metadata(None)
+    assert runtime_kwargs == {}
     assert block["parameter_profile"] is None
     assert block["runtime_profile"] == "current_runtime"
     assert block["baseline_id"] == PARAMETER_BASELINE_ID
@@ -193,7 +197,9 @@ def test_run_metadata_parameters_emitted_with_literature_profile():
     """--parameter-profile literature_baseline_v1: the profile name is
     recorded verbatim; runtime is still untouched
     (`applied_to_runtime` is False)."""
-    block = _build_parameters_metadata(PARAMETER_BASELINE_ID)
+    # PR #21: tuple return, profile alone keeps applied_to_runtime=False
+    block, runtime_kwargs = _build_parameters_metadata(PARAMETER_BASELINE_ID)
+    assert runtime_kwargs == {}
     assert block["parameter_profile"] == PARAMETER_BASELINE_ID
     assert block["baseline_id"] == PARAMETER_BASELINE_ID
     assert block["baseline_payload_hash"] == baseline_payload_hash()
@@ -247,13 +253,16 @@ def test_parameter_profile_metadata_only_trade_results_identical():
     """
     df = _ohlcv(400, start="2025-06-01", seed=7)
 
+    # PR #21: helper returns (metadata, runtime_kwargs); take metadata.
+    metadata_no_profile, _ = _build_parameters_metadata(None)
+    metadata_with_profile, _ = _build_parameters_metadata(PARAMETER_BASELINE_ID)
     res_no_profile = run_engine_backtest(
         df, "X", interval="1h", warmup=60,
-        parameters=_build_parameters_metadata(None),
+        parameters=metadata_no_profile,
     )
     res_with_profile = run_engine_backtest(
         df, "X", interval="1h", warmup=60,
-        parameters=_build_parameters_metadata(PARAMETER_BASELINE_ID),
+        parameters=metadata_with_profile,
     )
 
     assert _trade_summary(res_no_profile) == _trade_summary(res_with_profile), (

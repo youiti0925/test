@@ -335,6 +335,23 @@ class TechnicalSlice:
     technical_only_action: str
     technical_reason_codes: tuple[str, ...]
     reason_derivation: str
+    # PR #21: parameter-runtime audit fields. The historical Snapshot
+    # field name `rsi_14` does NOT change even when `rsi_period != 14`
+    # — these `*_used` fields make the actually-used period explicit.
+    # Default None preserves byte-identical to_dict() for pre-PR-#21
+    # callers that don't pass values.
+    rsi_period_used: int | None = None
+    rsi_overbought_used: float | None = None
+    rsi_oversold_used: float | None = None
+    macd_fast_used: int | None = None
+    macd_slow_used: int | None = None
+    macd_signal_used: int | None = None
+    bb_period_used: int | None = None
+    bb_std_used: float | None = None
+    atr_period_used: int | None = None
+    stop_atr_mult_used: float | None = None
+    tp_atr_mult_used: float | None = None
+    max_holding_bars_used: int | None = None
 
     def to_dict(self) -> dict:
         d = dict(self.__dict__)

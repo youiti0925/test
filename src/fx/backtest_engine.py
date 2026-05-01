@@ -545,6 +545,22 @@ def run_engine_backtest(
     # here. The kwarg exists so the catalog reaches RunMetadata via
     # the same plumbing as `calendar`, without touching decide_action.
     parameters: dict | None = None,
+    # PR #21: indicator-period / threshold overrides for runtime A/B.
+    # All None = current_runtime defaults (byte-identical to PR #20
+    # main). Non-None values flow to `indicators.build_snapshot` /
+    # `technical_signal*` / `compute_atr`. Triggered ONLY by
+    # backtest-engine `--apply-parameter-profile`. live cmd_trade
+    # never calls `run_engine_backtest`, so these kwargs cannot
+    # affect live behaviour.
+    rsi_period: int | None = None,
+    rsi_overbought: float | None = None,
+    rsi_oversold: float | None = None,
+    macd_fast: int | None = None,
+    macd_slow: int | None = None,
+    macd_signal_period: int | None = None,
+    bb_period: int | None = None,
+    bb_std: float | None = None,
+    atr_period: int | None = None,
 ) -> EngineBacktestResult:
     """Run a Decision Engine-driven backtest over `df`.
 
@@ -621,9 +637,41 @@ def run_engine_backtest(
         # so test bar i_test corresponds to full bar i_test + n_context_bars.
         return _long_term_trend_slice(df_full, i_test + n_context_bars)
 
+    # PR #21: resolve indicator-period overrides. None → existing
+    # current_runtime defaults, non-None → flowed through.
+    _atr_period_eff = atr_period if atr_period is not None else 14
+    _rsi_period_eff = rsi_period if rsi_period is not None else 14
+    _rsi_overbought_eff = rsi_overbought if rsi_overbought is not None else 70.0
+    _rsi_oversold_eff = rsi_oversold if rsi_oversold is not None else 30.0
+    _macd_fast_eff = macd_fast if macd_fast is not None else 12
+    _macd_slow_eff = macd_slow if macd_slow is not None else 26
+    _macd_signal_eff = macd_signal_period if macd_signal_period is not None else 9
+    _bb_period_eff = bb_period if bb_period is not None else 20
+    _bb_std_eff = bb_std if bb_std is not None else 2.0
+
+    # PR #21: actually-used dict for trace audit. Always populated so
+    # TechnicalSlice.*_used fields capture the run config (the values
+    # equal the historical defaults when no profile is applied — this
+    # is fine because the audit is meant to RECORD what ran, not just
+    # what differed).
+    _runtime_overrides_for_trace: dict = {
+        "rsi_period": _rsi_period_eff,
+        "rsi_overbought": _rsi_overbought_eff,
+        "rsi_oversold": _rsi_oversold_eff,
+        "macd_fast": _macd_fast_eff,
+        "macd_slow": _macd_slow_eff,
+        "macd_signal": _macd_signal_eff,
+        "bb_period": _bb_period_eff,
+        "bb_std": _bb_std_eff,
+        "atr_period": _atr_period_eff,
+        "stop_atr_mult": stop_atr_mult,
+        "tp_atr_mult": tp_atr_mult,
+        "max_holding_bars": max_holding_bars,
+    }
+
     # ATR is monotonic-suffix — compute once over the full df. Each bar
     # only reads atr_series.iloc[i], no future leak.
-    atr_series = compute_atr(df, period=14)
+    atr_series = compute_atr(df, period=_atr_period_eff)
     events_tuple = tuple(events)
     risk_reward = tp_atr_mult / stop_atr_mult
 
@@ -815,15 +863,32 @@ def run_engine_backtest(
                         min_directional_share=waveform_min_share,
                     ),
                     long_term_trend_override=_long_term_trend_for_bar(i),
+                    runtime_overrides=_runtime_overrides_for_trace,
                 )
                 result.decision_traces.append(trace)
             continue
 
-        snap = build_snapshot(symbol, window)
-        tech = technical_signal(snap)
+        snap = build_snapshot(
+            symbol, window,
+            rsi_period=_rsi_period_eff,
+            macd_fast=_macd_fast_eff,
+            macd_slow=_macd_slow_eff,
+            macd_signal=_macd_signal_eff,
+            bb_period=_bb_period_eff,
+            bb_std=_bb_std_eff,
+        )
+        tech = technical_signal(
+            snap,
+            rsi_overbought=_rsi_overbought_eff,
+            rsi_oversold=_rsi_oversold_eff,
+        )
         # Mirror call for trace only — action is delegated back to
         # technical_signal so it cannot drift. See indicators.py docstring.
-        tech_action_for_trace, tech_reason_codes = technical_signal_reasons(snap)
+        tech_action_for_trace, tech_reason_codes = technical_signal_reasons(
+            snap,
+            rsi_overbought=_rsi_overbought_eff,
+            rsi_oversold=_rsi_oversold_eff,
+        )
         pattern = analyse_patterns(window)
         higher_tf = (
             _resample_higher_tf(window, interval) if use_higher_tf else "UNKNOWN"
@@ -957,6 +1022,7 @@ def run_engine_backtest(
                     min_directional_share=waveform_min_share,
                 ),
                 long_term_trend_override=_long_term_trend_for_bar(i),
+                runtime_overrides=_runtime_overrides_for_trace,
             )
             result.decision_traces.append(trace)
 
