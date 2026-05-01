@@ -1212,6 +1212,30 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
         if runtime_kwargs else args.max_holding_bars
     )
 
+    # v2 lower-TF fetch (opt-in via --lower-tf). Failure is non-fatal —
+    # engine treats unavailable lower-TF as `not_attached` and emits
+    # the unavailable_reason in trace.
+    df_lower_tf_for_v2 = None
+    lower_tf_interval_for_v2 = getattr(args, "lower_tf", None)
+    if lower_tf_interval_for_v2 and len(df) > 0:
+        try:
+            df_lower_tf_for_v2 = fetch_ohlcv(
+                args.symbol,
+                interval=lower_tf_interval_for_v2,
+                period=None,
+                start=df.index.min().strftime("%Y-%m-%d"),
+                end=(df.index.max() + pd.Timedelta(days=1)).strftime(
+                    "%Y-%m-%d"
+                ),
+            )
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[warn] lower-TF fetch failed: {e} — v2 lower_tf_trigger "
+                "will report unavailable_reason",
+                file=sys.stderr,
+            )
+            df_lower_tf_for_v2 = None
+
     result = run_engine_backtest(
         df,
         symbol=args.symbol,
@@ -1242,6 +1266,9 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
         atr_period=runtime_kwargs.get("atr_period"),
         decision_profile=getattr(args, "decision_profile", "current_runtime"),
         royal_road_mode=getattr(args, "royal_road_mode", "balanced"),
+        df_lower_tf=df_lower_tf_for_v2,
+        lower_tf_interval=lower_tf_interval_for_v2,
+        stop_mode=getattr(args, "stop_mode", "atr"),
     )
     metrics = result.metrics()
     start_date = str(df.index[0])
@@ -2325,7 +2352,11 @@ def build_parser() -> argparse.ArgumentParser:
     be.add_argument(
         "--decision-profile",
         default="current_runtime",
-        choices=("current_runtime", "royal_road_decision_v1"),
+        choices=(
+            "current_runtime",
+            "royal_road_decision_v1",
+            "royal_road_decision_v2",
+        ),
         help=(
             "Which decision profile drives BUY/SELL/HOLD. Default "
             "`current_runtime` is byte-identical to PR #21 main. "
@@ -2358,6 +2389,37 @@ def build_parser() -> argparse.ArgumentParser:
             "is for discovering adjacent rules (WEAK with >=1 axis) "
             "and is NOT a candidate for adoption. All three modes "
             "are heuristic and pending validation."
+        ),
+    )
+    be.add_argument(
+        "--lower-tf",
+        default=None,
+        choices=("15m", "5m"),
+        help=(
+            "Optional lower-timeframe interval to fetch alongside the "
+            "base interval. Used by royal_road_decision_v2 only "
+            "(`--decision-profile royal_road_decision_v2`). When "
+            "omitted, v2's lower_tf_trigger field reports "
+            "unavailable_reason=not_attached. Future-leak-safe: only "
+            "lower-TF bars with timestamp <= the base bar's close "
+            "timestamp are visible. Backtest-only — has no effect on "
+            "live cmd_trade."
+        ),
+    )
+    be.add_argument(
+        "--stop-mode",
+        default="atr",
+        choices=("atr", "structure", "hybrid"),
+        help=(
+            "Stop-placement mode. `atr` (default) = entry +/- "
+            "stop_atr_mult * ATR (byte-identical to PR #21 main). "
+            "`structure` = the v2 structure_stop_price (most recent "
+            "confirmed swing low for BUY, swing high for SELL); HOLD "
+            "if missing. `hybrid` = structure if 0.5..3.0 ATR away, "
+            "ATR fallback if too far, HOLD if too close. Only "
+            "consulted when --decision-profile is "
+            "royal_road_decision_v2; otherwise the choice is recorded "
+            "in metadata only. Backtest-only."
         ),
     )
     be.add_argument("--trace-out", default=None,

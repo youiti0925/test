@@ -332,7 +332,11 @@ def compare_decisions(*, decision_current: Decision, decision_royal: Decision) -
     }
 
 
-SUPPORTED_DECISION_PROFILES: Final[tuple[str, ...]] = ("current_runtime", PROFILE_NAME)
+SUPPORTED_DECISION_PROFILES: Final[tuple[str, ...]] = (
+    "current_runtime",
+    PROFILE_NAME,
+    "royal_road_decision_v2",
+)
 
 
 def validate_decision_profile(name: str) -> str:

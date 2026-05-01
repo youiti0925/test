@@ -755,6 +755,118 @@ class RoyalRoadDecisionSlice:
 
 
 @dataclass(frozen=True)
+class RoyalRoadDecisionV2Slice:
+    """Royal-road v2 decision audit (royal_road_decision_v2 profile).
+
+    Emitted ONLY when run_engine_backtest(decision_profile=
+    "royal_road_decision_v2") is requested. Default current_runtime
+    leaves this field None on every bar, preserving byte-identical
+    trace output for legacy callers.
+
+    Carries the full v2 audit:
+      profile / mode / mode_status / mode_needs_validation
+      action / confidence / score
+      reasons / block_reasons / cautions
+      evidence_axes / evidence_axes_count / min_evidence_axes_required
+      support_resistance_v2 / trendline_context / chart_pattern_v2
+      lower_tf_trigger / macro_alignment / structure_stop_plan
+      compared_to_current_runtime / compared_to_royal_road_v1
+    """
+
+    profile: str
+    mode: str
+    mode_status: str
+    mode_needs_validation: bool
+    action: str
+    confidence: float
+    score: float
+    reasons: list
+    block_reasons: list
+    cautions: list
+    evidence_axes: dict
+    evidence_axes_count: dict
+    min_evidence_axes_required: int | None
+    support_resistance_v2: dict
+    trendline_context: dict
+    chart_pattern_v2: dict
+    lower_tf_trigger: dict
+    macro_alignment: dict
+    structure_stop_plan: dict | None
+    compared_to_current_runtime: dict
+    compared_to_royal_road_v1: dict | None
+
+    def to_dict(self) -> dict:
+        return {
+            "profile": self.profile,
+            "mode": self.mode,
+            "mode_status": self.mode_status,
+            "mode_needs_validation": bool(self.mode_needs_validation),
+            "action": self.action,
+            "confidence": float(self.confidence),
+            "score": float(self.score),
+            "reasons": list(self.reasons),
+            "block_reasons": list(self.block_reasons),
+            "cautions": list(self.cautions),
+            "evidence_axes": dict(self.evidence_axes),
+            "evidence_axes_count": dict(self.evidence_axes_count),
+            "min_evidence_axes_required": self.min_evidence_axes_required,
+            "support_resistance_v2": dict(self.support_resistance_v2),
+            "trendline_context": dict(self.trendline_context),
+            "chart_pattern_v2": dict(self.chart_pattern_v2),
+            "lower_tf_trigger": dict(self.lower_tf_trigger),
+            "macro_alignment": dict(self.macro_alignment),
+            "structure_stop_plan": (
+                dict(self.structure_stop_plan)
+                if self.structure_stop_plan is not None else None
+            ),
+            "compared_to_current_runtime": dict(
+                self.compared_to_current_runtime
+            ),
+            "compared_to_royal_road_v1": (
+                dict(self.compared_to_royal_road_v1)
+                if self.compared_to_royal_road_v1 is not None else None
+            ),
+        }
+
+    @classmethod
+    def from_decision(
+        cls,
+        *,
+        v2_decision,
+        comparison_vs_current: dict,
+        comparison_vs_v1: dict | None,
+    ) -> "RoyalRoadDecisionV2Slice":
+        adv = v2_decision.advisory or {}
+        return cls(
+            profile=str(adv.get("profile", "royal_road_decision_v2")),
+            mode=str(adv.get("mode", "balanced")),
+            mode_status=str(
+                adv.get("mode_status", "heuristic_not_validated_default")
+            ),
+            mode_needs_validation=bool(adv.get("mode_needs_validation", True)),
+            action=v2_decision.action,
+            confidence=float(v2_decision.confidence),
+            score=float(adv.get("score", 0.0)),
+            reasons=list(adv.get("reasons") or []),
+            block_reasons=list(adv.get("block_reasons") or []),
+            cautions=list(adv.get("cautions") or []),
+            evidence_axes=dict(adv.get("evidence_axes") or {}),
+            evidence_axes_count=dict(adv.get("evidence_axes_count") or {}),
+            min_evidence_axes_required=adv.get("min_evidence_axes_required"),
+            support_resistance_v2=dict(adv.get("support_resistance_v2") or {}),
+            trendline_context=dict(adv.get("trendline_context") or {}),
+            chart_pattern_v2=dict(adv.get("chart_pattern_v2") or {}),
+            lower_tf_trigger=dict(adv.get("lower_tf_trigger") or {}),
+            macro_alignment=dict(adv.get("macro_alignment") or {}),
+            structure_stop_plan=adv.get("structure_stop_plan"),
+            compared_to_current_runtime=dict(comparison_vs_current),
+            compared_to_royal_road_v1=(
+                dict(comparison_vs_v1) if comparison_vs_v1 else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class FundamentalSlice:
     nearby_events: tuple[dict, ...]
     blocking_events: tuple[dict, ...]
@@ -985,6 +1097,10 @@ class BarDecisionTrace:
     # byte-identical trace output for legacy callers and the live
     # cmd_trade export path.
     royal_road_decision: RoyalRoadDecisionSlice | None = None
+    # royal_road_decision_v2 profile audit. Emitted ONLY when
+    # run_engine_backtest(decision_profile="royal_road_decision_v2").
+    # Default None preserves trace shape for current_runtime / v1.
+    royal_road_decision_v2: "RoyalRoadDecisionV2Slice | None" = None
 
     def to_dict(self) -> dict:
         return {
@@ -1020,6 +1136,10 @@ class BarDecisionTrace:
             "royal_road_decision": (
                 self.royal_road_decision.to_dict()
                 if self.royal_road_decision else None
+            ),
+            "royal_road_decision_v2": (
+                self.royal_road_decision_v2.to_dict()
+                if self.royal_road_decision_v2 else None
             ),
         }
 
@@ -1093,6 +1213,7 @@ __all__ = [
     "MacroContextSlice",
     "TechnicalConfluenceSlice",
     "RoyalRoadDecisionSlice",
+    "RoyalRoadDecisionV2Slice",
     "FundamentalSlice",
     "ExecutionAssumptionSlice",
     "ExecutionTraceSlice",

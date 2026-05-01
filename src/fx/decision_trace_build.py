@@ -31,6 +31,7 @@ from .decision_trace import (
     MarketSlice,
     RULE_TAXONOMY,
     RoyalRoadDecisionSlice,
+    RoyalRoadDecisionV2Slice,
     RuleCheck,
     TRACE_SCHEMA_VERSION,
     TechnicalConfluenceSlice,
@@ -1848,6 +1849,9 @@ def build_full_trace(
     runtime_overrides: dict | None = None,
     royal_road_decision=None,
     royal_road_compare: dict | None = None,
+    royal_road_decision_v2=None,
+    royal_road_v2_compare_vs_current: dict | None = None,
+    royal_road_v2_compare_vs_v1: dict | None = None,
 ) -> BarDecisionTrace:
     """Full trace for a normally processed bar.
 
@@ -1936,6 +1940,16 @@ def build_full_trace(
             royal_decision=royal_road_decision,
             comparison=royal_road_compare,
         )
+    royal_v2_slice: RoyalRoadDecisionV2Slice | None = None
+    if (
+        royal_road_decision_v2 is not None
+        and royal_road_v2_compare_vs_current is not None
+    ):
+        royal_v2_slice = RoyalRoadDecisionV2Slice.from_decision(
+            v2_decision=royal_road_decision_v2,
+            comparison_vs_current=royal_road_v2_compare_vs_current,
+            comparison_vs_v1=royal_road_v2_compare_vs_v1,
+        )
 
     return BarDecisionTrace(
         run_id=run_id,
@@ -1953,6 +1967,7 @@ def build_full_trace(
         macro_context=macro_ctx,
         technical_confluence=confluence,
         royal_road_decision=royal_slice,
+        royal_road_decision_v2=royal_v2_slice,
     )
 
 

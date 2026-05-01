@@ -52,6 +52,17 @@ from .royal_road_decision_modes import (
     DEFAULT_ROYAL_ROAD_MODE,
     get_royal_road_mode_config,
 )
+from .royal_road_decision_v2 import (
+    PROFILE_NAME_V2 as ROYAL_ROAD_PROFILE_V2,
+    compare_v2_vs_current,
+    compare_v2_vs_v1,
+    decide_royal_road_v2,
+)
+from .stop_modes import (
+    DEFAULT_STOP_MODE,
+    plan_stop,
+    validate_stop_mode,
+)
 from .technical_confluence import build_technical_confluence
 from .macro import MacroSnapshot
 from .waveform_library import WaveformSample
@@ -588,6 +599,18 @@ def run_engine_backtest(
     # diagnostic heuristic; `exploratory` is for discovery and not for
     # adoption. See `royal_road_decision_modes.py`.
     royal_road_mode: str = DEFAULT_ROYAL_ROAD_MODE,
+    # v2 inputs (consulted only when decision_profile=
+    # "royal_road_decision_v2"). df_lower_tf must be a DataFrame whose
+    # bars are at a finer interval than `interval`. lower_tf_interval
+    # is recorded in trace; the engine itself does not require it for
+    # correctness. df_lower_tf=None → trigger emits unavailable_reason.
+    df_lower_tf: pd.DataFrame | None = None,
+    lower_tf_interval: str | None = None,
+    # Stop placement mode. "atr" (default) reproduces PR #21 main.
+    # "structure" / "hybrid" are opt-in and consult the v2 structure
+    # stop layer. Live cmd_trade does not call this function so the
+    # flag cannot affect live trading.
+    stop_mode: str = DEFAULT_STOP_MODE,
 ) -> EngineBacktestResult:
     """Run a Decision Engine-driven backtest over `df`.
 
@@ -671,11 +694,13 @@ def run_engine_backtest(
     # profile module after the existing decide_action call.
     _decision_profile = validate_decision_profile(decision_profile)
     _royal_road_active = (_decision_profile == ROYAL_ROAD_PROFILE)
+    _royal_road_v2_active = (_decision_profile == ROYAL_ROAD_PROFILE_V2)
     # Validate the mode upfront (raises ValueError on unknown values).
     # The kwarg is harmless when the profile is current_runtime, but we
     # still want unknown values to surface immediately rather than
     # waiting for the first royal-road bar.
     _royal_road_mode = get_royal_road_mode_config(royal_road_mode).name
+    _stop_mode = validate_stop_mode(stop_mode)
 
     # PR #21: resolve indicator-period overrides. None → existing
     # current_runtime defaults, non-None → flowed through.
@@ -966,7 +991,11 @@ def run_engine_backtest(
         # — this is what `compared_to_current_runtime` exposes.
         decision_royal: Decision | None = None
         royal_compare: dict | None = None
-        if _royal_road_active:
+        decision_v2: Decision | None = None
+        v2_compare_vs_current: dict | None = None
+        v2_compare_vs_v1: dict | None = None
+        v2_stop_plan = None
+        if _royal_road_active or _royal_road_v2_active:
             confluence_dict = build_technical_confluence(
                 df_window=df.iloc[: i + 1],
                 snapshot=snap,
@@ -976,20 +1005,75 @@ def run_engine_backtest(
                 stop_atr_mult=stop_atr_mult,
                 tp_atr_mult=tp_atr_mult,
             )
-            decision_royal = decide_royal_road(
-                technical_signal=tech,
-                pattern=pattern,
-                higher_timeframe_trend=higher_tf,
-                risk_reward=risk_reward,
-                risk_state=risk_state,
-                technical_confluence=confluence_dict,
-                mode=_royal_road_mode,
-            )
-            royal_compare = compare_royal_decisions(
-                decision_current=decision_current,
-                decision_royal=decision_royal,
-            )
-            decision = decision_royal
+            if _royal_road_active:
+                decision_royal = decide_royal_road(
+                    technical_signal=tech,
+                    pattern=pattern,
+                    higher_timeframe_trend=higher_tf,
+                    risk_reward=risk_reward,
+                    risk_state=risk_state,
+                    technical_confluence=confluence_dict,
+                    mode=_royal_road_mode,
+                )
+                royal_compare = compare_royal_decisions(
+                    decision_current=decision_current,
+                    decision_royal=decision_royal,
+                )
+                decision = decision_royal
+            elif _royal_road_v2_active:
+                # Always compute v1 for the v2 trace's compared_to_v1 block.
+                decision_royal = decide_royal_road(
+                    technical_signal=tech,
+                    pattern=pattern,
+                    higher_timeframe_trend=higher_tf,
+                    risk_reward=risk_reward,
+                    risk_state=risk_state,
+                    technical_confluence=confluence_dict,
+                    mode=_royal_road_mode,
+                )
+                royal_compare = compare_royal_decisions(
+                    decision_current=decision_current,
+                    decision_royal=decision_royal,
+                )
+                # Macro context dict for v2 (point-in-time).
+                from .decision_trace_build import macro_context_slice
+                _macro_slice = macro_context_slice(macro, ts)
+                _macro_dict = (
+                    _macro_slice.to_dict() if _macro_slice is not None else None
+                )
+                decision_v2 = decide_royal_road_v2(
+                    df_window=df.iloc[: i + 1],
+                    technical_confluence=confluence_dict,
+                    pattern=pattern,
+                    higher_timeframe_trend=higher_tf,
+                    risk_reward=risk_reward,
+                    risk_state=risk_state,
+                    atr_value=float(atr_value),
+                    last_close=float(price),
+                    symbol=symbol,
+                    macro_context=_macro_dict,
+                    df_lower_tf=df_lower_tf,
+                    lower_tf_interval=lower_tf_interval,
+                    stop_mode=_stop_mode,
+                    stop_atr_mult=stop_atr_mult,
+                    tp_atr_mult=tp_atr_mult,
+                    base_bar_close_ts=ts,
+                    mode=_royal_road_mode,
+                )
+                v2_compare_vs_current = compare_v2_vs_current(
+                    decision_current=decision_current,
+                    decision_v2=decision_v2,
+                )
+                v2_compare_vs_v1 = compare_v2_vs_v1(
+                    decision_v1=decision_royal,
+                    decision_v2=decision_v2,
+                )
+                # Pull the stop plan back out of the advisory for engine
+                # use (saves recomputation).
+                v2_stop_plan = (decision_v2.advisory or {}).get(
+                    "structure_stop_plan"
+                )
+                decision = decision_v2
         else:
             decision = decision_current
 
@@ -1020,6 +1104,17 @@ def run_engine_backtest(
             else:
                 stop = price + offset
                 tp = price - tp_offset
+            # v2 + stop_mode != "atr": consult the v2 structure stop plan
+            # when valid. Default stop_mode="atr" keeps the legacy logic
+            # unchanged (byte-identical for current_runtime / v1).
+            if (
+                _royal_road_v2_active and _stop_mode != "atr"
+                and v2_stop_plan is not None
+                and v2_stop_plan.get("stop_price") is not None
+                and v2_stop_plan.get("take_profit_price") is not None
+            ):
+                stop = float(v2_stop_plan["stop_price"])
+                tp = float(v2_stop_plan["take_profit_price"])
             # Position size: full cash / price — the legacy backtest's
             # convention. Real sizing is risk-fraction; we keep this
             # comparable to backtest.py for direct A/B reads.
@@ -1100,6 +1195,9 @@ def run_engine_backtest(
                 runtime_overrides=_runtime_overrides_for_trace,
                 royal_road_decision=decision_royal,
                 royal_road_compare=royal_compare,
+                royal_road_decision_v2=decision_v2,
+                royal_road_v2_compare_vs_current=v2_compare_vs_current,
+                royal_road_v2_compare_vs_v1=v2_compare_vs_v1,
             )
             result.decision_traces.append(trace)
 
