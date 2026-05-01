@@ -40,10 +40,17 @@ from .waveform_library import build_library, read_library, write_library
 from .waveform_matcher import compute_signature
 from .broker import Broker, PaperBroker
 from .calendar import (
+    Event,
     calendar_freshness,
+    events_file_sha8,
     load_events,
+    load_events_with_diagnostics,
     seed_defaults,
     upcoming_for_symbol,
+)
+from .risk_gate import (
+    EVENT_WINDOW_POLICY_VERSION,
+    infer_event_kind,
 )
 from .config import Config
 from .context import (
@@ -79,6 +86,259 @@ from src.notify import (
 )
 
 EVENTS_PATH = Path("data/events.json")
+
+
+# PR #18 — calendar policy enum recorded in run_metadata.calendar.
+# `backtest_warn_but_use` / `paper_warn_but_use`: stale is a warning,
+# events are still loaded so historical results stay deterministic.
+# `live_require_fresh`: stale fails closed (events disabled here, Risk
+# Gate also blocks via require_calendar_fresh). `disabled_*` variants
+# capture explicit / structural reasons events were not loaded.
+_CALENDAR_POLICY_BACKTEST = "backtest_warn_but_use"
+_CALENDAR_POLICY_PAPER    = "paper_warn_but_use"
+_CALENDAR_POLICY_LIVE     = "live_require_fresh"
+_CALENDAR_POLICY_DISABLED_EXPLICIT   = "disabled_explicit"
+_CALENDAR_POLICY_DISABLED_MISSING    = "disabled_missing"
+_CALENDAR_POLICY_DISABLED_UNREADABLE = "disabled_unreadable"
+_CALENDAR_POLICY_DISABLED_EMPTY      = "disabled_empty"
+
+
+# PR #19: Literature parameter baseline catalog. Always emitted into
+# `run_metadata.parameters` from the research backtest path so a stored
+# trace can be reconciled with the catalog version that produced it.
+# PR #21: when `--apply-parameter-profile` is also supplied, the
+# baseline values are RESOLVED into runtime kwargs and forwarded to
+# `run_engine_backtest`. The metadata flips `applied_to_runtime=True`
+# and emits applied_sections / skipped_sections / applied_values /
+# diff_vs_default. `--parameter-profile X` ALONE remains metadata-only
+# (PR #19 invariant preserved). Live `cmd_trade` never calls this
+# helper, so live behaviour is unaffected.
+def _build_parameters_metadata(
+    requested_profile: str | None,
+    *,
+    apply_runtime: bool = False,
+) -> tuple[dict, dict]:
+    """Build the run_metadata.parameters block + runtime kwargs.
+
+    Returns (parameters_metadata, runtime_kwargs).
+
+    parameters_metadata is the dict folded into `run_metadata.parameters`.
+    runtime_kwargs is what to splat into `run_engine_backtest(**kwargs)`
+      to actually apply the profile to the engine. Empty dict when
+      `apply_runtime` is False, in which case the engine uses its
+      historical defaults (PR #20 main byte-identical).
+
+    `requested_profile` comes from `--parameter-profile`. None +
+    apply_runtime=True → ValueError (CLI must reject; this is a
+    defensive guard).
+    """
+    from .parameter_defaults import (
+        PARAMETER_BASELINE_V1,
+        PARAMETER_BASELINE_ID,
+        PARAMETER_BASELINE_VERSION,
+        PARAMETER_SWEEP_SPACE_V1,
+        baseline_payload_hash,
+        KNOWN_PARAMETER_PROFILES,
+    )
+    from .runtime_parameters import resolve_runtime_parameters
+    if (
+        requested_profile is not None
+        and requested_profile not in KNOWN_PARAMETER_PROFILES
+    ):
+        raise ValueError(
+            f"unknown --parameter-profile: {requested_profile!r}. "
+            f"Known profiles: {list(KNOWN_PARAMETER_PROFILES)}"
+        )
+    if apply_runtime and requested_profile is None:
+        raise ValueError(
+            "--apply-parameter-profile requires --parameter-profile to "
+            "be set as well"
+        )
+    runtime_kwargs, runtime_audit = resolve_runtime_parameters(
+        profile_baseline=PARAMETER_BASELINE_V1 if apply_runtime else None,
+        apply_runtime=apply_runtime,
+    )
+    base = {
+        "parameter_profile": requested_profile,
+        "runtime_profile": (
+            requested_profile if apply_runtime else "current_runtime"
+        ),
+        "baseline_id": PARAMETER_BASELINE_ID,
+        "baseline_version": PARAMETER_BASELINE_VERSION,
+        "baseline_payload_hash": baseline_payload_hash(PARAMETER_BASELINE_V1),
+        "baseline_reference": PARAMETER_BASELINE_ID,
+        "baseline_values": dict(PARAMETER_BASELINE_V1),
+        "sweep_space_reference": PARAMETER_SWEEP_SPACE_V1.get("sweep_space_id"),
+    }
+    base.update(runtime_audit)
+    return base, runtime_kwargs
+
+
+def _load_events_for_run(
+    *,
+    events_path: Path,
+    no_events: bool,
+    policy: str,
+    test_range: tuple | None = None,
+) -> tuple[tuple[Event, ...], dict, list[str]]:
+    """Load events for a research backtest / analyze / timeline run.
+
+    PR #18. The freshness signal goes into the metadata + warnings, but
+    `backtest_warn_but_use` deliberately uses events anyway so historical
+    backtests are deterministic against the events.json content (not the
+    file mtime). Returns:
+        (events_tuple, calendar_metadata_dict, warning_strings)
+    `calendar_metadata_dict` is the run_metadata.calendar block emission;
+    callers should attach it to RunMetadata via the engine kwarg.
+
+    `policy` is one of the `_CALENDAR_POLICY_*` constants. `test_range`
+    is `(start, end)` of the run window (used to compute
+    `test_range_within_coverage`). Pass None to skip that check.
+    """
+    warnings: list[str] = []
+
+    def _build_metadata(
+        *,
+        events_loaded: bool,
+        events: tuple[Event, ...],
+        diagnostics,
+        freshness,
+        effective_policy: str,
+        event_high_enabled: bool,
+    ) -> dict:
+        coverage_start = (
+            min(e.when for e in events).isoformat() if events else None
+        )
+        coverage_end = (
+            max(e.when for e in events).isoformat() if events else None
+        )
+        in_test_range = None
+        within_coverage: bool | None = None
+        if events and test_range is not None:
+            ts_start, ts_end = test_range
+            in_test_range = sum(
+                1 for e in events
+                if (e.impact or "medium").lower() == "high"
+                and ts_start <= e.when <= ts_end
+            )
+            within_coverage = (
+                min(e.when for e in events) <= ts_start
+                and max(e.when for e in events) >= ts_end
+            )
+        return {
+            "events_path": str(events_path),
+            "events_path_basename": Path(events_path).name,
+            "events_loaded": events_loaded,
+            "events_count": len(events),
+            "events_loaded_count": (
+                diagnostics.loaded_count if diagnostics else 0
+            ),
+            "events_dropped_count": (
+                diagnostics.dropped_count if diagnostics else 0
+            ),
+            "events_dropped_examples": (
+                list(diagnostics.dropped_examples) if diagnostics else []
+            ),
+            "events_parse_errors": (
+                list(diagnostics.parse_errors) if diagnostics else []
+            ),
+            "events_coverage_start": coverage_start,
+            "events_coverage_end": coverage_end,
+            "events_in_test_range_high_count": in_test_range,
+            "test_range_within_coverage": within_coverage,
+            "calendar_freshness_status": (
+                freshness.status if freshness else None
+            ),
+            "calendar_freshness_age_hours": (
+                freshness.age_hours if freshness else None
+            ),
+            "calendar_max_age_hours": (
+                freshness.max_age_hours if freshness else None
+            ),
+            "calendar_policy": effective_policy,
+            "event_high_enabled": event_high_enabled,
+            "event_window_policy_version": EVENT_WINDOW_POLICY_VERSION,
+            "events_file_sha8": events_file_sha8(events_path),
+            "warnings": list(warnings),
+        }
+
+    if no_events:
+        warnings.append("calendar disabled by --no-events")
+        return (), _build_metadata(
+            events_loaded=False, events=(), diagnostics=None,
+            freshness=None,
+            effective_policy=_CALENDAR_POLICY_DISABLED_EXPLICIT,
+            event_high_enabled=False,
+        ), warnings
+
+    freshness = calendar_freshness(events_path)
+
+    # Structural failure paths — independent of policy choice.
+    if freshness.status == "missing":
+        warnings.append(
+            f"events.json not found at {events_path}; running without events"
+        )
+        return (), _build_metadata(
+            events_loaded=False, events=(), diagnostics=None,
+            freshness=freshness,
+            effective_policy=_CALENDAR_POLICY_DISABLED_MISSING,
+            event_high_enabled=False,
+        ), warnings
+    if freshness.status == "unreadable":
+        warnings.append(
+            f"events.json unreadable: {freshness.detail}; "
+            "running without events"
+        )
+        return (), _build_metadata(
+            events_loaded=False, events=(), diagnostics=None,
+            freshness=freshness,
+            effective_policy=_CALENDAR_POLICY_DISABLED_UNREADABLE,
+            event_high_enabled=False,
+        ), warnings
+
+    events_list, diagnostics = load_events_with_diagnostics(events_path)
+    if diagnostics.dropped_count > 0:
+        warnings.append(
+            f"events.json: {diagnostics.dropped_count} entries dropped "
+            f"during parse (see events_dropped_examples)"
+        )
+    if not events_list:
+        warnings.append("events.json contains zero events")
+        return (), _build_metadata(
+            events_loaded=True, events=(), diagnostics=diagnostics,
+            freshness=freshness,
+            effective_policy=_CALENDAR_POLICY_DISABLED_EMPTY,
+            event_high_enabled=False,
+        ), warnings
+
+    # Live policy: stale fails closed. Research policies: stale is a
+    # warning, events are still loaded → backtest stays deterministic
+    # vs the events.json content.
+    if freshness.status == "stale" and policy == _CALENDAR_POLICY_LIVE:
+        warnings.append(
+            f"calendar stale ({freshness.age_hours:.1f}h > "
+            f"{freshness.max_age_hours:.0f}h) and policy={policy} → "
+            "events disabled for this run"
+        )
+        return (), _build_metadata(
+            events_loaded=False, events=(), diagnostics=diagnostics,
+            freshness=freshness, effective_policy=policy,
+            event_high_enabled=False,
+        ), warnings
+
+    if freshness.status == "stale":
+        warnings.append(
+            f"calendar stale ({freshness.age_hours:.1f}h > "
+            f"{freshness.max_age_hours:.0f}h) — using events anyway "
+            f"(policy={policy})"
+        )
+
+    events_tuple = tuple(events_list)
+    return events_tuple, _build_metadata(
+        events_loaded=True, events=events_tuple, diagnostics=diagnostics,
+        freshness=freshness, effective_policy=policy,
+        event_high_enabled=True,
+    ), warnings
 
 
 def _notify(storage: Storage, kind: str, text: str, min_confidence: float = 0.0) -> None:
@@ -429,20 +689,56 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
     ctx = _gather_inputs(args, cfg, storage)
     snap, decision, atr_value = ctx["snapshot"], ctx["decision"], ctx["atr"]
 
+    # Live trace plumbing — single helper that the three exit branches
+    # (HOLD / dry-run / live order) all call so every cmd_trade invocation
+    # produces exactly one BarDecisionTrace. When --trace-out / --trace-out-default
+    # is given but export fails, we surface the error to the caller via
+    # `trace_export_error` and the exit branches return code 2 — silent
+    # success on a requested-but-failed export would be dangerous.
+    trace_export_paths: dict[str, str] | None = None
+    trace_export_error: str | None = None
+
+    def _emit_live_trace(*, order_placed: bool, fill_obj: object | None) -> None:
+        nonlocal trace_export_paths, trace_export_error
+        out_dir = _resolve_live_trace_out_dir(args, ctx)
+        if out_dir is None:
+            return
+        try:
+            trace_export_paths = _write_live_trace(
+                ctx=ctx,
+                args=args,
+                broker_label=args.broker,
+                dry_run=bool(getattr(args, "dry_run", False)),
+                order_placed=order_placed,
+                fill_obj=fill_obj,
+                out_dir=out_dir,
+                overwrite=bool(getattr(args, "overwrite", False)),
+            )
+        except (FileExistsError, ValueError, OSError) as exc:
+            trace_export_error = f"{type(exc).__name__}: {exc}"
+            print(
+                f"[error] live trace export failed: {trace_export_error}",
+                file=sys.stderr,
+            )
+
     if decision.action == "HOLD":
-        _print(
-            {
-                "action": "HOLD",
-                "reason": decision.reason,
-                "blocked_by": list(decision.blocked_by),
-                "spread_pct": spread_pct,
-                "calendar": (
-                    ctx["calendar_freshness"].to_dict()
-                    if ctx.get("calendar_freshness") else None
-                ),
-            }
-        )
-        return 0
+        _emit_live_trace(order_placed=False, fill_obj=None)
+        payload_hold = {
+            "action": "HOLD",
+            "reason": decision.reason,
+            "blocked_by": list(decision.blocked_by),
+            "spread_pct": spread_pct,
+            "calendar": (
+                ctx["calendar_freshness"].to_dict()
+                if ctx.get("calendar_freshness") else None
+            ),
+        }
+        if trace_export_paths:
+            payload_hold["trace_export"] = trace_export_paths
+        if trace_export_error:
+            payload_hold["trace_export_error"] = trace_export_error
+        _print(payload_hold)
+        return 2 if trace_export_error else 0
 
     if atr_value <= 0:
         print("[warn] ATR is non-positive; cannot size trade.", file=sys.stderr)
@@ -473,21 +769,25 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
     )
 
     if args.dry_run:
-        _print(
-            {
-                "mode": "dry-run",
-                "symbol": args.symbol,
-                "decision": {
-                    "action": decision.action,
-                    "confidence": decision.confidence,
-                    "reason": decision.reason,
-                },
-                "plan": plan.to_dict(),
-                "spread_pct": spread_pct,
-                "would_place_order": True,
-            }
-        )
-        return 0
+        _emit_live_trace(order_placed=False, fill_obj=None)
+        payload_dry = {
+            "mode": "dry-run",
+            "symbol": args.symbol,
+            "decision": {
+                "action": decision.action,
+                "confidence": decision.confidence,
+                "reason": decision.reason,
+            },
+            "plan": plan.to_dict(),
+            "spread_pct": spread_pct,
+            "would_place_order": True,
+        }
+        if trace_export_paths:
+            payload_dry["trace_export"] = trace_export_paths
+        if trace_export_error:
+            payload_dry["trace_export_error"] = trace_export_error
+        _print(payload_dry)
+        return 2 if trace_export_error else 0
 
     pos = broker.place_order(
         symbol=args.symbol,
@@ -502,6 +802,17 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
     # object is None for old broker implementations that haven't been
     # upgraded — we still save the trade, just without the audit.
     fill = broker.last_execution_fill()
+    # Emit the live trace BEFORE persisting the trade so save_trade() can
+    # record the resolved decision_traces.jsonl path. If trace export is
+    # not requested (no --trace-out / --trace-out-default), trace_export_paths
+    # stays None and the trade row gets NULL for trace_jsonl_path. If trace
+    # export is requested but fails, we still persist the trade (the order
+    # was already placed by the broker) with NULL path, and exit code 2 is
+    # surfaced via trace_export_error below.
+    _emit_live_trace(order_placed=True, fill_obj=fill)
+    trace_jsonl_path = (
+        trace_export_paths.get("decision_traces") if trace_export_paths else None
+    )
     trade_id = storage.save_trade(
         symbol=args.symbol,
         side=plan.side,
@@ -522,26 +833,164 @@ def cmd_trade(args, cfg: Config, storage: Storage) -> int:
         order_response_time=fill.order_response_time if fill else None,
         fill_time=fill.fill_time if fill else None,
         execution_latency_ms=fill.execution_latency_ms if fill else None,
+        trace_jsonl_path=trace_jsonl_path,
     )
-    _print(
-        {
-            "mode": "live",
-            "broker": args.broker,
-            "trade_id": trade_id,
-            "position": {
-                "id": pos.id,
-                "symbol": pos.symbol,
-                "side": pos.side,
-                "entry": pos.entry,
-                "size": pos.size,
-                "stop": pos.stop,
-                "take_profit": pos.take_profit,
-            },
-            "fill": fill.to_dict() if fill else None,
-            "plan": plan.to_dict(),
-        }
+    payload_live = {
+        "mode": "live",
+        "broker": args.broker,
+        "trade_id": trade_id,
+        "position": {
+            "id": pos.id,
+            "symbol": pos.symbol,
+            "side": pos.side,
+            "entry": pos.entry,
+            "size": pos.size,
+            "stop": pos.stop,
+            "take_profit": pos.take_profit,
+        },
+        "fill": fill.to_dict() if fill else None,
+        "plan": plan.to_dict(),
+    }
+    if trace_export_paths:
+        payload_live["trace_export"] = trace_export_paths
+    if trace_export_error:
+        payload_live["trace_export_error"] = trace_export_error
+    _print(payload_live)
+    return 2 if trace_export_error else 0
+
+
+def _resolve_live_trace_out_dir(args, ctx) -> "Path | None":
+    """Decide the live trace output directory based on CLI flags.
+
+    --trace-out wins over --trace-out-default. When --trace-out-default is
+    on but the run_id helper has not yet been generated, we mint one here
+    so the directory name is deterministic for the rest of the call.
+    """
+    if getattr(args, "trace_out", None):
+        return Path(args.trace_out)
+    if getattr(args, "trace_out_default", False):
+        from .decision_trace_build import build_run_id
+        if "_live_run_id" not in ctx:
+            ctx["_live_run_id"] = build_run_id(args.symbol)
+        return Path("runs") / "live" / ctx["_live_run_id"]
+    return None
+
+
+def _write_live_trace(
+    *,
+    ctx: dict,
+    args,
+    broker_label: str,
+    dry_run: bool,
+    order_placed: bool,
+    fill_obj,
+    out_dir: "Path",
+    overwrite: bool,
+) -> dict[str, str]:
+    """Write run_metadata.json + decision_traces.jsonl for one cmd_trade run.
+
+    `decision_traces.jsonl` carries exactly one line (one bar) — live
+    invocations are single-bar by definition. Returns the resolved file
+    paths so the CLI can echo them in the JSON payload.
+    """
+    from .decision_trace_build import (
+        build_live_decision_trace,
+        build_live_run_metadata,
+        build_run_id,
     )
-    return 0
+
+    run_id = ctx.get("_live_run_id") or build_run_id(args.symbol)
+    df = ctx["df"]
+    ts = df.index[-1]
+    snap = ctx["snapshot"]
+    pattern = ctx["pattern"]
+    technical_action = ctx["technical"]
+    higher_tf = ctx["higher_tf"]
+    decision = ctx["decision"]
+    atr_value = ctx["atr"]
+
+    # Re-derive the same RiskState the engine saw — _gather_inputs builds
+    # it inline and discards it; re-build with the same inputs to feed
+    # rule_checks_full. This matches the values used by decide_action.
+    from datetime import timezone as _tz
+    from .risk_gate import RiskState as _RiskState
+    cal_health = ctx.get("calendar_freshness")
+    risk_state = _RiskState(
+        df=df,
+        events=tuple(ctx.get("events", [])),
+        spread_pct=getattr(args, "_spread_pct_override", None),
+        sentiment_snapshot=ctx.get("sentiment"),
+        calendar_freshness=cal_health,
+        require_calendar_fresh=bool(getattr(args, "require_fresh_calendar", False)),
+        require_spread=bool(getattr(args, "require_spread", False)),
+        now=ts.to_pydatetime() if ts.tzinfo else ts.tz_localize(_tz.utc).to_pydatetime(),
+    )
+
+    risk_reward = ctx.get("context").risk_reward if ctx.get("context") else None
+    if risk_reward is None:
+        risk_reward = 0.0
+
+    trace = build_live_decision_trace(
+        run_id=run_id,
+        df=df,
+        ts=ts,
+        symbol=args.symbol,
+        interval=args.interval,
+        snap=snap,
+        atr_value=atr_value if atr_value and atr_value > 0 else None,
+        technical_action=technical_action,
+        pattern=pattern,
+        higher_tf=higher_tf,
+        use_higher_tf=not bool(getattr(args, "no_higher_tf", False)),
+        risk_state=risk_state,
+        llm_signal=ctx.get("llm"),
+        decision=decision,
+        risk_reward=float(risk_reward),
+        broker_label=broker_label,
+        dry_run=dry_run,
+        order_placed=order_placed,
+        fill=fill_obj,
+    )
+
+    run_metadata = build_live_run_metadata(
+        run_id=run_id,
+        symbol=args.symbol,
+        interval=args.interval,
+        broker_label=broker_label,
+        dry_run=dry_run,
+        config_payload={
+            "broker": broker_label,
+            "dry_run": dry_run,
+            "interval": args.interval,
+        },
+    )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = out_dir / "run_metadata.json"
+    traces_path = out_dir / "decision_traces.jsonl"
+
+    if not overwrite:
+        existing = [p for p in (metadata_path, traces_path) if p.exists()]
+        if existing:
+            names = ", ".join(p.name for p in existing)
+            raise FileExistsError(
+                f"_write_live_trace: refusing to overwrite existing file(s) "
+                f"in {out_dir}: {names}. Pass --overwrite to replace."
+            )
+
+    metadata_path.write_text(
+        json.dumps(run_metadata.to_dict(), ensure_ascii=False,
+                   default=str, indent=2),
+        encoding="utf-8",
+    )
+    with traces_path.open("w", encoding="utf-8") as fp:
+        fp.write(json.dumps(trace.to_dict(), ensure_ascii=False, default=str))
+        fp.write("\n")
+
+    return {
+        "run_metadata": str(metadata_path.resolve()),
+        "decision_traces": str(traces_path.resolve()),
+    }
 
 
 def _build_broker(args) -> Broker:
@@ -608,29 +1057,189 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
         end=args.end,
     )
 
-    events = ()
-    if not args.no_events:
-        cal_health = calendar_freshness(EVENTS_PATH)
-        if cal_health.is_fresh:
-            events = tuple(load_events(EVENTS_PATH))
-        else:
+    # PR #17: optional historical context — feeds long_term_trend_slice
+    # only, NOT the judgement path. Fetched as a separate yfinance call
+    # ending strictly before df.index.min(). The 1h-specific 730d total-
+    # span limit is enforced here because the user's combined window
+    # (context + test) must fit; longer intervals (1d / 1wk) have no
+    # such limit and we don't blanket-apply it.
+    df_context = None
+    context_days = int(getattr(args, "context_days", 0) or 0)
+    if context_days > 0:
+        if len(df) == 0:
             print(
-                f"[warn] calendar {cal_health.status}: "
-                f"{cal_health.detail or 'unhealthy'} — "
-                "running backtest without macro events",
+                "[error] --context-days given but the test fetch is empty",
                 file=sys.stderr,
             )
+            return 2
+        test_start_ts = pd.Timestamp(df.index.min())
+        # Combined-window guard for 1h: yfinance hard-stops at ~730 days.
+        if args.interval == "1h":
+            test_span_days = (df.index.max() - df.index.min()).days + 1
+            if context_days + test_span_days > 730:
+                print(
+                    f"[error] --context-days {context_days} + test span "
+                    f"{test_span_days}d > 730d (yfinance 1h hard limit). "
+                    "Reduce --context-days or shorten test window.",
+                    file=sys.stderr,
+                )
+                return 2
+        ctx_end = test_start_ts.strftime("%Y-%m-%d")
+        ctx_start = (
+            test_start_ts - pd.Timedelta(days=context_days)
+        ).strftime("%Y-%m-%d")
+        try:
+            df_context = fetch_ohlcv(
+                args.symbol,
+                interval=args.interval,
+                period=None,
+                start=ctx_start,
+                end=ctx_end,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[error] context fetch failed: {e}",
+                file=sys.stderr,
+            )
+            return 2
+        # Drop any rows that landed at or after test_start (yfinance can
+        # over-deliver near the boundary). Strict-less-than is rechecked
+        # by the engine, but we trim defensively here so the engine
+        # doesn't reject the run on what is really a data-source quirk.
+        if len(df_context) > 0:
+            df_context = df_context[df_context.index < df.index.min()]
+        if len(df_context) == 0:
+            print(
+                "[warn] context fetch returned 0 bars after the strict-"
+                "before filter — proceeding without context",
+                file=sys.stderr,
+            )
+            df_context = None
+
+    # PR #18 — backtest deterministic policy: stale events.json is a
+    # WARNING, not a reason to drop events. Same events.json content +
+    # different mtime must yield the same trades. Live path uses
+    # `live_require_fresh` separately.
+    test_range_for_calendar = (
+        (df.index.min().to_pydatetime(), df.index.max().to_pydatetime())
+        if len(df) > 0 else None
+    )
+    events, calendar_metadata, calendar_warnings = _load_events_for_run(
+        events_path=EVENTS_PATH,
+        no_events=args.no_events,
+        policy=_CALENDAR_POLICY_BACKTEST,
+        test_range=test_range_for_calendar,
+    )
+    for w in calendar_warnings:
+        print(f"[warn] {w}", file=sys.stderr)
+
+    # Macro context (DXY / US10Y / VIX / indices). Fetched once per run
+    # and attached to the engine; build_full_trace samples each slot
+    # point-in-time per bar via Series.asof. Failure is non-fatal —
+    # backtest still produces the trace, macro_context just stays None.
+    macro = None
+    if not getattr(args, "no_macro", False):
+        try:
+            macro_period = getattr(args, "macro_period", None) or "2y"
+            macro = fetch_macro_snapshot(
+                df.index, interval="1d", period=macro_period,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[warn] macro fetch failed: {e} — trace will have "
+                "macro_context=null",
+                file=sys.stderr,
+            )
+
+    # Waveform library (PR #15): user-built JSONL of past WaveformSample.
+    # Read failure is fatal here — if you asked for a library and we
+    # cannot load it, you'd unknowingly run a backtest without it.
+    # Decision logic is unchanged either way; this is observability only.
+    waveform_library = None
+    waveform_library_id = None
+    if getattr(args, "waveform_library", None):
+        from .waveform_library import read_library
+        from .decision_trace_build import compute_library_id
+        lib_path = Path(args.waveform_library)
+        try:
+            waveform_library = read_library(lib_path)
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[error] failed to read waveform library {lib_path}: {e}",
+                file=sys.stderr,
+            )
+            return 2
+        if not waveform_library:
+            print(
+                f"[error] waveform library {lib_path} is empty",
+                file=sys.stderr,
+            )
+            return 2
+        waveform_library_id = compute_library_id(
+            waveform_library, str(lib_path),
+        )
+
+    # PR #19: build the literature_baseline_v1 metadata block. This is
+    # ALWAYS emitted (regardless of --parameter-profile) so a stored
+    # trace records which catalog version was current at run time.
+    # PR #21: when `--apply-parameter-profile` is also supplied, the
+    # baseline values are RESOLVED into runtime kwargs that flow to
+    # `run_engine_backtest`. Without that flag, runtime is unchanged
+    # (PR #19 invariant preserved).
+    try:
+        parameters_metadata, runtime_kwargs = _build_parameters_metadata(
+            getattr(args, "parameter_profile", None),
+            apply_runtime=bool(getattr(args, "apply_parameter_profile", False)),
+        )
+    except ValueError as e:
+        print(f"[error] {e}", file=sys.stderr)
+        return 2
+
+    # When PR #21 runtime apply is on, the resolved profile values
+    # override stop_atr_mult / tp_atr_mult / max_holding_bars. CLI args
+    # (--stop-atr etc.) take precedence ONLY when the user did NOT
+    # request profile apply — otherwise the profile wins.
+    _stop_atr_mult = (
+        runtime_kwargs.get("stop_atr_mult", args.stop_atr)
+        if runtime_kwargs else args.stop_atr
+    )
+    _tp_atr_mult = (
+        runtime_kwargs.get("tp_atr_mult", args.tp_atr)
+        if runtime_kwargs else args.tp_atr
+    )
+    _max_holding_bars = (
+        runtime_kwargs.get("max_holding_bars", args.max_holding_bars)
+        if runtime_kwargs else args.max_holding_bars
+    )
 
     result = run_engine_backtest(
         df,
         symbol=args.symbol,
         interval=args.interval,
         warmup=args.warmup,
-        stop_atr_mult=args.stop_atr,
-        tp_atr_mult=args.tp_atr,
-        max_holding_bars=args.max_holding_bars,
+        stop_atr_mult=_stop_atr_mult,
+        tp_atr_mult=_tp_atr_mult,
+        max_holding_bars=_max_holding_bars,
         events=events,
         use_higher_tf=not args.no_higher_tf,
+        macro=macro,
+        waveform_library=waveform_library,
+        waveform_library_id=waveform_library_id,
+        df_context=df_context,
+        context_days=context_days,
+        calendar=calendar_metadata,
+        parameters=parameters_metadata,
+        # PR #21 indicator-period overrides (None when apply_runtime=False
+        # → engine uses its existing defaults)
+        rsi_period=runtime_kwargs.get("rsi_period"),
+        rsi_overbought=runtime_kwargs.get("rsi_overbought"),
+        rsi_oversold=runtime_kwargs.get("rsi_oversold"),
+        macd_fast=runtime_kwargs.get("macd_fast"),
+        macd_slow=runtime_kwargs.get("macd_slow"),
+        macd_signal_period=runtime_kwargs.get("macd_signal"),
+        bb_period=runtime_kwargs.get("bb_period"),
+        bb_std=runtime_kwargs.get("bb_std"),
+        atr_period=runtime_kwargs.get("atr_period"),
     )
     metrics = result.metrics()
     start_date = str(df.index[0])
@@ -643,28 +1252,56 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
         strategy="decision_engine",
         metrics=metrics,
     )
-    _print(
-        {
-            "symbol": args.symbol,
-            "interval": args.interval,
-            "period": f"{start_date} -> {end_date}",
-            "bars": len(df),
-            "metrics": metrics,
-            "last_5_trades": [
-                {
-                    "side": t.side,
-                    "entry": round(t.entry, 6),
-                    "exit": round(t.exit, 6),
-                    "return_pct": round(t.return_pct, 3),
-                    "bars_held": t.bars_held,
-                    "exit_reason": t.exit_reason,
-                    "entry_ts": str(t.entry_ts),
-                    "exit_ts": str(t.exit_ts),
-                }
-                for t in result.trades[-5:]
-            ],
-        }
-    )
+    payload = {
+        "symbol": args.symbol,
+        "interval": args.interval,
+        "period": f"{start_date} -> {end_date}",
+        "bars": len(df),
+        "metrics": metrics,
+        "last_5_trades": [
+            {
+                "side": t.side,
+                "entry": round(t.entry, 6),
+                "exit": round(t.exit, 6),
+                "return_pct": round(t.return_pct, 3),
+                "bars_held": t.bars_held,
+                "exit_reason": t.exit_reason,
+                "entry_ts": str(t.entry_ts),
+                "exit_ts": str(t.exit_ts),
+            }
+            for t in result.trades[-5:]
+        ],
+    }
+
+    if args.trace_out:
+        trace_out_dir = Path(args.trace_out)
+    elif args.trace_out_default:
+        if result.run_metadata is None:
+            print(
+                "[error] --trace-out-default requires capture_traces=True "
+                "(run_metadata is None)",
+                file=sys.stderr,
+            )
+            return 2
+        trace_out_dir = Path("runs") / result.run_metadata.run_id
+    else:
+        trace_out_dir = None
+
+    if trace_out_dir is not None:
+        from .decision_trace_io import export_run
+        try:
+            paths = export_run(
+                result,
+                out_dir=trace_out_dir,
+                overwrite=args.overwrite,
+                gzip=args.gzip,
+            )
+        except (FileExistsError, ValueError) as exc:
+            print(f"[error] trace export failed: {exc}", file=sys.stderr)
+            return 2
+        payload["trace_export"] = {k: str(v) for k, v in paths.items()}
+
+    _print(payload)
     return 0
 
 
@@ -678,18 +1315,20 @@ def cmd_build_timeline(args, cfg: Config, storage: Storage) -> int:
         end=args.end,
     )
 
-    events: tuple = ()
-    if not args.no_events:
-        cal_health = calendar_freshness(EVENTS_PATH)
-        if cal_health.is_fresh:
-            events = tuple(load_events(EVENTS_PATH))
-        else:
-            print(
-                f"[warn] calendar {cal_health.status}: "
-                f"{cal_health.detail or 'unhealthy'} — "
-                "timeline will have no event columns",
-                file=sys.stderr,
-            )
+    # PR #18: timeline is a research path — same deterministic policy
+    # as backtest-engine so the event columns are reproducible.
+    test_range_for_calendar = (
+        (df.index.min().to_pydatetime(), df.index.max().to_pydatetime())
+        if len(df) > 0 else None
+    )
+    events, _calendar_metadata, calendar_warnings = _load_events_for_run(
+        events_path=EVENTS_PATH,
+        no_events=args.no_events,
+        policy=_CALENDAR_POLICY_BACKTEST,
+        test_range=test_range_for_calendar,
+    )
+    for w in calendar_warnings:
+        print(f"[warn] {w}", file=sys.stderr)
 
     macro = None
     if not args.no_macro:
@@ -1047,6 +1686,80 @@ def cmd_compare_external(args, cfg: Config, storage: Storage) -> int:
     return 0
 
 
+def cmd_trace_stats(args, cfg: Config, storage: Storage) -> int:
+    """Aggregate a `decision_traces.jsonl` (or .jsonl.gz) into a JSON summary.
+
+    Errors raised by `aggregate_stats` (FileNotFoundError / ValueError)
+    propagate as stderr + exit 2. When parsing succeeded but malformed
+    lines were skipped, the stats JSON is still emitted to stdout AND
+    exit code is 2 so a downstream caller can detect the partial read.
+    """
+    from .decision_trace_stats import aggregate_stats
+    try:
+        stats = aggregate_stats(
+            args.path,
+            top_n_hold_reasons=args.top_hold_reasons,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"[error] trace-stats: {exc}", file=sys.stderr)
+        return 2
+
+    if args.pretty:
+        out = json.dumps(stats, indent=2, ensure_ascii=False, default=str)
+    else:
+        out = json.dumps(stats, ensure_ascii=False, default=str)
+    print(out)
+
+    errors_total = stats["consistency_checks"]["errors_total"]
+    if errors_total > 0:
+        print(
+            f"[warn] trace-stats: {errors_total} error(s) recorded; "
+            f"see consistency_checks.errors",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
+
+
+def cmd_trace_stats_multi(args, cfg: Config, storage: Storage) -> int:
+    """Aggregate multiple `decision_traces.jsonl` files at once.
+
+    Per-run stats and a global pooled aggregate are emitted as a single
+    JSON document. Failure semantics:
+      * A `ValueError` from `aggregate_many` (no input paths or every
+        path failed) is printed to stderr and the command exits 2.
+      * If at least one path succeeded but `consistency_checks.errors_total`
+        is non-zero (per-run errors or failed_runs), the JSON is still
+        written to stdout AND the command exits 2 so the caller can
+        detect the partial read.
+    """
+    from .decision_trace_stats import aggregate_many
+    try:
+        stats = aggregate_many(
+            list(args.paths),
+            top_n_hold_reasons=args.top_hold_reasons,
+        )
+    except ValueError as exc:
+        print(f"[error] trace-stats-multi: {exc}", file=sys.stderr)
+        return 2
+
+    if args.pretty:
+        out = json.dumps(stats, indent=2, ensure_ascii=False, default=str)
+    else:
+        out = json.dumps(stats, ensure_ascii=False, default=str)
+    print(out)
+
+    errors_total = stats["consistency_checks"]["errors_total"]
+    if errors_total > 0:
+        print(
+            f"[warn] trace-stats-multi: {errors_total} error(s) recorded; "
+            f"see consistency_checks.errors / failed_runs",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
+
+
 def cmd_review(args, cfg: Config, storage: Storage) -> int:
     if not cfg.anthropic_api_key:
         print("ANTHROPIC_API_KEY not set; cannot run review.", file=sys.stderr)
@@ -1359,6 +2072,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Print the plan but do not place the order")
     t.add_argument("--confirm-demo", action="store_true",
                    help="Required for OANDA broker; acknowledges demo-only use")
+    t.add_argument("--trace-out", default=None,
+                   help="Directory to write run_metadata.json and "
+                        "decision_traces.jsonl (one line for this trade). "
+                        "Skip the flag to disable live trace export.")
+    t.add_argument("--trace-out-default", action="store_true",
+                   help="When --trace-out is omitted, write the live trace "
+                        "to runs/live/<run_id>/. --trace-out wins if both.")
+    t.add_argument("--overwrite", action="store_true",
+                   help="Allow live trace export to overwrite existing "
+                        "files in the target dir.")
     t.set_defaults(func=cmd_trade)
 
     b = sub.add_parser("backtest", help="Backtest technical strategy")
@@ -1534,7 +2257,113 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Ignore data/events.json (skip macro-event gate)")
     be.add_argument("--no-higher-tf", action="store_true",
                     help="Skip higher-timeframe alignment check")
+    be.add_argument("--no-macro", action="store_true",
+                    help="Do not fetch / attach the macro snapshot (DXY, "
+                         "US10Y, VIX, indices). trace.macro_context will "
+                         "be null. Decision logic is unchanged either way "
+                         "— this only affects what's recorded.")
+    be.add_argument("--macro-period", default="2y",
+                    help="yfinance period for the macro snapshot fetch "
+                         "(default 2y). Must comfortably cover --period.")
+    be.add_argument("--waveform-library", default=None,
+                    help="Path to a waveform library JSONL produced by "
+                         "`waveform-build-library`. When given, trace.waveform"
+                         ".waveform_bias is populated per bar via a "
+                         "horizon-aware look-ahead-safe lookup. Decision "
+                         "logic is unchanged — bias is observability only. "
+                         "REQUIRES a PR-#15+ library that records "
+                         "`forward_return_end_ts` per horizon (older "
+                         "libraries are rejected at lookup time and "
+                         "logged as unavailable_reason; rebuild with the "
+                         "current `waveform-build-library`). Recommended: "
+                         "build the library from data PRIOR to the "
+                         "backtest period (out-of-sample).")
+    be.add_argument("--context-days", type=int, default=0,
+                    help="Days of historical OHLCV to fetch BEFORE the "
+                         "test window for long_term_trend / SMA200 / "
+                         "monthly_trend computation. Observation-only — "
+                         "the judgement path (ATR / patterns / "
+                         "higher_tf / RSI / waveform target signature / "
+                         "decide_action) NEVER sees this context, so "
+                         "decisions are byte-identical with or without "
+                         "it. Default 0 (legacy behaviour). For "
+                         "`--interval 1h`, context_days + test span "
+                         "must be ≤730 (yfinance hard limit).")
+    be.add_argument("--parameter-profile", default=None,
+                    help="Literature parameter catalog profile to record "
+                         "in run_metadata.parameters. PR #19: "
+                         "METADATA-ONLY by default. Even with "
+                         "`--parameter-profile literature_baseline_v1` "
+                         "alone the runtime gate / decide_action / "
+                         "risk_gate values are unchanged — "
+                         "`applied_to_runtime` stays False. trade list "
+                         "/ metrics / hold_reasons / equity_curve are "
+                         "byte-identical with or without this flag "
+                         "(pinned by "
+                         "test_parameter_profile_metadata_only_trade_"
+                         "results_identical). To actually apply the "
+                         "profile to backtest runtime, ALSO pass "
+                         "--apply-parameter-profile. Unknown profile "
+                         "names are rejected with exit code 2.")
+    be.add_argument("--apply-parameter-profile", action="store_true",
+                    help="PR #21: actually apply the catalog selected "
+                         "by --parameter-profile to the backtest "
+                         "engine's runtime. Backtest-only — live "
+                         "(cmd_trade --broker oanda) and paper paths "
+                         "are unaffected. Without this flag, "
+                         "--parameter-profile stays metadata-only "
+                         "(PR #19 invariant preserved). Requires "
+                         "--parameter-profile X; passing this flag "
+                         "alone is rejected with exit code 2. "
+                         "literature_baseline_v1 differs from "
+                         "current_runtime defaults ONLY on "
+                         "stop_atr_mult (1.5 vs 2.0); other "
+                         "indicator periods / thresholds already "
+                         "match current defaults.")
+    be.add_argument("--trace-out", default=None,
+                    help="Directory to write run_metadata.json / "
+                         "decision_traces.jsonl / summary.json. Skip the "
+                         "flag to disable export (default behaviour).")
+    be.add_argument("--trace-out-default", action="store_true",
+                    help="When --trace-out is omitted, write the trace "
+                         "artefacts to runs/<run_id>/. --trace-out wins "
+                         "if both are given.")
+    be.add_argument("--overwrite", action="store_true",
+                    help="Allow --trace-out to overwrite existing files. "
+                         "Without this flag, any pre-existing output file "
+                         "in the target dir aborts the export.")
+    be.add_argument("--gzip", action="store_true",
+                    help="Write decision_traces.jsonl.gz instead of plain "
+                         "JSONL (only meaningful with --trace-out).")
     be.set_defaults(func=cmd_backtest_engine)
+
+    ts = sub.add_parser(
+        "trace-stats",
+        help="Aggregate a decision_traces.jsonl (or .gz) to a JSON summary",
+    )
+    ts.add_argument("path",
+                    help="Path to decision_traces.jsonl or .jsonl.gz")
+    ts.add_argument("--pretty", action="store_true",
+                    help="Pretty-print the output JSON (indent=2). "
+                         "Default is compact one-line JSON.")
+    ts.add_argument("--top-hold-reasons", type=int, default=10,
+                    help="Number of (reason, count) pairs to surface in "
+                         "top_hold_reasons (default 10).")
+    ts.set_defaults(func=cmd_trace_stats)
+
+    tsm = sub.add_parser(
+        "trace-stats-multi",
+        help="Aggregate multiple decision_traces.jsonl files (per-run + global)",
+    )
+    tsm.add_argument("paths", nargs="+",
+                     help="Paths to one or more decision_traces.jsonl(.gz). "
+                          "Globs expand via the shell.")
+    tsm.add_argument("--pretty", action="store_true",
+                     help="Pretty-print the output JSON (indent=2).")
+    tsm.add_argument("--top-hold-reasons", type=int, default=10,
+                     help="Number of (reason, count) pairs to surface in "
+                          "global.top_hold_reasons (default 10).")
+    tsm.set_defaults(func=cmd_trace_stats_multi)
 
     r = sub.add_parser("review", help="Weekly self-review via Claude")
     r.add_argument("--limit", type=int, default=50)

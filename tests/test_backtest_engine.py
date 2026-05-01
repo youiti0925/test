@@ -36,6 +36,37 @@ def test_engine_backtest_runs_to_completion():
     assert len(res.equity_curve) == res.bars_processed
 
 
+def test_engine_backtest_metrics_disclose_synthetic_execution_model():
+    df = _ohlcv(200, seed=7)
+    metrics = run_engine_backtest(df, symbol="X", interval="1h", warmup=60).metrics()
+
+    assert metrics["synthetic_execution"] is True
+    assert metrics["spread_mode"] == "not_modelled"
+    assert metrics["slippage_mode"] == "not_modelled"
+    assert metrics["fill_model"] == "close_price"
+    assert metrics["bid_ask_mode"] == "not_modelled"
+    assert metrics["sentiment_archive"] == "not_available"
+
+
+def test_engine_backtest_metrics_disclose_synthetic_execution_model_with_no_trades():
+    n = 200
+    idx = pd.date_range("2025-01-01", periods=n, freq="1h", tz="UTC")
+    df = pd.DataFrame(
+        {"open": [100.0] * n, "high": [100.0] * n, "low": [100.0] * n,
+         "close": [100.0] * n, "volume": [1000] * n},
+        index=idx,
+    )
+    metrics = run_engine_backtest(df, symbol="X", interval="1h", warmup=60).metrics()
+
+    assert metrics["n_trades"] == 0
+    assert metrics["synthetic_execution"] is True
+    assert metrics["spread_mode"] == "not_modelled"
+    assert metrics["slippage_mode"] == "not_modelled"
+    assert metrics["fill_model"] == "close_price"
+    assert metrics["bid_ask_mode"] == "not_modelled"
+    assert metrics["sentiment_archive"] == "not_available"
+
+
 def test_engine_backtest_returns_no_trades_on_extreme_high_event():
     """An always-on FOMC window should keep every bar at HOLD via the gate."""
     df = _ohlcv(200, seed=2)

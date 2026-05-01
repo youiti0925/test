@@ -30,17 +30,36 @@ right of `i`.
 """
 from __future__ import annotations
 
+import dataclasses
+import secrets
 from dataclasses import dataclass, field
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import Callable, Iterable
 
 import numpy as np
 import pandas as pd
 
 from .calendar import Event
-from .decision_engine import decide as decide_action
+from .decision_engine import Decision, decide as decide_action
+from .macro import MacroSnapshot
+from .waveform_library import WaveformSample
+from .decision_trace import (
+    BarDecisionTrace,
+    RunMetadata,
+    TRACE_SCHEMA_VERSION,
+    compute_data_snapshot_hash,
+    compute_strategy_config_hash,
+    get_commit_sha,
+)
+from .decision_trace_build import (
+    build_atr_unavailable_trace as _build_atr_unavailable_trace,
+    build_full_trace as _build_full_trace,
+    build_run_id as _build_run_id,
+    long_term_trend_slice as _long_term_trend_slice,
+    populate_future_outcomes as _populate_future_outcomes,
+)
 from .higher_timeframe import HIGHER_INTERVAL_MAP
-from .indicators import build_snapshot, technical_signal
+from .indicators import build_snapshot, technical_signal, technical_signal_reasons
 from .patterns import TrendState, analyse as analyse_patterns
 from .risk import atr as compute_atr
 from .risk_gate import RiskState
@@ -55,6 +74,24 @@ class EnginePosition:
     stop: float
     take_profit: float
     bars_held: int = 0
+    # Stable id of the form f"{run_id}_T{N}" so the trade can be joined
+    # back to the BarDecisionTrace entries at entry and exit.
+    trade_id: str = ""
+
+
+def _position_dict(p: "EnginePosition | None") -> dict | None:
+    if p is None:
+        return None
+    return {
+        "side": p.side,
+        "entry": p.entry,
+        "entry_ts": p.entry_ts,
+        "size": p.size,
+        "stop": p.stop,
+        "take_profit": p.take_profit,
+        "bars_held": p.bars_held,
+        "trade_id": p.trade_id,
+    }
 
 
 @dataclass
@@ -75,6 +112,10 @@ class EngineTrade:
     exit_reason: str
     rule_chain: tuple[str, ...] = ()
     blocked_by: tuple[str, ...] = ()
+    # Joins this trade to the corresponding ExecutionTraceSlice entries
+    # (entry bar + exit bar). Empty default keeps existing tests/code that
+    # construct EngineTrade directly working unchanged.
+    trade_id: str = ""
 
 
 @dataclass
@@ -86,9 +127,25 @@ class EngineBacktestResult:
     # synthetic "hold_no_signal" / "hold_pattern" / "hold_other" buckets.
     hold_reasons: dict[str, int] = field(default_factory=dict)
     bars_processed: int = 0
+    # Per-bar audit trail. Shape: list of BarDecisionTrace, one entry per
+    # bar processed (warmup excluded — they don't go through decide()).
+    # Empty when run_engine_backtest is called with capture_traces=False.
+    decision_traces: list[BarDecisionTrace] = field(default_factory=list)
+    # Reproducibility metadata — strategy hash, data hash, commit sha,
+    # run_id linking every trace back to this run.
+    run_metadata: RunMetadata | None = None
+
+    def to_decision_trace_records(self) -> list[dict]:
+        """Return all traces as JSON-serialisable dicts."""
+        return [t.to_dict() for t in self.decision_traces]
+
+    def to_run_metadata_dict(self) -> dict:
+        """Return run metadata as a JSON-serialisable dict (or empty)."""
+        return self.run_metadata.to_dict() if self.run_metadata else {}
 
     def metrics(self) -> dict:
         bars = self.bars_processed or 1
+        execution_metadata = _synthetic_execution_metadata()
         if not self.trades:
             return {
                 "n_trades": 0,
@@ -99,6 +156,7 @@ class EngineBacktestResult:
                 "hold_rate": 1.0,
                 "hold_reasons": dict(self.hold_reasons),
                 "bars_processed": self.bars_processed,
+                **execution_metadata,
             }
         wins = [t for t in self.trades if t.pnl > 0]
         losses = [t for t in self.trades if t.pnl < 0]
@@ -136,7 +194,25 @@ class EngineBacktestResult:
             "hold_reasons": dict(self.hold_reasons),
             "exit_reasons": _count_by_attr(self.trades, "exit_reason"),
             "bars_processed": self.bars_processed,
+            **execution_metadata,
         }
+
+
+def _synthetic_execution_metadata() -> dict[str, str | bool]:
+    """Disclose execution assumptions used by this research backtest.
+
+    The engine replay validates the decision rule chain, not real broker
+    execution quality. These fields make reports self-describing so the
+    result is not mistaken for spread/slippage/fill-aware live performance.
+    """
+    return {
+        "synthetic_execution": True,
+        "spread_mode": "not_modelled",
+        "slippage_mode": "not_modelled",
+        "fill_model": "close_price",
+        "bid_ask_mode": "not_modelled",
+        "sentiment_archive": "not_available",
+    }
 
 
 def _count_by_attr(trades: list[EngineTrade], attr: str) -> dict[str, int]:
@@ -204,6 +280,221 @@ def _bar_event_window(events: tuple[Event, ...], ts: pd.Timestamp) -> tuple[Even
     )
 
 
+def _compute_waveform_bias_for_bar(
+    df: pd.DataFrame,
+    i: int,
+    *,
+    library: list[WaveformSample] | None,
+    library_id: str | None,
+    interval: str,
+    window_bars: int,
+    horizon_bars: int,
+    method: str,
+    min_score: float,
+    min_samples: int,
+    min_directional_share: float,
+) -> dict | None:
+    """Thin wrapper: returns None when no library is attached (so the
+    trace stores a literal null and downstream tooling treats the bar
+    as 'waveform lookup not requested'). Otherwise delegates to
+    `decision_trace_build.waveform_bias_dict`, which itself returns a
+    dict — possibly with only `unavailable_reason` if the lookup could
+    not run for this bar (look-ahead filter empty, unknown interval,
+    insufficient warmup, etc.).
+    """
+    if library is None:
+        return None
+    from .decision_trace_build import waveform_bias_dict
+    return waveform_bias_dict(
+        library, df, i,
+        interval=interval,
+        library_id=library_id,
+        window_bars=window_bars,
+        horizon_bars=horizon_bars,
+        method=method,
+        min_score=min_score,
+        min_samples=min_samples,
+        min_directional_share=min_directional_share,
+    )
+
+
+def _validate_and_concat_context(
+    df_context: pd.DataFrame, df_test: pd.DataFrame,
+) -> tuple[pd.DataFrame, int]:
+    """Concatenate `df_context + df_test` after strict validation. PR #17.
+
+    Returns
+    -------
+    df_full : pd.DataFrame
+        The concatenation, sorted by index, used **only** as input to
+        `long_term_trend_slice`. The judgement path keeps using df_test.
+    n_context_bars : int
+        `len(df_context)` after validation. Surfaced in run_metadata so
+        the audit reader can recover the boundary.
+
+    Raises
+    ------
+    ValueError
+        If df_context overlaps with df_test in time, or either has
+        duplicate / non-monotonic index, or the tz state of the two
+        indices is mismatched. We fail loud — silently dropping rows
+        would corrupt long-term trend computation in ways that look
+        plausible but are wrong.
+    """
+    if df_context.empty:
+        return df_test, 0
+
+    # tz-state must match — comparing tz-aware against tz-naive raises
+    # in pandas, but the message is cryptic. Catch it here.
+    ctx_tz = df_context.index.tz
+    test_tz = df_test.index.tz
+    if (ctx_tz is None) != (test_tz is None):
+        raise ValueError(
+            "df_context and df_test have mismatched timezone state "
+            f"(context tz={ctx_tz}, test tz={test_tz}). Both must be "
+            "tz-aware or both tz-naive — cannot compare."
+        )
+
+    # Sort defensively, but catch unexpected duplicates *before* the sort
+    # masks them.
+    if df_context.index.duplicated().any():
+        n_dup = int(df_context.index.duplicated().sum())
+        raise ValueError(
+            f"df_context has {n_dup} duplicate index entries; refuse to "
+            "silently dedupe (would corrupt SMA computation). Caller must "
+            "clean upstream."
+        )
+    if df_test.index.duplicated().any():
+        n_dup = int(df_test.index.duplicated().sum())
+        raise ValueError(
+            f"df_test has {n_dup} duplicate index entries; refuse to "
+            "silently dedupe."
+        )
+
+    df_context_sorted = df_context.sort_index()
+    df_test_sorted = df_test.sort_index()
+    ctx_max = df_context_sorted.index.max()
+    test_min = df_test_sorted.index.min()
+    if ctx_max >= test_min:
+        raise ValueError(
+            "df_context overlaps df_test: "
+            f"context.max={ctx_max!s} >= test.min={test_min!s}. "
+            "context must be strictly before test_start."
+        )
+
+    df_full = pd.concat([df_context_sorted, df_test_sorted])
+    # Defensive: post-concat duplicates would only happen if the two
+    # frames share a timestamp on the seam, which the strict-less-than
+    # check above already rejects. Belt and braces.
+    if df_full.index.duplicated().any():  # pragma: no cover
+        raise ValueError(
+            "concatenated df_full has duplicate index after merge — "
+            "context/test boundary likely overlapping."
+        )
+    return df_full, len(df_context_sorted)
+
+
+def _build_context_metadata(
+    *,
+    df_test: pd.DataFrame,
+    df_context: pd.DataFrame | None,
+    n_context_bars: int,
+    context_days: int | None,
+) -> dict:
+    """Readable context-period block for run_metadata. PR #17.
+
+    Always emits all 9 fields regardless of whether context is attached —
+    a missing field would be ambiguous between "old run" and "explicitly
+    no context", and the reader has to defend against `KeyError` either
+    way. ``trace_scope`` / ``metrics_scope`` are constants here because
+    the engine ALWAYS confines trades and traces to the test frame, even
+    when context is supplied (the judgement loop only iterates df_test).
+    """
+    enabled = n_context_bars > 0 and df_context is not None
+    test_start_iso = (
+        df_test.index.min().isoformat() if len(df_test) > 0 else None
+    )
+    test_end_iso = (
+        df_test.index.max().isoformat() if len(df_test) > 0 else None
+    )
+    if enabled:
+        # df_context has been validated and possibly sorted — recover its
+        # earliest bar, which is the start of the historical window.
+        context_start_iso = df_context.sort_index().index.min().isoformat()
+    else:
+        context_start_iso = None
+    return {
+        "context_enabled": enabled,
+        "context_days": context_days if context_days is not None else 0,
+        "context_start": context_start_iso,
+        "test_start": test_start_iso,
+        "test_end": test_end_iso,
+        "n_context_bars": n_context_bars,
+        "n_test_bars": len(df_test),
+        "metrics_scope": "test_only",
+        "trace_scope": "test_only",
+        "long_term_context_attached": enabled,
+    }
+
+
+def _build_waveform_metadata(
+    *,
+    library: list[WaveformSample] | None,
+    library_id: str | None,
+    window_bars: int,
+    horizon_bars: int,
+    min_samples: int,
+    min_score: float,
+    min_share: float,
+    method: str,
+) -> dict:
+    """Readable waveform-match config for run_metadata.json (PR #16).
+
+    The same payload is fed into `compute_strategy_config_hash` so the hash
+    still distinguishes runs with different libraries, but the readable
+    copy here lets a future audit answer "which library / horizon / method
+    produced this run?" without cracking open decision_traces.jsonl.
+    Always emitted (waveform_enabled may be False) — a missing field would
+    be ambiguous between "unset" and "explicitly disabled".
+    """
+    schema: str | None = None
+    basename: str | None = None
+    first_end_ts: str | None = None
+    last_end_ts: str | None = None
+
+    if library is not None and library_id is not None:
+        # library_id format (PR-#15):
+        #   "{basename}|schema={v1|v2|empty}|n=N|{first_end_ts}|{last_end_ts}|{sha8}"
+        # Pre-PR-#15 callers may pass a non-conforming string — keep parsing
+        # forgiving so we never crash run_metadata generation.
+        parts = library_id.split("|")
+        if len(parts) >= 1:
+            basename = parts[0]
+        for p in parts[1:]:
+            if p.startswith("schema="):
+                schema = p[len("schema="):]
+                break
+        if len(parts) >= 5:
+            first_end_ts = parts[3] or None
+            last_end_ts = parts[4] or None
+
+    return {
+        "waveform_enabled": library is not None,
+        "waveform_library_id": library_id,
+        "waveform_library_size": len(library) if library is not None else 0,
+        "waveform_library_schema": schema,
+        "waveform_library_path_basename": basename,
+        "waveform_library_first_end_ts": first_end_ts,
+        "waveform_library_last_end_ts": last_end_ts,
+        "waveform_window_bars": window_bars,
+        "waveform_horizon_bars": horizon_bars,
+        "waveform_min_samples": min_samples,
+        "waveform_min_score": min_score,
+        "waveform_min_share": min_share,
+        "waveform_method": method,
+    }
+
+
 def run_engine_backtest(
     df: pd.DataFrame,
     symbol: str,
@@ -217,6 +508,59 @@ def run_engine_backtest(
     events: Iterable[Event] = (),
     llm_signal_fn: LLMSignalFn | None = None,
     use_higher_tf: bool = True,
+    capture_traces: bool = True,
+    compute_future_outcome: bool = True,
+    data_source: str = "unknown",
+    data_retrieved_at: datetime | None = None,
+    macro: MacroSnapshot | None = None,
+    # PR #15: waveform-match observability — values land in
+    # trace.waveform.waveform_bias and run_metadata, but are NEVER
+    # forwarded to decide_action (decisions remain unchanged whether
+    # a library is attached or not).
+    waveform_library: list[WaveformSample] | None = None,
+    waveform_library_id: str | None = None,
+    waveform_window_bars: int = 60,
+    waveform_horizon_bars: int = 24,
+    waveform_min_samples: int = 20,
+    waveform_min_score: float = 0.55,
+    waveform_min_share: float = 0.6,
+    waveform_method: str = "dtw",
+    # PR #17: optional historical OHLCV strictly BEFORE `df.index.min()`,
+    # used **only** by long_term_trend_slice so SMA90/200 + monthly_trend
+    # become valid from test_start. The judgement path (ATR / patterns /
+    # _resample_higher_tf / waveform target signature / RSI / decide_action)
+    # NEVER sees df_context — invariant pinned by
+    # test_decisions_byte_identical_with_or_without_context.
+    df_context: pd.DataFrame | None = None,
+    context_days: int | None = None,
+    # PR #18: optional pre-built calendar metadata block (events.json
+    # freshness / coverage / window-policy version). Engine doesn't
+    # touch the events themselves through this kwarg — events flow as
+    # before via the `events=` tuple, keeping decision behaviour
+    # invariant. This kwarg is purely for run_metadata.calendar.
+    calendar: dict | None = None,
+    # PR #19: optional pre-built parameter catalog block (baseline_id,
+    # baseline_version, baseline_payload_hash, full baseline payload,
+    # requested profile). METADATA-ONLY — engine reads no values from
+    # here. The kwarg exists so the catalog reaches RunMetadata via
+    # the same plumbing as `calendar`, without touching decide_action.
+    parameters: dict | None = None,
+    # PR #21: indicator-period / threshold overrides for runtime A/B.
+    # All None = current_runtime defaults (byte-identical to PR #20
+    # main). Non-None values flow to `indicators.build_snapshot` /
+    # `technical_signal*` / `compute_atr`. Triggered ONLY by
+    # backtest-engine `--apply-parameter-profile`. live cmd_trade
+    # never calls `run_engine_backtest`, so these kwargs cannot
+    # affect live behaviour.
+    rsi_period: int | None = None,
+    rsi_overbought: float | None = None,
+    rsi_oversold: float | None = None,
+    macd_fast: int | None = None,
+    macd_slow: int | None = None,
+    macd_signal_period: int | None = None,
+    bb_period: int | None = None,
+    bb_std: float | None = None,
+    atr_period: int | None = None,
 ) -> EngineBacktestResult:
     """Run a Decision Engine-driven backtest over `df`.
 
@@ -246,6 +590,18 @@ def run_engine_backtest(
         Default `None` keeps the test deterministic.
     use_higher_tf:
         Compute higher-TF trend per bar (slightly slower). Default True.
+    capture_traces:
+        When True (default), every processed bar produces a BarDecisionTrace
+        in result.decision_traces. Decision logic is identical with or
+        without this flag — pinned by test_decisions_unchanged_with_trace_logging.
+    compute_future_outcome:
+        When True (default), a second pass after the bar loop fills the
+        FutureOutcomeSlice on every trace. The decision pipeline never
+        consults future_outcome — pinned by
+        test_future_outcome_does_not_affect_decisions.
+    data_source / data_retrieved_at:
+        Provenance metadata copied into RunMetadata and MarketSlice. Pure
+        labelling — no behaviour depends on these.
     """
     result = EngineBacktestResult()
     pos: EnginePosition | None = None
@@ -254,11 +610,154 @@ def run_engine_backtest(
     pending_chain: tuple[str, ...] = ()
     pending_blocked: tuple[str, ...] = ()
 
+    # PR #17: optional historical context for long_term_trend_slice ONLY.
+    # The judgement path (ATR / patterns / higher_tf / RSI / waveform) sees
+    # df only — never df_full. This is what keeps decisions byte-identical
+    # with or without context (pinned by
+    # test_decisions_byte_identical_with_or_without_context).
+    df_full = df
+    n_context_bars = 0
+    if df_context is not None and len(df_context) > 0:
+        df_full, n_context_bars = _validate_and_concat_context(df_context, df)
+
+    def _long_term_trend_for_bar(i_test: int):
+        """Closure: compute long_term_trend at test bar i_test, expanding
+        the input window to include df_context if provided. PR #17.
+
+        Returns None when no context is attached — preserves the existing
+        behaviour where the trace builder falls back to
+        long_term_trend_slice(df, i) on its own. We only emit an override
+        when context actually changes the answer, keeping the no-context
+        path byte-identical with pre-PR-#17 runs.
+        """
+        if n_context_bars == 0:
+            return None
+        # Map the test-frame bar index into the full-frame index. The
+        # full frame is df_context (length n_context_bars) followed by df,
+        # so test bar i_test corresponds to full bar i_test + n_context_bars.
+        return _long_term_trend_slice(df_full, i_test + n_context_bars)
+
+    # PR #21: resolve indicator-period overrides. None → existing
+    # current_runtime defaults, non-None → flowed through.
+    _atr_period_eff = atr_period if atr_period is not None else 14
+    _rsi_period_eff = rsi_period if rsi_period is not None else 14
+    _rsi_overbought_eff = rsi_overbought if rsi_overbought is not None else 70.0
+    _rsi_oversold_eff = rsi_oversold if rsi_oversold is not None else 30.0
+    _macd_fast_eff = macd_fast if macd_fast is not None else 12
+    _macd_slow_eff = macd_slow if macd_slow is not None else 26
+    _macd_signal_eff = macd_signal_period if macd_signal_period is not None else 9
+    _bb_period_eff = bb_period if bb_period is not None else 20
+    _bb_std_eff = bb_std if bb_std is not None else 2.0
+
+    # PR #21: actually-used dict for trace audit. Always populated so
+    # TechnicalSlice.*_used fields capture the run config (the values
+    # equal the historical defaults when no profile is applied — this
+    # is fine because the audit is meant to RECORD what ran, not just
+    # what differed).
+    _runtime_overrides_for_trace: dict = {
+        "rsi_period": _rsi_period_eff,
+        "rsi_overbought": _rsi_overbought_eff,
+        "rsi_oversold": _rsi_oversold_eff,
+        "macd_fast": _macd_fast_eff,
+        "macd_slow": _macd_slow_eff,
+        "macd_signal": _macd_signal_eff,
+        "bb_period": _bb_period_eff,
+        "bb_std": _bb_std_eff,
+        "atr_period": _atr_period_eff,
+        "stop_atr_mult": stop_atr_mult,
+        "tp_atr_mult": tp_atr_mult,
+        "max_holding_bars": max_holding_bars,
+    }
+
     # ATR is monotonic-suffix — compute once over the full df. Each bar
     # only reads atr_series.iloc[i], no future leak.
-    atr_series = compute_atr(df, period=14)
+    atr_series = compute_atr(df, period=_atr_period_eff)
     events_tuple = tuple(events)
     risk_reward = tp_atr_mult / stop_atr_mult
+
+    # ── Trace metadata ──────────────────────────────────────────────────
+    # Built up-front so every trace can carry the same run_id. bar_range
+    # is finalised after the loop so it reflects what actually ran.
+    run_metadata: RunMetadata | None = None
+    trade_counter = 0
+    if capture_traces:
+        run_id = _build_run_id(symbol)
+        # PR #16: derive readable waveform metadata once, then reuse for both
+        # the strategy_config_hash payload and RunMetadata.waveform. The hash
+        # alone cannot tell a future audit which library / horizon / method
+        # produced these traces; without the readable copy you have to crack
+        # open decision_traces.jsonl just to find the library_id.
+        waveform_meta = _build_waveform_metadata(
+            library=waveform_library,
+            library_id=waveform_library_id,
+            window_bars=waveform_window_bars,
+            horizon_bars=waveform_horizon_bars,
+            min_samples=waveform_min_samples,
+            min_score=waveform_min_score,
+            min_share=waveform_min_share,
+            method=waveform_method,
+        )
+        # PR #17: backtest-engine context-period block. Always emitted for
+        # backtest runs so a future audit can see "context_enabled=false"
+        # explicitly rather than guessing from a missing field.
+        context_meta = _build_context_metadata(
+            df_test=df,
+            df_context=df_context,
+            n_context_bars=n_context_bars,
+            context_days=context_days,
+        )
+        config_payload = {
+            "interval": interval,
+            "initial_cash": initial_cash,
+            "warmup": warmup,
+            "stop_atr_mult": stop_atr_mult,
+            "tp_atr_mult": tp_atr_mult,
+            "max_holding_bars": max_holding_bars,
+            "use_higher_tf": use_higher_tf,
+            "n_events": len(events_tuple),
+            "llm_signal_fn_used": llm_signal_fn is not None,
+            "macro_attached": macro is not None,
+            "macro_slots": (
+                sorted(macro.series.keys()) if macro is not None else []
+            ),
+            # PR #15 — waveform-match config. Saved here so a trace can be
+            # re-derived from the same library + params later.
+            **waveform_meta,
+            # PR #17 — context-period config. Folded into the hash so a run
+            # made WITH context is distinguishable from one WITHOUT, even
+            # though decisions byte-match by design.
+            "context_enabled": context_meta["context_enabled"],
+            "context_days": context_meta["context_days"],
+            "n_context_bars": context_meta["n_context_bars"],
+        }
+        sha, sha_status = get_commit_sha()
+        run_metadata = RunMetadata(
+            run_id=run_id,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            symbol=symbol,
+            timeframe=interval,
+            bar_range={"start": None, "end": None, "n_bars": 0, "warmup": warmup},
+            trace_schema_version=TRACE_SCHEMA_VERSION,
+            strategy_config_hash=compute_strategy_config_hash(config_payload),
+            data_snapshot_hash=compute_data_snapshot_hash(df, symbol, interval),
+            input_data_source=data_source,
+            input_data_retrieved_at=(
+                data_retrieved_at.isoformat() if data_retrieved_at else None
+            ),
+            synthetic_execution=True,
+            commit_sha=sha,
+            commit_sha_status=sha_status,
+            execution_mode="synthetic_backtest",
+            engine_version="backtest_engine.run_engine_backtest",
+            timezone_name="UTC",
+            waveform=dict(waveform_meta),
+            context=dict(context_meta),
+            calendar=dict(calendar) if calendar is not None else None,
+            parameters=dict(parameters) if parameters is not None else None,
+        )
+        result.run_metadata = run_metadata
+    else:
+        run_id = ""
 
     for i in range(warmup, len(df)):
         result.bars_processed += 1
@@ -266,8 +765,18 @@ def run_engine_backtest(
         ts = window.index[-1]
         price = float(window["close"].iloc[-1])
 
+        # Snapshot before any state mutation on this bar, so the trace can
+        # reproduce what the engine "saw" entering the bar.
+        position_before = _position_dict(pos)
+        bars_held_before = pos.bars_held if pos is not None else None
+        had_open_position = pos is not None
+
         # Mark-to-market the existing position first; stops/TPs win over
         # any new signal on the same bar.
+        bar_exit_event = False
+        bar_exit_reason: str | None = None
+        bar_exit_price: float | None = None
+        bar_exit_trade_id: str | None = None
         if pos is not None:
             pos.bars_held += 1
             high = float(window["high"].iloc[-1])
@@ -305,9 +814,14 @@ def run_engine_backtest(
                         exit_reason=exit_reason,
                         rule_chain=pending_chain,
                         blocked_by=pending_blocked,
+                        trade_id=pos.trade_id,
                     )
                 )
                 cash += pnl
+                bar_exit_event = True
+                bar_exit_reason = exit_reason
+                bar_exit_price = exit_price
+                bar_exit_trade_id = pos.trade_id
                 pos = None
 
         # Build the engine inputs from the window only. Skip bars where
@@ -317,10 +831,64 @@ def run_engine_backtest(
             _bump(result.hold_reasons, "atr_unavailable")
             equity = cash + _unrealized(pos, price)
             result.equity_curve.append((ts, equity))
+            if capture_traces:
+                trace = _build_atr_unavailable_trace(
+                    run_id=run_id,
+                    df=df,
+                    i=i,
+                    ts=ts,
+                    symbol=symbol,
+                    interval=interval,
+                    data_source=data_source,
+                    events_tuple=events_tuple,
+                    pos_after=pos,
+                    position_before=position_before,
+                    bars_held_before=bars_held_before,
+                    had_open_position=had_open_position,
+                    bar_exit_event=bar_exit_event,
+                    bar_exit_reason=bar_exit_reason,
+                    bar_exit_price=bar_exit_price,
+                    bar_exit_trade_id=bar_exit_trade_id,
+                    macro=macro,
+                    waveform_bias=_compute_waveform_bias_for_bar(
+                        df, i,
+                        library=waveform_library,
+                        library_id=waveform_library_id,
+                        interval=interval,
+                        window_bars=waveform_window_bars,
+                        horizon_bars=waveform_horizon_bars,
+                        method=waveform_method,
+                        min_score=waveform_min_score,
+                        min_samples=waveform_min_samples,
+                        min_directional_share=waveform_min_share,
+                    ),
+                    long_term_trend_override=_long_term_trend_for_bar(i),
+                    runtime_overrides=_runtime_overrides_for_trace,
+                )
+                result.decision_traces.append(trace)
             continue
 
-        snap = build_snapshot(symbol, window)
-        tech = technical_signal(snap)
+        snap = build_snapshot(
+            symbol, window,
+            rsi_period=_rsi_period_eff,
+            macd_fast=_macd_fast_eff,
+            macd_slow=_macd_slow_eff,
+            macd_signal=_macd_signal_eff,
+            bb_period=_bb_period_eff,
+            bb_std=_bb_std_eff,
+        )
+        tech = technical_signal(
+            snap,
+            rsi_overbought=_rsi_overbought_eff,
+            rsi_oversold=_rsi_oversold_eff,
+        )
+        # Mirror call for trace only — action is delegated back to
+        # technical_signal so it cannot drift. See indicators.py docstring.
+        tech_action_for_trace, tech_reason_codes = technical_signal_reasons(
+            snap,
+            rsi_overbought=_rsi_overbought_eff,
+            rsi_oversold=_rsi_oversold_eff,
+        )
         pattern = analyse_patterns(window)
         higher_tf = (
             _resample_higher_tf(window, interval) if use_higher_tf else "UNKNOWN"
@@ -365,6 +933,9 @@ def run_engine_backtest(
         # from BUY to SELL on the same bar is rare and would over-trade
         # in a backtest — close on flip is handled at the NEXT bar via
         # mark-to-market once the new direction's stop/TP frames it.
+        bar_entry_executed = False
+        bar_entry_price: float | None = None
+        bar_entry_skipped_reason = "entry_executed"  # set per case below
         if decision.action in ("BUY", "SELL") and pos is None:
             offset = stop_atr_mult * float(atr_value)
             tp_offset = tp_atr_mult * float(atr_value)
@@ -378,6 +949,8 @@ def run_engine_backtest(
             # convention. Real sizing is risk-fraction; we keep this
             # comparable to backtest.py for direct A/B reads.
             size = cash / price
+            trade_counter += 1
+            new_trade_id = f"{run_id}_T{trade_counter}" if run_id else ""
             pos = EnginePosition(
                 side=decision.action,
                 entry=price,
@@ -385,21 +958,86 @@ def run_engine_backtest(
                 size=size,
                 stop=stop,
                 take_profit=tp,
+                trade_id=new_trade_id,
             )
             pending_chain = decision.rule_chain
             pending_blocked = decision.blocked_by
+            bar_entry_executed = True
+            bar_entry_price = price
+            bar_entry_skipped_reason = "entry_executed"
+        elif decision.action in ("BUY", "SELL") and pos is not None:
+            bar_entry_skipped_reason = "position_already_open"
+        else:  # decision.action == "HOLD"
+            bar_entry_skipped_reason = "decision_was_HOLD"
 
         equity = cash + _unrealized(pos, price)
         result.equity_curve.append((ts, equity))
 
+        if capture_traces:
+            trace = _build_full_trace(
+                run_id=run_id,
+                df=df,
+                i=i,
+                ts=ts,
+                symbol=symbol,
+                interval=interval,
+                data_source=data_source,
+                events_tuple=events_tuple,
+                snap=snap,
+                atr_value=float(atr_value),
+                tech=tech,
+                tech_reason_codes=tech_reason_codes,
+                pattern=pattern,
+                higher_tf=higher_tf,
+                use_higher_tf=use_higher_tf,
+                risk_state=risk_state,
+                llm_signal=llm_signal,
+                decision=decision,
+                risk_reward=risk_reward,
+                stop_atr_mult=stop_atr_mult,
+                tp_atr_mult=tp_atr_mult,
+                max_holding_bars=max_holding_bars,
+                position_before=position_before,
+                position_after=_position_dict(pos),
+                bars_held_before=bars_held_before,
+                had_open_position=had_open_position,
+                bar_entry_executed=bar_entry_executed,
+                bar_entry_price=bar_entry_price,
+                bar_entry_skipped_reason=bar_entry_skipped_reason,
+                bar_exit_event=bar_exit_event,
+                bar_exit_reason=bar_exit_reason,
+                bar_exit_price=bar_exit_price,
+                bar_exit_trade_id=bar_exit_trade_id,
+                macro=macro,
+                waveform_bias=_compute_waveform_bias_for_bar(
+                    df, i,
+                    library=waveform_library,
+                    library_id=waveform_library_id,
+                    interval=interval,
+                    window_bars=waveform_window_bars,
+                    horizon_bars=waveform_horizon_bars,
+                    method=waveform_method,
+                    min_score=waveform_min_score,
+                    min_samples=waveform_min_samples,
+                    min_directional_share=waveform_min_share,
+                ),
+                long_term_trend_override=_long_term_trend_for_bar(i),
+                runtime_overrides=_runtime_overrides_for_trace,
+            )
+            result.decision_traces.append(trace)
+
     # Force-close anything still open at the end so equity / trade counts
-    # don't omit the final position's PnL.
+    # don't omit the final position's PnL. The end_of_data exit must also
+    # be reflected in the LAST decision_trace's execution_trace so the
+    # trace is consistent with EngineTrade — pinned by
+    # test_end_of_data_exit_recorded_in_last_trace.
     if pos is not None:
         ts = df.index[-1]
         price = float(df["close"].iloc[-1])
         direction = 1 if pos.side == "BUY" else -1
         pnl = (price - pos.entry) * pos.size * direction
         ret_pct = 100 * (price - pos.entry) / pos.entry * direction
+        forced_trade_id = pos.trade_id
         result.trades.append(
             EngineTrade(
                 side=pos.side,
@@ -413,7 +1051,73 @@ def run_engine_backtest(
                 exit_reason="end_of_data",
                 rule_chain=pending_chain,
                 blocked_by=pending_blocked,
+                trade_id=forced_trade_id,
             )
+        )
+        if capture_traces and result.decision_traces:
+            last_trace = result.decision_traces[-1]
+            new_exec = dataclasses.replace(
+                last_trace.execution_trace,
+                position_after=None,
+                exit_event=True,
+                exit_reason="end_of_data",
+                exit_price=price,
+                exit_trade_id=forced_trade_id,
+                trade_id=(
+                    last_trace.execution_trace.entry_trade_id
+                    or forced_trade_id
+                ),
+            )
+            # Patch the exit_check rule_check so it stays consistent with
+            # the execution_trace — otherwise readers see exit_event=true
+            # while exit_check still says "position remains open".
+            new_checks = []
+            for rc in last_trace.rule_checks:
+                if rc.canonical_rule_id == "exit_check":
+                    new_checks.append(dataclasses.replace(
+                        rc,
+                        result="PASS",
+                        computed=True,
+                        used_in_decision=True,
+                        value={
+                            "exited": True,
+                            "exit_reason": "end_of_data",
+                            "exit_price": price,
+                            "forced_close_at_end_of_data": True,
+                        },
+                        reason="position force-closed at end_of_data",
+                        source_chain_step="post_loop",
+                    ))
+                else:
+                    new_checks.append(rc)
+            last_trace.execution_trace = new_exec
+            last_trace.rule_checks = tuple(new_checks)
+
+    # Finalise run metadata now that we know the actual processed range,
+    # then run the second pass that fills FutureOutcomeSlice. The second
+    # pass runs over the completed traces — it cannot influence decisions.
+    if capture_traces and result.run_metadata is not None:
+        if result.decision_traces:
+            result.run_metadata.bar_range = {
+                "start": result.decision_traces[0].timestamp,
+                "end": result.decision_traces[-1].timestamp,
+                "n_bars": len(result.decision_traces),
+                "warmup": warmup,
+            }
+        else:
+            result.run_metadata.bar_range = {
+                "start": None, "end": None, "n_bars": 0, "warmup": warmup,
+            }
+
+    if capture_traces and compute_future_outcome and result.decision_traces:
+        _populate_future_outcomes(
+            traces=result.decision_traces,
+            df=df,
+            interval=interval,
+            stop_atr_mult=stop_atr_mult,
+            tp_atr_mult=tp_atr_mult,
+            max_holding_bars=max_holding_bars,
+            atr_series=atr_series,
         )
 
     return result
