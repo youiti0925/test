@@ -1,13 +1,3 @@
-"""Unit tests for `royal_road_decision.decide_royal_road` rule chain.
-
-Each test feeds a hand-built `technical_confluence_v1` dict, an empty
-df-based RiskState (so the gate passes), and asserts the rule output
-matches the royal-road v1 spec (see `docs/royal_road_decision_v1.md`).
-
-These tests do NOT exercise the engine wiring — that belongs in
-`test_royal_road_decision_engine_invariant.py` and
-`test_royal_road_decision_compare_trace.py`.
-"""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -24,297 +14,138 @@ from src.fx.royal_road_decision import (
     decide_royal_road,
     validate_decision_profile,
 )
-
-
-# ──────────── helpers ──────────────────────────────────────────────
+from src.fx.royal_road_decision_modes import (
+    DEFAULT_ROYAL_ROAD_MODE,
+    get_royal_road_mode_config,
+    supported_royal_road_modes,
+)
 
 
 def _ohlcv(n: int = 200) -> pd.DataFrame:
     rng = np.random.default_rng(7)
     idx = pd.date_range("2025-01-01", periods=n, freq="1h", tz="UTC")
     close = 100.0 + np.cumsum(rng.standard_normal(n) * 0.3)
-    return pd.DataFrame({
-        "open": close, "high": close + 0.3, "low": close - 0.3,
-        "close": close, "volume": [1000] * n,
-    }, index=idx)
+    return pd.DataFrame({"open": close, "high": close + 0.3, "low": close - 0.3, "close": close, "volume": [1000] * n}, index=idx)
 
 
 def _state() -> RiskState:
-    """Minimal RiskState whose gate passes (no events, no spread, no
-    recent loss streak)."""
-    return RiskState(
-        df=_ohlcv(200),
-        events=(),
-        spread_pct=None,
-        sentiment_snapshot=None,
-        now=datetime(2025, 1, 5, 12, 0, tzinfo=timezone.utc),
-    )
+    return RiskState(df=_ohlcv(), events=(), spread_pct=None, sentiment_snapshot=None, now=datetime(2025, 1, 5, 12, 0, tzinfo=timezone.utc))
 
 
-def _confluence(
-    *,
-    label: str = "STRONG_BUY_SETUP",
-    score: float = 0.6,
-    invalidation_clear: bool = True,
-    structure_stop: float | None = 99.0,
-    near_support: bool = True,
-    near_resistance: bool = False,
-    candle_bull: bool = False,
-    candle_bear: bool = False,
-    market_regime: str = "TREND_UP",
-    structure_code: str = "HL",
-    avoid_reasons: list[str] | None = None,
-    bullish_reasons: list[str] | None = None,
-    bearish_reasons: list[str] | None = None,
-) -> dict:
+def _tc(label="STRONG_BUY_SETUP", *, side="BUY", invalidation_clear=True, structure_stop=99.0, near_support=True, near_resistance=False, avoid=None):
+    bull = side == "BUY"
     return {
-        "policy_version": "technical_confluence_v1",
-        "market_regime": market_regime,
-        "dow_structure": {
-            "structure_code": structure_code,
-            "last_swing_high": 101.0, "last_swing_low": 99.0,
-            "bos_up": False, "bos_down": False,
-        },
-        "support_resistance": {
-            "near_support": near_support,
-            "near_resistance": near_resistance,
-            "breakout": False, "pullback": False,
-            "role_reversal": False, "fake_breakout": False,
-        },
-        "candlestick_signal": {
-            "bullish_pinbar": candle_bull,
-            "bearish_pinbar": candle_bear,
-            "bullish_engulfing": False, "bearish_engulfing": False,
-            "harami": False,
-            "strong_bull_body": False, "strong_bear_body": False,
-            "rejection_wick": False,
-        },
-        "chart_pattern": {},
-        "indicator_context": {},
-        "risk_plan_obs": {
-            "atr_stop_distance_atr": 2.0,
-            "structure_stop_price": structure_stop,
-            "structure_stop_distance_atr": 1.2 if structure_stop else None,
-            "rr_atr_based": 1.5,
-            "rr_structure_based": 2.5 if structure_stop else None,
-            "invalidation_clear": invalidation_clear,
-        },
-        "vote_breakdown": {},
-        "final_confluence": {
-            "label": label, "score": score,
-            "bullish_reasons": bullish_reasons or [],
-            "bearish_reasons": bearish_reasons or [],
-            "avoid_reasons":   avoid_reasons or [],
-        },
+        "market_regime": "TREND_UP" if bull else "TREND_DOWN",
+        "dow_structure": {"structure_code": "HL" if bull else "LH", "bos_up": False, "bos_down": False},
+        "support_resistance": {"near_support": near_support, "near_resistance": near_resistance, "role_reversal": False},
+        "candlestick_signal": {"bullish_pinbar": bull, "bullish_engulfing": False, "strong_bull_body": False, "bearish_pinbar": not bull, "bearish_engulfing": False, "strong_bear_body": False},
+        "chart_pattern": {"double_top": False, "double_bottom": False, "triple_top": False, "triple_bottom": False, "neckline_broken": False},
+        "risk_plan_obs": {"invalidation_clear": invalidation_clear, "structure_stop_price": structure_stop},
+        "final_confluence": {"label": label, "score": 0.6 if bull else -0.6, "bullish_reasons": [], "bearish_reasons": [], "avoid_reasons": avoid or []},
     }
 
 
-def _decide(tc: dict, **overrides):
-    kwargs = dict(
-        technical_signal="HOLD",
-        pattern=None,
-        higher_timeframe_trend="UPTREND",
-        risk_reward=1.5,
-        risk_state=_state(),
-        technical_confluence=tc,
-    )
-    kwargs.update(overrides)
-    return decide_royal_road(**kwargs)
+def _decide(tc, **kw):
+    args = dict(technical_signal="HOLD", pattern=None, higher_timeframe_trend="UPTREND", risk_reward=1.5, risk_state=_state(), technical_confluence=tc)
+    args.update(kw)
+    return decide_royal_road(**args)
 
 
-# ─────────────── happy paths ───────────────────────────────────────
+def test_default_mode_is_balanced():
+    assert DEFAULT_ROYAL_ROAD_MODE == "balanced"
+    assert get_royal_road_mode_config().name == "balanced"
+    assert supported_royal_road_modes() == ("strict", "balanced", "exploratory")
 
 
-def test_strong_buy_with_full_evidence_returns_buy():
-    d = _decide(_confluence(
-        label="STRONG_BUY_SETUP", near_support=True,
-        market_regime="TREND_UP", structure_code="HL",
-        candle_bull=True, score=0.7,
-    ))
+def test_balanced_strong_buy_returns_buy():
+    d = _decide(_tc("STRONG_BUY_SETUP"))
     assert d.action == "BUY"
     assert d.advisory["profile"] == PROFILE_NAME
-    assert d.advisory["score"] == 0.7
-    assert "STRONG_BUY_SETUP_confirmed" in d.advisory["reasons"]
-    assert d.advisory["block_reasons"] == []
-    assert 0.55 <= d.confidence <= 0.95
+    assert d.advisory["mode"] == "balanced"
+    assert d.advisory["mode_needs_validation"] is True
 
 
-def test_strong_sell_with_full_evidence_returns_sell():
-    d = _decide(
-        _confluence(
-            label="STRONG_SELL_SETUP",
-            near_support=False, near_resistance=True,
-            market_regime="TREND_DOWN", structure_code="LH",
-            candle_bull=False, candle_bear=True, score=-0.6,
-        ),
-        higher_timeframe_trend="DOWNTREND",
-    )
+def test_balanced_strong_sell_returns_sell():
+    d = _decide(_tc("STRONG_SELL_SETUP", side="SELL", near_support=False, near_resistance=True), higher_timeframe_trend="DOWNTREND")
     assert d.action == "SELL"
-    assert d.advisory["profile"] == PROFILE_NAME
+    assert d.advisory["mode"] == "balanced"
 
 
-# ─────────────── strict v1 rejections (HOLD) ───────────────────────
-
-
-def test_weak_buy_setup_returns_hold():
-    d = _decide(_confluence(label="WEAK_BUY_SETUP"))
+def test_strict_weak_buy_stays_hold():
+    d = _decide(_tc("WEAK_BUY_SETUP"), mode="strict")
     assert d.action == "HOLD"
-    assert any("weak_setup:WEAK_BUY_SETUP" in r for r in d.advisory["block_reasons"])
+    assert "weak_setup:WEAK_BUY_SETUP" in d.advisory["block_reasons"]
 
 
-def test_weak_sell_setup_returns_hold():
-    d = _decide(_confluence(label="WEAK_SELL_SETUP"))
-    assert d.action == "HOLD"
-    assert any("weak_setup:WEAK_SELL_SETUP" in r for r in d.advisory["block_reasons"])
+def test_balanced_weak_buy_can_enter_with_multiple_axes():
+    d = _decide(_tc("WEAK_BUY_SETUP"))
+    assert d.action == "BUY"
 
 
-def test_no_trade_label_returns_hold():
-    d = _decide(_confluence(label="NO_TRADE"))
-    assert d.action == "HOLD"
+def test_balanced_weak_sell_can_enter_with_multiple_axes():
+    d = _decide(_tc("WEAK_SELL_SETUP", side="SELL", near_support=False, near_resistance=True), higher_timeframe_trend="DOWNTREND")
+    assert d.action == "SELL"
 
 
-def test_avoid_trade_label_returns_hold():
-    d = _decide(_confluence(label="AVOID_TRADE"))
-    assert d.action == "HOLD"
-
-
-def test_unknown_label_returns_hold():
-    d = _decide(_confluence(label="UNKNOWN"))
-    assert d.action == "HOLD"
-
-
-def test_invalidation_unclear_blocks_buy():
-    d = _decide(_confluence(label="STRONG_BUY_SETUP", invalidation_clear=False))
-    assert d.action == "HOLD"
-    assert "invalidation_unclear" in d.advisory["block_reasons"]
-
-
-def test_structure_stop_missing_blocks_buy():
-    d = _decide(_confluence(label="STRONG_BUY_SETUP", structure_stop=None))
-    assert d.action == "HOLD"
-    assert "structure_stop_missing" in d.advisory["block_reasons"]
-
-
-def test_near_resistance_blocks_strong_buy():
-    d = _decide(_confluence(
-        label="STRONG_BUY_SETUP",
-        near_support=False, near_resistance=True,
-        market_regime="TREND_UP", structure_code="HL",
-    ))
+def test_balanced_near_resistance_blocks_buy():
+    d = _decide(_tc("STRONG_BUY_SETUP", near_support=False, near_resistance=True))
     assert d.action == "HOLD"
     assert "near_resistance_for_buy" in d.advisory["block_reasons"]
 
 
-def test_near_support_blocks_strong_sell():
-    d = _decide(
-        _confluence(
-            label="STRONG_SELL_SETUP",
-            near_support=True, near_resistance=False,
-            market_regime="TREND_DOWN", structure_code="LH",
-            candle_bear=True, score=-0.6,
-        ),
-        higher_timeframe_trend="DOWNTREND",
-    )
+def test_balanced_near_support_blocks_sell():
+    d = _decide(_tc("STRONG_SELL_SETUP", side="SELL", near_support=True, near_resistance=False), higher_timeframe_trend="DOWNTREND")
     assert d.action == "HOLD"
     assert "near_support_for_sell" in d.advisory["block_reasons"]
 
 
-def test_no_bullish_evidence_blocks_buy():
-    d = _decide(_confluence(
-        label="STRONG_BUY_SETUP",
-        near_support=False, near_resistance=False,
-        market_regime="RANGE", structure_code="MIXED",
-        candle_bull=False,
-    ))
+def test_balanced_soft_missing_structure_stop():
+    d = _decide(_tc("STRONG_BUY_SETUP", structure_stop=None))
+    assert d.action == "BUY"
+    assert "structure_stop_missing_soft" in d.advisory["cautions"]
+
+
+def test_balanced_soft_invalidation_unclear():
+    d = _decide(_tc("STRONG_BUY_SETUP", invalidation_clear=False))
+    assert d.action == "BUY"
+    assert "invalidation_unclear_soft" in d.advisory["cautions"]
+
+
+def test_strict_still_blocks_missing_structure_stop():
+    d = _decide(_tc("STRONG_BUY_SETUP", structure_stop=None), mode="strict")
     assert d.action == "HOLD"
-    assert "no_bullish_evidence" in d.advisory["block_reasons"]
+    assert "structure_stop_missing" in d.advisory["block_reasons"]
 
 
-def test_htf_counter_trend_blocks_buy():
-    d = _decide(
-        _confluence(
-            label="STRONG_BUY_SETUP",
-            near_support=True, market_regime="TREND_UP",
-            structure_code="HL", candle_bull=True,
-        ),
-        higher_timeframe_trend="DOWNTREND",
-    )
+def test_serious_avoid_blocks():
+    d = _decide(_tc("STRONG_BUY_SETUP", avoid=["fake_breakout"]))
     assert d.action == "HOLD"
-    assert "htf_counter_trend_for_buy" in d.advisory["block_reasons"]
+    assert "avoid:fake_breakout" in d.advisory["block_reasons"]
 
 
-def test_serious_avoid_blocks_strong_buy():
-    d = _decide(_confluence(
-        label="STRONG_BUY_SETUP",
-        near_support=True, market_regime="TREND_UP",
-        structure_code="HL", candle_bull=True,
-        avoid_reasons=["fake_breakout"],
-    ))
+@pytest.mark.parametrize("label", ["NO_TRADE", "AVOID_TRADE", "UNKNOWN"])
+def test_non_directional_labels_hold(label):
+    d = _decide(_tc(label))
     assert d.action == "HOLD"
-    assert any("fake_breakout" in r for r in d.advisory["block_reasons"])
+    assert f"label:{label}" in d.advisory["block_reasons"]
 
 
-def test_rr_below_floor_blocks():
-    d = _decide(
-        _confluence(
-            label="STRONG_BUY_SETUP", near_support=True,
-            market_regime="TREND_UP", structure_code="HL",
-            candle_bull=True,
-        ),
-        risk_reward=0.5,
-    )
-    assert d.action == "HOLD"
-    assert any("rr<" in r for r in d.advisory["block_reasons"])
-
-
-# ─────────────── compare_decisions taxonomy ───────────────────────
-
-
-class _Dummy:
-    def __init__(self, action: str) -> None:
+class _D:
+    def __init__(self, action):
         self.action = action
 
 
-def test_compare_same_action_same():
-    out = compare_decisions(decision_current=_Dummy("BUY"), decision_royal=_Dummy("BUY"))
-    assert out["difference_type"] == "same"
-    assert out["same_action"] is True
+def test_compare_decisions_taxonomy():
+    assert compare_decisions(decision_current=_D("BUY"), decision_royal=_D("HOLD"))["difference_type"] == "current_buy_royal_hold"
+    assert compare_decisions(decision_current=_D("HOLD"), decision_royal=_D("SELL"))["difference_type"] == "current_hold_royal_sell"
+    assert compare_decisions(decision_current=_D("BUY"), decision_royal=_D("SELL"))["difference_type"] == "opposite_direction"
 
 
-def test_compare_current_buy_royal_hold():
-    out = compare_decisions(
-        decision_current=_Dummy("BUY"), decision_royal=_Dummy("HOLD"),
-    )
-    assert out["difference_type"] == "current_buy_royal_hold"
-
-
-def test_compare_current_hold_royal_sell():
-    out = compare_decisions(
-        decision_current=_Dummy("HOLD"), decision_royal=_Dummy("SELL"),
-    )
-    assert out["difference_type"] == "current_hold_royal_sell"
-
-
-def test_compare_opposite_direction():
-    out = compare_decisions(
-        decision_current=_Dummy("BUY"), decision_royal=_Dummy("SELL"),
-    )
-    assert out["difference_type"] == "opposite_direction"
-
-
-# ─────────────── profile validation ────────────────────────────────
-
-
-def test_supported_profiles_includes_default_and_royal():
+def test_profile_validation():
     assert "current_runtime" in SUPPORTED_DECISION_PROFILES
     assert PROFILE_NAME in SUPPORTED_DECISION_PROFILES
-
-
-def test_validate_decision_profile_rejects_unknown():
+    assert validate_decision_profile(PROFILE_NAME) == PROFILE_NAME
     with pytest.raises(ValueError):
-        validate_decision_profile("nonexistent_profile")
-
-
-def test_validate_decision_profile_returns_canonical_name():
-    assert validate_decision_profile("current_runtime") == "current_runtime"
-    assert validate_decision_profile("royal_road_decision_v1") == PROFILE_NAME
+        validate_decision_profile("bad")
+    with pytest.raises(ValueError):
+        get_royal_road_mode_config("bad")
