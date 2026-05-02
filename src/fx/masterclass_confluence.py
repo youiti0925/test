@@ -30,14 +30,23 @@ SCHEMA_VERSION: Final[str] = "grand_confluence_v2"
 _AXES: Final[tuple[str, ...]] = (
     "dow", "line", "ma", "oscillator", "price_action",
     "pattern", "risk_reward", "invalidation", "macro",
+    # Source-pack additions (observation-only)
+    "fibonacci", "mtf", "roadmap", "symbol_macro",
 )
 
 
-def _axis(name: str, status: str, reason_ja: str) -> dict:
+def _axis(
+    name: str,
+    status: str,
+    reason_ja: str,
+    *,
+    what_to_check_on_chart_ja: str = "",
+) -> dict:
     return {
         "axis": name,
         "status": status,
         "reason_ja": reason_ja,
+        "what_to_check_on_chart_ja": what_to_check_on_chart_ja,
     }
 
 
@@ -64,6 +73,10 @@ def build_grand_confluence_v2(
     pattern_review: dict | None,
     entry_summary: dict | None,
     macro_score: float | None = None,
+    fibonacci_review: dict | None = None,
+    mtf_story: dict | None = None,
+    roadmap_review: dict | None = None,
+    symbol_briefing_review: dict | None = None,
 ) -> dict:
     """Aggregate the 9 axes into a single panel."""
     axes: list[dict] = []
@@ -258,6 +271,97 @@ def build_grand_confluence_v2(
         axes.append(_axis(
             "macro", "UNKNOWN",
             f"マクロスコア {macro_score:+.2f} (NEUTRAL)。",
+        ))
+
+    # Source-pack additions: fibonacci / mtf / roadmap / symbol_macro
+
+    # Fibonacci
+    if not fibonacci_review or not fibonacci_review.get("available"):
+        axes.append(_axis(
+            "fibonacci", "UNKNOWN", "フィボ判定不可 (アンカースイング不足)。",
+            what_to_check_on_chart_ja=(
+                "波形に明確な高安スイングが出るまで待ってください。"
+            ),
+        ))
+    else:
+        zone = fibonacci_review.get("retracement_zone", "")
+        fib_status = fibonacci_review.get("status", "UNKNOWN")
+        axes.append(_axis(
+            "fibonacci", fib_status,
+            f"フィボ位置: {zone}。{fibonacci_review.get('meaning_ja', '')}",
+            what_to_check_on_chart_ja=fibonacci_review.get(
+                "what_to_check_on_chart_ja", "",
+            ),
+        ))
+
+    # MTF
+    if not mtf_story or not mtf_story.get("available"):
+        axes.append(_axis(
+            "mtf", "UNKNOWN", "マルチタイムフレーム判定不可。",
+        ))
+    elif mtf_story.get("tf_aligned"):
+        axes.append(_axis(
+            "mtf", "PASS",
+            f"上位足 {mtf_story.get('higher_tf')} と下位足が整合。",
+            what_to_check_on_chart_ja=(
+                "上位足チャートと下位足チャートを切り替えて、方向が一致しているかを"
+                "確認してください。"
+            ),
+        ))
+    else:
+        axes.append(_axis(
+            "mtf", "WARN",
+            "上位足と下位足の方向が一致していません。",
+            what_to_check_on_chart_ja=(
+                "整合しない場合は王道ではエントリーを見送るか、より小さい"
+                "ロットで試すのが定石です。"
+            ),
+        ))
+
+    # Roadmap
+    if not roadmap_review or not roadmap_review.get("available"):
+        axes.append(_axis(
+            "roadmap", "UNKNOWN", "Daily roadmap 判定不可。",
+        ))
+    else:
+        rd_status = roadmap_review.get("status", "UNKNOWN")
+        axes.append(_axis(
+            "roadmap", rd_status,
+            roadmap_review.get("verdict_ja", ""),
+            what_to_check_on_chart_ja=roadmap_review.get(
+                "what_to_check_on_chart_ja", "",
+            ),
+        ))
+
+    # Symbol macro briefing
+    if not symbol_briefing_review:
+        axes.append(_axis(
+            "symbol_macro", "UNKNOWN",
+            "通貨ペア固有のファンダブリーフィング情報なし。",
+        ))
+    elif symbol_briefing_review.get("unavailable_reason") == (
+        "macro_briefing_data_missing"
+    ):
+        axes.append(_axis(
+            "symbol_macro", "UNKNOWN",
+            symbol_briefing_review.get("warning_ja", "")
+            or "ファンダ未接続。",
+            what_to_check_on_chart_ja=symbol_briefing_review.get(
+                "what_to_check_on_chart_ja", "",
+            ),
+        ))
+    elif symbol_briefing_review.get("available"):
+        axes.append(_axis(
+            "symbol_macro", "PASS",
+            symbol_briefing_review.get("meaning_ja", ""),
+            what_to_check_on_chart_ja=symbol_briefing_review.get(
+                "what_to_check_on_chart_ja", "",
+            ),
+        ))
+    else:
+        axes.append(_axis(
+            "symbol_macro", "UNKNOWN",
+            "通貨ペアブリーフィングが資料パックにありません。",
         ))
 
     # Aggregate

@@ -1133,6 +1133,7 @@ def build_visual_audit_payload(
     from .masterclass_aggregate import build_masterclass_panels
     technical_confluence_dict = _trace_technical_confluence(trace)
     macro_align = v2.get("macro_alignment") or {}
+    trace_symbol = _trace_symbol(trace)
     masterclass_panels = build_masterclass_panels(
         visible_df=visible,
         parent_bar_ts=parent_ts,
@@ -1151,6 +1152,7 @@ def build_visual_audit_payload(
             float(macro_align.get("macro_score"))
             if macro_align.get("macro_score") is not None else None
         ),
+        symbol=trace_symbol,
     )
 
     return {
@@ -2135,6 +2137,8 @@ _WAVE_LINE_STYLE: Final[dict] = {
     "pattern_upper":         {"color": "#ef6c00", "dash": "4,3", "width": 1.6},
     "pattern_lower":         {"color": "#ef6c00", "dash": "4,3", "width": 1.6},
     "pattern_breakout":      {"color": "#7b1fa2", "dash": "6,4", "width": 2.0},
+    "fibonacci_retracement": {"color": "#00838f", "dash": "3,3", "width": 1.2},
+    "fibonacci_extension":   {"color": "#00695c", "dash": "3,3", "width": 1.2},
 }
 
 
@@ -2868,6 +2872,25 @@ img.thumb { width: 220px; height: auto; border: 1px solid #ddd; }
 .masterclass-detail table.kv td.status-YES { background: #d9f7d9; font-weight: bold; }
 .masterclass-detail table.kv td.status-NO { background: #f8d7da; font-weight: bold; }
 .masterclass-detail .small { color: #555; font-size: 11px; margin: 4px 0; }
+/* Tier 1 / Tier 2 summary blocks (3-tier layout: summary → check → detail) */
+.masterclass-tier1 { background: #fff8e1; border: 2px solid #f9a825;
+  border-radius: 6px; padding: 8px 12px; margin: 8px 0; }
+.masterclass-tier1 h4 { color: #5d4037; margin: 0 0 6px; font-size: 14px; }
+.masterclass-tier1 .tier1-table { font-size: 12px; width: 100%; }
+.masterclass-tier1 .tier1-table th { background: #fff3cd; }
+.masterclass-tier2 { background: #f0f8f0; border: 1px solid #6fb56f;
+  border-radius: 4px; padding: 8px 12px; margin: 8px 0; }
+.masterclass-tier2 h4 { color: #2e5f2e; margin: 0 0 6px; font-size: 13px; }
+.masterclass-tier2 .tier2-table { font-size: 12px; width: 100%; }
+.masterclass-tier2 .tier2-table th { background: #d9f7d9; }
+.masterclass-tier1 .tier1-table td.status-PASS,
+.masterclass-tier2 .tier2-table td.status-PASS { background: #d9f7d9; font-weight: bold; }
+.masterclass-tier1 .tier1-table td.status-WARN,
+.masterclass-tier2 .tier2-table td.status-WARN { background: #fff3cd; font-weight: bold; }
+.masterclass-tier1 .tier1-table td.status-BLOCK,
+.masterclass-tier2 .tier2-table td.status-BLOCK { background: #f8d7da; font-weight: bold; }
+.masterclass-tier1 .tier1-table td.status-UNKNOWN,
+.masterclass-tier2 .tier2-table td.status-UNKNOWN { background: #e0e0e0; }
 /* wave overlay (drawn on top of candle chart) */
 .wave-skeleton-line { pointer-events: none; }
 .wave-pivot-dot { pointer-events: none; }
@@ -3921,6 +3944,74 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
     panels = panels_dict.get("panels") or {}
     parts: list[str] = ["<div class='masterclass-panels'>"]
 
+    # ── Tier 1: 重要サマリ (今日このケースで見るべきこと) ──
+    summary_rows: list[tuple[str, str, str]] = [
+        ("ダウ構造",     panels.get("dow_structure_review", {}).get("status", "—"),
+         panels.get("dow_structure_review", {}).get("status_ja", "")),
+        ("波形パターン", panels.get("chart_pattern_anatomy_v2", {}).get("status", "—"),
+         panels.get("chart_pattern_anatomy_v2", {}).get("summary_ja", "")),
+        ("水平線心理",   panels.get("level_psychology_review", {}).get("status", "—"),
+         f"レベル {panels.get('level_psychology_review', {}).get('n_levels', 0)} 個"),
+        ("ローソク足",   panels.get("candlestick_anatomy_review", {}).get("status", "—"),
+         panels.get("candlestick_anatomy_review", {}).get("meaning_ja", "")[:80]),
+        ("MA / グランビル", panels.get("ma_context_review", {}).get("status", "—"),
+         panels.get("ma_context_review", {}).get("summary_ja", "")[:80]),
+        ("RSI / MACD", panels.get("macd_architecture_review", {}).get("status", "—"),
+         f"RSI {panels.get('rsi_regime_filter', {}).get('rsi_value', '—')} / MACD bias {panels.get('macd_architecture_review', {}).get('bias', '—')}"),
+        ("Bollinger",  panels.get("bollinger_lifecycle_review", {}).get("status", "—"),
+         panels.get("bollinger_lifecycle_review", {}).get("stage", "")),
+        ("Fibonacci",  panels.get("fibonacci_context_review", {}).get("status", "—"),
+         panels.get("fibonacci_context_review", {}).get("retracement_zone", "—") or "—"),
+        ("MTF整合",    panels.get("multi_timeframe_story", {}).get("status", "—"),
+         "整合" if panels.get("multi_timeframe_story", {}).get("tf_aligned") else "不整合"),
+        ("損切り",     panels.get("invalidation_engine_v2", {}).get("status", "—"),
+         "構造アンカー" if panels.get("invalidation_engine_v2", {}).get("is_structure_anchored") else "ATR/その他"),
+        ("RR",         "PASS" if panels.get("invalidation_engine_v2", {}).get("rr_pass") else "WARN" if panels.get("invalidation_engine_v2", {}).get("rr") else "—",
+         f"RR {panels.get('invalidation_engine_v2', {}).get('rr', '—')}"),
+        ("Daily Roadmap", panels.get("daily_roadmap_review", {}).get("status", "—"),
+         panels.get("daily_roadmap_review", {}).get("verdict_ja", "")[:80]),
+        ("ファンダ (Symbol)", panels.get("symbol_macro_briefing_review", {}).get("status", "—"),
+         "未接続" if panels.get("symbol_macro_briefing_review", {}).get("unavailable_reason") == "macro_briefing_data_missing" else "—"),
+    ]
+    summary_rows_html = "".join(
+        f"<tr><td>{_html_escape(label)}</td>"
+        f"<td class='status-{_html_escape(status)}'>{_html_escape(status)}</td>"
+        f"<td>{_html_escape(detail)}</td></tr>"
+        for label, status, detail in summary_rows
+    )
+    parts.append(
+        "<div class='masterclass-tier1'>"
+        "<h4>★ 今日このケースで見るべきこと (重要サマリ)</h4>"
+        "<table class='kv tier1-table'>"
+        "<tr><th>項目</th><th>状態</th><th>要約</th></tr>"
+        + summary_rows_html + "</table></div>"
+    )
+
+    # ── Tier 2: 王道チェック (13軸 confluence) ──
+    conf = panels.get("grand_confluence_v2") or {}
+    if conf.get("available") and conf.get("axes"):
+        check_rows = "".join(
+            f"<tr><td>{_html_escape(a['axis'])}</td>"
+            f"<td class='status-{_html_escape(a['status'])}'>"
+            f"{_html_escape(a['status'])}</td>"
+            f"<td>{_html_escape(a.get('reason_ja', ''))}</td>"
+            f"<td>{_html_escape(a.get('what_to_check_on_chart_ja', ''))}</td></tr>"
+            for a in conf["axes"]
+        )
+        parts.append(
+            "<div class='masterclass-tier2'>"
+            f"<h4>王道チェック ({len(conf['axes'])}軸 グランドコンフルエンス) — "
+            f"{_html_escape(conf.get('label', ''))}</h4>"
+            "<table class='kv tier2-table'>"
+            "<tr><th>軸</th><th>状態</th><th>理由</th><th>チャート確認ポイント</th></tr>"
+            + check_rows + "</table></div>"
+        )
+
+    # ── Tier 3: 詳細パネル (19 個の <details>) ──
+    parts.append(
+        "<h4>詳細パネル (19 機能 — observation-only)</h4>"
+    )
+
     def _detail(title_ja: str, body_html: str, *, open_: bool = False) -> str:
         attr = " open" if open_ else ""
         return (
@@ -4259,6 +4350,88 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
         body = "<p class='placeholder'>事前診断不可。</p>"
     parts.append(_detail(
         "16. 事前診断チェックリスト (pre-trade diagnostic)", body, open_=True,
+    ))
+
+    # 17. Fibonacci context
+    fib = panels.get("fibonacci_context_review") or {}
+    if fib.get("available"):
+        anchor = fib.get("anchor_swing") or {}
+        retr_rows = "".join(
+            f"<tr><td>{_html_escape(lvl['level'])}%</td>"
+            f"<td>{float(lvl['price']):.5f}</td></tr>"
+            for lvl in fib.get("retracement_levels") or []
+        )
+        ext_rows = "".join(
+            f"<tr><td>{_html_escape(lvl['level'])}%</td>"
+            f"<td>{float(lvl['price']):.5f}</td></tr>"
+            for lvl in fib.get("extension_targets") or []
+        )
+        body = (
+            _kv_table([
+                ("anchor side", anchor.get("side", "")),
+                ("anchor from", str(anchor.get("from", {}).get("price"))),
+                ("anchor to", str(anchor.get("to", {}).get("price"))),
+                ("current_close", _safe_str(fib.get("current_close"))),
+                ("retracement_pct",
+                 f"{float(fib.get('current_retracement_pct') or 0.0):.3f}"),
+                ("retracement_zone", fib.get("retracement_zone", "")),
+                ("意味", fib.get("meaning_ja", "")),
+                ("チャート確認", fib.get("what_to_check_on_chart_ja", "")),
+            ])
+            + (
+                "<p class='small'><b>Retracement levels:</b></p>"
+                f"<table class='kv'><tr><th>level</th><th>price</th></tr>{retr_rows}</table>"
+            )
+            + (
+                "<p class='small'><b>Extension targets:</b></p>"
+                f"<table class='kv'><tr><th>level</th><th>price</th></tr>{ext_rows}</table>"
+            )
+        )
+    else:
+        body = (
+            f"<p class='placeholder'>フィボ判定不可: "
+            f"{fib.get('unavailable_reason', '')}</p>"
+        )
+    parts.append(_detail(
+        "17. フィボナッチ (fibonacci_context_review)", body,
+    ))
+
+    # 18. Daily roadmap
+    rd = panels.get("daily_roadmap_review") or {}
+    if rd.get("available"):
+        rows = "".join(
+            f"<tr><td>{_html_escape(it['label_ja'])}</td>"
+            f"<td class='status-{_html_escape(it['status'])}'>"
+            f"{_html_escape(it['status'])}</td>"
+            f"<td>{_html_escape(it.get('reason_ja', ''))}</td></tr>"
+            for it in rd.get("items") or []
+        )
+        body = (
+            f"<p><b>{_html_escape(rd.get('verdict_ja', ''))}</b></p>"
+            "<table class='kv'>"
+            "<tr><th>項目</th><th>状態</th><th>理由</th></tr>"
+            + rows + "</table>"
+        )
+    else:
+        body = "<p class='placeholder'>roadmap 判定不可。</p>"
+    parts.append(_detail(
+        "18. Daily 10k FX Roadmap (一部未接続)", body,
+    ))
+
+    # 19. Symbol macro briefing
+    sb = panels.get("symbol_macro_briefing_review") or {}
+    body = _kv_table([
+        ("symbol", sb.get("symbol", "")),
+        ("status", sb.get("status", "")),
+        ("macro_drivers", " / ".join(sb.get("macro_drivers") or [])),
+        ("bias", sb.get("bias", "")),
+        ("意味", sb.get("meaning_ja", "")),
+        ("注意", sb.get("warning_ja", "")),
+        ("チャート確認", sb.get("what_to_check_on_chart_ja", "")),
+        ("unavailable_reason", sb.get("unavailable_reason") or "—"),
+    ])
+    parts.append(_detail(
+        "19. 通貨ペア固有ファンダ (symbol_macro_briefing_review)", body,
     ))
 
     parts.append("</div>")
@@ -4654,7 +4827,14 @@ def render_visual_audit_mobile_single_file(
         case_label = f"{sym} @ {ts} ({action})"
         # Pick the wave overlay (best_pattern's scale) for chart drawing.
         wave_overlay = _select_wave_overlay(payload)
-        wd_lines = payload.get("wave_derived_lines") or []
+        wd_lines = list(payload.get("wave_derived_lines") or [])
+        # Append WFIB* lines from the fibonacci_context_review so the
+        # chart overlay renders them alongside the wave-derived lines.
+        # observation-only — used_in_decision is preserved (False).
+        mc_panels = (payload.get("masterclass_panels") or {}).get("panels") or {}
+        fib_panel = mc_panels.get("fibonacci_context_review") or {}
+        for fib_line in (fib_panel.get("fib_wave_lines") or []):
+            wd_lines.append(fib_line)
         # User-facing chart title (replaces dev "best=... | quality=..."
         # text drawn inside the SVG). Format:
         # 判断: <action> / 波形候補: <kind> / 参考線: <W*-ids>.

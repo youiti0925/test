@@ -487,7 +487,7 @@ def test_mtf_story_missing_higher_tf():
 # ---------------------------------------------------------------------------
 
 
-def test_grand_confluence_emits_9_axes():
+def test_grand_confluence_emits_13_axes():
     p = build_grand_confluence_v2(
         dow_review={"available": True, "trend": "UP"},
         overlays={"level_zones_selected": [{"kind": "support"}],
@@ -511,14 +511,19 @@ def test_grand_confluence_emits_9_axes():
                        "atr_stop_price": 1.0,
                        "rr_unavailable_reason": None},
         macro_score=0.0,
+        # Source-pack additions (observation-only)
+        fibonacci_review=None, mtf_story=None,
+        roadmap_review=None, symbol_briefing_review=None,
     )
     _assert_observation_shape(p)
     assert p["schema_version"] == CONF_SCHEMA
-    assert len(p["axes"]) == 9
+    assert len(p["axes"]) == 13
     axis_names = {a["axis"] for a in p["axes"]}
     assert axis_names == {
         "dow", "line", "ma", "oscillator", "price_action",
         "pattern", "risk_reward", "invalidation", "macro",
+        # Source-pack additions
+        "fibonacci", "mtf", "roadmap", "symbol_macro",
     }
     for a in p["axes"]:
         assert a["status"] in ("PASS", "WARN", "BLOCK", "UNKNOWN")
@@ -594,7 +599,7 @@ def test_checklist_emits_7_questions_with_ja():
 # ---------------------------------------------------------------------------
 
 
-def test_aggregator_emits_all_16_panels():
+def test_aggregator_emits_all_19_panels():
     df = _trending_df(n=200)
     panels = build_masterclass_panels(
         visible_df=df,
@@ -623,7 +628,7 @@ def test_aggregator_emits_all_16_panels():
     )
     assert panels["available"] is True
     assert panels["schema_version"] == AGG_SCHEMA
-    assert len(panels["panels"]) == 16
+    assert len(panels["panels"]) == 19
     expected_keys = {
         "candlestick_anatomy_review", "parent_bar_lower_tf_anatomy",
         "dow_structure_review", "chart_pattern_anatomy_v2",
@@ -633,6 +638,10 @@ def test_aggregator_emits_all_16_panels():
         "divergence_review", "macd_architecture_review",
         "multi_timeframe_story", "grand_confluence_v2",
         "invalidation_engine_v2", "pre_trade_diagnostic_checklist_v1",
+        # Source-pack additions (observation-only)
+        "fibonacci_context_review",
+        "daily_roadmap_review",
+        "symbol_macro_briefing_review",
     }
     assert set(panels["panels"].keys()) == expected_keys
     # Every panel carries the observation contract

@@ -247,12 +247,16 @@ def build_candlestick_anatomy_review(
     atr_value: float | None,
     near_support: bool = False,
     near_resistance: bool = False,
+    higher_tf_trend: str | None = None,
 ) -> dict:
     """Classify the latest bar of `visible_df` (the parent bar) into
     a candlestick anatomy label and emit a JA audit panel.
 
     `visible_df` MUST already be truncated to bars at or before
     parent_bar_ts. We never reach beyond `iloc[-1]`.
+
+    `higher_tf_trend` (optional): one of UP / DOWN / RANGE / UNKNOWN.
+    Used to compute `aligned_with_higher_tf`.
     """
     if visible_df is None or len(visible_df) == 0:
         return _empty_panel(CANDLESTICK_SCHEMA, "no_visible_bars")
@@ -261,6 +265,62 @@ def build_candlestick_anatomy_review(
     bar_type, direction, special = _classify_anatomy(
         parent=parent, prev=prev, atr_value=atr_value,
     )
+
+    # Candlestick_Master_Guide additions: location_quality +
+    # confirmation_needed + aligned_with_higher_tf + confidence_label.
+    if near_support and direction == "BUY":
+        location_quality = "at_support"
+    elif near_resistance and direction == "SELL":
+        location_quality = "into_resistance"
+    elif near_support and direction == "SELL":
+        location_quality = "against_support"
+    elif near_resistance and direction == "BUY":
+        location_quality = "against_resistance"
+    elif not near_support and not near_resistance:
+        location_quality = "midrange"
+    else:
+        location_quality = "neutral"
+
+    confirmation_needed = "none"
+    if bar_type in ("bullish_pinbar", "bullish_harami", "bullish_engulfing"):
+        confirmation_needed = "next_bar_break_high"
+    elif bar_type in ("bearish_pinbar", "bearish_harami", "bearish_engulfing"):
+        confirmation_needed = "next_bar_break_low"
+    elif bar_type == "neutral_doji":
+        confirmation_needed = "next_bar_directional_break"
+
+    aligned_with_higher_tf: bool | None = None
+    if higher_tf_trend:
+        ht = str(higher_tf_trend).upper()
+        if direction == "BUY" and ht == "UP":
+            aligned_with_higher_tf = True
+        elif direction == "SELL" and ht == "DOWN":
+            aligned_with_higher_tf = True
+        elif direction in ("BUY", "SELL") and ht in ("UP", "DOWN"):
+            aligned_with_higher_tf = False
+
+    engulfed_what: str | None = None
+    if bar_type in ("bullish_engulfing", "bearish_engulfing") and prev is not None:
+        po, pc = float(prev["open"]), float(prev["close"])
+        engulfed_what = (
+            f"prev_body_{'bull' if pc > po else 'bear'}"
+        )
+
+    power_chase_risk = False
+    if bar_type in ("large_bull", "large_bear") and special == "power_move":
+        if not (
+            (bar_type == "large_bull" and near_support)
+            or (bar_type == "large_bear" and near_resistance)
+        ):
+            power_chase_risk = True
+
+    confidence_label = _confidence_label(
+        bar_type=bar_type,
+        location_quality=location_quality,
+        aligned_with_higher_tf=aligned_with_higher_tf,
+        engulfed_what=engulfed_what,
+    )
+
     return {
         "schema_version": CANDLESTICK_SCHEMA,
         "available": True,
@@ -279,13 +339,87 @@ def build_candlestick_anatomy_review(
         ),
         "near_support": bool(near_support),
         "near_resistance": bool(near_resistance),
+        # Candlestick_Master_Guide additions
+        "location_quality": location_quality,
+        "confirmation_needed": confirmation_needed,
+        "aligned_with_higher_tf": aligned_with_higher_tf,
+        "engulfed_what": engulfed_what,
+        "power_chase_risk": power_chase_risk,
+        "confidence_label": confidence_label,
+        # Standard text fields
         "meaning_ja": _meaning_ja(bar_type, direction, special),
         "context_ja": _context_ja(
             bar_type, direction,
             near_support=near_support, near_resistance=near_resistance,
         ),
         "warning_ja": _warning_ja(bar_type, direction),
+        "what_to_check_on_chart_ja": _what_to_check_ja(
+            bar_type=bar_type, location_quality=location_quality,
+            confirmation_needed=confirmation_needed,
+        ),
     }
+
+
+def _confidence_label(
+    *,
+    bar_type: str,
+    location_quality: str,
+    aligned_with_higher_tf: bool | None,
+    engulfed_what: str | None,
+) -> str:
+    if bar_type in ("range_bar", "unclassified"):
+        return "low"
+    if bar_type == "neutral_doji":
+        return "neutral_pending_confirmation"
+    location_bonus = location_quality in ("at_support", "into_resistance")
+    htf_bonus = aligned_with_higher_tf is True
+    engulf_bonus = (
+        engulfed_what == "prev_body_bear" if "bullish" in bar_type else (
+            engulfed_what == "prev_body_bull" if "bearish" in bar_type
+            else False
+        )
+    )
+    score = sum([location_bonus, htf_bonus, engulf_bonus])
+    if score >= 2:
+        return "high"
+    if score == 1:
+        return "moderate"
+    return "low"
+
+
+def _what_to_check_ja(
+    *,
+    bar_type: str,
+    location_quality: str,
+    confirmation_needed: str,
+) -> str:
+    loc_map = {
+        "at_support":
+            "ローソク足のヒゲがサポート帯に刺さって戻されているか",
+        "into_resistance":
+            "ローソク足のヒゲがレジスタンス帯まで届いて戻されているか",
+        "against_support":
+            "サポート帯付近で逆方向のシグナルが出ていないか (騙し注意)",
+        "against_resistance":
+            "レジスタンス帯付近で逆方向のシグナルが出ていないか (騙し注意)",
+        "midrange":
+            "レンジ中央でのシグナルになっていないか (信頼度低下)",
+        "neutral":
+            "サポレジから離れた位置のシグナルになっていないか",
+    }
+    loc_msg = loc_map.get(location_quality, "サポレジ位置を確認してください")
+    confirm_map = {
+        "next_bar_break_high": "次の足で高値ブレイク確認を待ってください",
+        "next_bar_break_low": "次の足で安値ブレイク確認を待ってください",
+        "next_bar_directional_break":
+            "次の足で方向ブレイク確認を待ってください",
+        "none": "",
+    }
+    confirm_msg = confirm_map.get(confirmation_needed, "")
+    parts = [loc_msg]
+    if confirm_msg:
+        parts.append(confirm_msg)
+    return "を確認してください。 ".join(parts) + "。"
 
 
 # ---------------------------------------------------------------------------
