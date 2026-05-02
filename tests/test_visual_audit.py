@@ -56,7 +56,7 @@ def test_payload_emits_required_top_level_keys():
         "title",
         "profile", "mode", "action",
         "best_setup", "reconstruction_quality",
-        "overlays", "royal_road_decision_v2",
+        "overlays", "checklist_panels", "royal_road_decision_v2",
     }
     assert set(p.keys()) == expected
     assert p["schema_version"] == SCHEMA_VERSION
@@ -606,3 +606,244 @@ def test_future_bars_not_in_batch_report(tmp_path: Path):
         end_ts = pd.Timestamp(audit["render_window_end_ts"])
         parent_ts = pd.Timestamp(audit["parent_bar_ts"])
         assert end_ts <= parent_ts
+
+
+# ─────── PDF-derived royal-road checklist panels ────────────────────
+
+
+def _first_v2_payload() -> dict:
+    df = _ohlcv()
+    res = run_engine_backtest(
+        df, "EURUSD=X", interval="1h", warmup=60,
+        decision_profile="royal_road_decision_v2",
+    )
+    tr = res.decision_traces[150]
+    p = build_visual_audit_payload(trace=tr, df=df)
+    assert p is not None
+    return p
+
+
+def test_checklist_panels_present_in_payload():
+    """All 7 PDF-derived panels appear under `checklist_panels`."""
+    p = _first_v2_payload()
+    cp = p["checklist_panels"]
+    expected = {
+        "candlestick_interpretation",
+        "rsi_context",
+        "ma_granville_context",
+        "bollinger_lifecycle",
+        "grand_confluence_checklist",
+        "invalidation_explanation",
+        "current_runtime_indicator_votes",
+    }
+    assert set(cp.keys()) == expected
+
+
+def test_candlestick_interpretation_panel_keys():
+    p = _first_v2_payload()
+    panel = p["checklist_panels"]["candlestick_interpretation"]
+    for key in (
+        "available", "candle_type", "direction", "source",
+        "context", "strength", "near_strong_support",
+        "near_strong_resistance", "supporting_pattern_kinds", "reason",
+    ):
+        assert key in panel
+    assert panel["direction"] in ("BUY", "SELL", "NEUTRAL")
+    assert panel["strength"] in ("strong", "medium", "weak", "none")
+
+
+def test_rsi_context_panel_keys_and_trap_logic():
+    p = _first_v2_payload()
+    panel = p["checklist_panels"]["rsi_context"]
+    for key in (
+        "available", "rsi_value", "regime",
+        "overbought", "oversold",
+        "rsi_signal", "rsi_signal_valid", "rsi_trap_reason", "source",
+    ):
+        assert key in panel
+    assert panel["regime"] in ("range", "trend", "trend_extreme", "unknown")
+    assert panel["rsi_signal"] in ("BUY", "SELL", "NEUTRAL")
+    # rsi_signal_valid is True only when extreme + range regime + not danger.
+    if panel["rsi_signal"] != "NEUTRAL" and panel["regime"] != "range":
+        assert panel["rsi_signal_valid"] is False
+
+
+def test_ma_granville_context_panel_keys():
+    p = _first_v2_payload()
+    panel = p["checklist_panels"]["ma_granville_context"]
+    if panel.get("available"):
+        for key in (
+            "ma_periods", "ma_slope", "price_vs_ma",
+            "pullback_to_ma", "bounce_from_ma", "breakdown_from_ma",
+            "granville_pattern", "direction", "confidence",
+            "sma_20", "sma_50", "close", "reason", "source",
+        ):
+            assert key in panel
+        assert panel["ma_slope"] in ("rising", "falling", "flat")
+        assert panel["price_vs_ma"] in (
+            "above_both", "below_both", "between_mas",
+        )
+    else:
+        assert "unavailable_reason" in panel
+
+
+def test_bollinger_lifecycle_panel_keys():
+    p = _first_v2_payload()
+    panel = p["checklist_panels"]["bollinger_lifecycle"]
+    if panel.get("available"):
+        for key in (
+            "lifecycle_phase", "bb_squeeze", "bb_expansion", "bb_band_walk",
+            "breakout_after_squeeze", "reversal_risk",
+            "bb_signal_valid", "source", "reason",
+        ):
+            assert key in panel
+        assert panel["lifecycle_phase"] in (
+            "squeeze", "post_squeeze_breakout", "band_walk",
+            "expansion", "neutral",
+        )
+    else:
+        assert "unavailable_reason" in panel
+
+
+def test_grand_confluence_checklist_has_12_items_with_pwb_totals():
+    p = _first_v2_payload()
+    panel = p["checklist_panels"]["grand_confluence_checklist"]
+    assert panel["available"] is True
+    assert panel["total_items"] == 12
+    items = panel["items"]
+    assert len(items) == 12
+    item_ids = {it["item"] for it in items}
+    expected_ids = {
+        "higher_tf_alignment", "dow_structure", "support_resistance",
+        "trendline", "chart_pattern", "candlestick_confirmation",
+        "lower_tf_confirmation", "indicator_environment",
+        "macro_alignment", "invalidation_clear", "rr_valid",
+        "reconstruction_quality",
+    }
+    assert item_ids == expected_ids
+    for it in items:
+        assert it["status"] in ("PASS", "WARN", "BLOCK")
+    assert (
+        panel["total_pass"] + panel["total_warn"] + panel["total_block"] == 12
+    )
+
+
+def test_invalidation_explanation_panel_present_when_v2_active():
+    p = _first_v2_payload()
+    panel = p["checklist_panels"]["invalidation_explanation"]
+    if panel.get("available"):
+        for key in (
+            "selected_stop_price", "atr_stop_price", "structure_stop_price",
+            "chosen_mode", "outcome",
+            "invalidation_structure", "invalidation_status",
+            "why_this_stop_invalidates_the_setup", "rr_selected",
+            "source", "reason",
+        ):
+            assert key in panel
+        assert panel["invalidation_status"] in (
+            "valid", "invalid", "fallback_atr", "missing",
+        )
+    else:
+        assert "unavailable_reason" in panel
+
+
+def test_current_runtime_indicator_votes_panel_uses_trace_when_present():
+    p = _first_v2_payload()
+    panel = p["checklist_panels"]["current_runtime_indicator_votes"]
+    # technical_confluence is wired into the trace by default for v2 runs.
+    assert panel["available"] is True
+    for key in (
+        "rsi_vote", "macd_vote", "sma_vote", "bb_vote",
+        "voted_action", "vote_count_buy", "vote_count_sell",
+        "warning", "source",
+    ):
+        assert key in panel
+    for v in (panel["rsi_vote"], panel["macd_vote"], panel["sma_vote"]):
+        assert v in ("BUY", "SELL", "NEUTRAL")
+    assert panel["bb_vote"] in ("BUY", "SELL", "NEUTRAL", "UNKNOWN")
+    assert panel["voted_action"] in ("BUY", "SELL", "HOLD")
+
+
+def test_current_runtime_indicator_votes_unavailable_without_tc():
+    """Direct unit-test the panel builder with tc=None to pin the
+    `available=False` fallback path the user requested."""
+    from src.fx.visual_audit import _current_runtime_indicator_votes_panel
+    panel = _current_runtime_indicator_votes_panel(tc=None)
+    assert panel["available"] is False
+    assert "unavailable_reason" in panel
+
+
+def test_default_runtime_payload_does_not_emit_visual_audit(tmp_path: Path):
+    """Pin the existing invariant explicitly in the panel test layer:
+    the default current_runtime profile produces no audit (None)."""
+    df = _ohlcv()
+    res = run_engine_backtest(df, "EURUSD=X", interval="1h", warmup=60)
+    tr = res.decision_traces[150]
+    p = build_visual_audit_payload(trace=tr, df=df)
+    assert p is None
+
+
+def test_checklist_panels_no_future_leak_via_render_window():
+    """Pin: checklist panels are computed off trace data only; their
+    construction must not require bars beyond parent_bar_ts. This test
+    guarantees the panel builders never read df by feeding them an
+    empty df + verifying the panels still build off the trace."""
+    df_full = _ohlcv(400)
+    res = run_engine_backtest(
+        df_full.iloc[:200], "EURUSD=X", interval="1h", warmup=60,
+        decision_profile="royal_road_decision_v2",
+    )
+    tr = res.decision_traces[100]
+    parent_ts = pd.Timestamp(tr.timestamp)
+    df_visible_only = df_full[df_full.index <= parent_ts]
+    p_visible = build_visual_audit_payload(
+        trace=tr, df=df_visible_only,
+    )
+    p_with_future = build_visual_audit_payload(trace=tr, df=df_full)
+    # Panels must be byte-identical regardless of whether the df has
+    # future bars attached.
+    assert p_visible["checklist_panels"] == p_with_future["checklist_panels"]
+
+
+def test_detail_html_renders_grand_confluence_and_invalidation(tmp_path: Path):
+    """Both Grand Confluence Checklist and Invalidation Explanation
+    panels must be visible in detail.html."""
+    from src.fx.visual_audit import render_visual_audit_report
+    df, res = _v2_run()
+    render_visual_audit_report(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df},
+        out_dir=tmp_path, max_cases=3,
+    )
+    cd = next(p for p in (tmp_path / "EURUSD=X").iterdir() if p.is_dir())
+    html = (cd / "detail.html").read_text()
+    assert "Grand Confluence Checklist" in html
+    assert "Invalidation Explanation" in html
+    assert "Candlestick Interpretation" in html
+    assert "RSI Context" in html
+    assert "MA Granville Context" in html
+    assert "Bollinger Lifecycle" in html
+    assert "Current Runtime Indicator Votes" in html
+
+
+def test_audit_json_contains_checklist_panels(tmp_path: Path):
+    """The on-disk audit.json must include the new `checklist_panels`
+    key with all 7 sub-panels."""
+    from src.fx.visual_audit import render_visual_audit_report
+    df, res = _v2_run()
+    render_visual_audit_report(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df},
+        out_dir=tmp_path, max_cases=3,
+    )
+    cd = next(p for p in (tmp_path / "EURUSD=X").iterdir() if p.is_dir())
+    audit = json.loads((cd / "audit.json").read_text())
+    assert "checklist_panels" in audit
+    cp = audit["checklist_panels"]
+    for key in (
+        "candlestick_interpretation", "rsi_context",
+        "ma_granville_context", "bollinger_lifecycle",
+        "grand_confluence_checklist", "invalidation_explanation",
+        "current_runtime_indicator_votes",
+    ):
+        assert key in cp

@@ -80,6 +80,770 @@ def _trace_timestamp(trace: Any) -> pd.Timestamp | None:
         return None
 
 
+def _trace_technical_confluence(trace: Any) -> dict | None:
+    """Return the technical_confluence slice as a dict (or None)."""
+    sl = _safe_get(trace, "technical_confluence")
+    if sl is None:
+        return None
+    if isinstance(sl, dict):
+        return sl
+    to_dict = getattr(sl, "to_dict", None)
+    return to_dict() if callable(to_dict) else None
+
+
+def _trace_technical(trace: Any) -> dict | None:
+    """Return the technical slice as a dict (or None)."""
+    sl = _safe_get(trace, "technical")
+    if sl is None:
+        return None
+    if isinstance(sl, dict):
+        return sl
+    to_dict = getattr(sl, "to_dict", None)
+    return to_dict() if callable(to_dict) else None
+
+
+def _trace_market(trace: Any) -> dict | None:
+    sl = _safe_get(trace, "market")
+    if sl is None:
+        return None
+    if isinstance(sl, dict):
+        return sl
+    to_dict = getattr(sl, "to_dict", None)
+    return to_dict() if callable(to_dict) else None
+
+
+# ---------------------------------------------------------------------------
+# PDF-derived royal-road checklist panels (visual_audit_v1 extension)
+# ---------------------------------------------------------------------------
+#
+# Each builder reads ONLY from the trace / v2 payload (or, when raw price
+# values are needed, from values already on the trace). No fresh
+# computation off `df` is performed inside any builder, which means the
+# panels inherit the future-leak guarantees already established by
+# decision_trace_build.
+# ---------------------------------------------------------------------------
+
+
+def _candlestick_interpretation_panel(
+    *, tc: dict | None, v2: dict,
+) -> dict:
+    """PDF: candle_type / direction / source / context / strength / reason.
+
+    Pure read from technical_confluence.candlestick_signal + v2 SR/pattern
+    cross-reference.
+    """
+    sig = (tc or {}).get("candlestick_signal") or {}
+    sr = v2.get("support_resistance_v2") or {}
+    cp = v2.get("chart_pattern_v2") or {}
+    bull = bool(
+        sig.get("bullish_pinbar") or sig.get("bullish_engulfing")
+        or sig.get("strong_bull_body")
+    )
+    bear = bool(
+        sig.get("bearish_pinbar") or sig.get("bearish_engulfing")
+        or sig.get("strong_bear_body")
+    )
+    if sig.get("bullish_pinbar"):
+        candle_type = "bullish_pinbar"
+    elif sig.get("bearish_pinbar"):
+        candle_type = "bearish_pinbar"
+    elif sig.get("bullish_engulfing"):
+        candle_type = "bullish_engulfing"
+    elif sig.get("bearish_engulfing"):
+        candle_type = "bearish_engulfing"
+    elif sig.get("strong_bull_body"):
+        candle_type = "strong_bull_body"
+    elif sig.get("strong_bear_body"):
+        candle_type = "strong_bear_body"
+    elif sig.get("harami"):
+        candle_type = "harami"
+    elif sig.get("rejection_wick"):
+        candle_type = "rejection_wick"
+    else:
+        candle_type = "no_signal"
+    if bull and not bear:
+        direction = "BUY"
+    elif bear and not bull:
+        direction = "SELL"
+    else:
+        direction = "NEUTRAL"
+    near_support = bool(sr.get("near_strong_support"))
+    near_resistance = bool(sr.get("near_strong_resistance"))
+    sel_patterns = cp.get("selected_patterns_top5") or []
+    pattern_kinds = [p.get("kind") for p in sel_patterns if p.get("kind")]
+    if direction == "BUY" and near_support:
+        context = "at_strong_support"
+    elif direction == "SELL" and near_resistance:
+        context = "at_strong_resistance"
+    elif direction == "BUY" and near_resistance:
+        context = "into_strong_resistance"
+    elif direction == "SELL" and near_support:
+        context = "into_strong_support"
+    elif candle_type == "no_signal":
+        context = "no_candle_signal"
+    else:
+        context = "midrange"
+    if candle_type in (
+        "bullish_engulfing", "bearish_engulfing",
+        "strong_bull_body", "strong_bear_body",
+    ):
+        strength = "strong"
+    elif candle_type in ("bullish_pinbar", "bearish_pinbar"):
+        strength = "medium" if context.startswith("at_") else "weak"
+    elif candle_type == "no_signal":
+        strength = "none"
+    else:
+        strength = "weak"
+    reason_parts: list[str] = [f"candle={candle_type}"]
+    if context != "midrange":
+        reason_parts.append(context)
+    if pattern_kinds:
+        reason_parts.append(f"patterns={pattern_kinds}")
+    return {
+        "available": tc is not None,
+        "candle_type": candle_type,
+        "direction": direction,
+        "source": "technical_confluence_v1.candlestick_signal",
+        "context": context,
+        "strength": strength,
+        "near_strong_support": near_support,
+        "near_strong_resistance": near_resistance,
+        "supporting_pattern_kinds": pattern_kinds,
+        "reason": "; ".join(reason_parts),
+    }
+
+
+def _rsi_context_panel(*, tc: dict | None, technical: dict | None) -> dict:
+    """PDF: rsi_value / regime / overbought / oversold /
+    rsi_signal / rsi_signal_valid / rsi_trap_reason.
+
+    The "trap" wording from the PDF maps to rsi_trend_danger: in a
+    strong trend, RSI extremes are usually NOT reversal signals.
+    """
+    ind = (tc or {}).get("indicator_context") or {}
+    rsi_value = ind.get("rsi_value")
+    if rsi_value is None and technical is not None:
+        rsi_value = technical.get("rsi_14")
+    rsi_range_valid = ind.get("rsi_range_valid")
+    rsi_trend_danger = ind.get("rsi_trend_danger")
+    overbought = bool(rsi_value is not None and rsi_value > 70)
+    oversold = bool(rsi_value is not None and rsi_value < 30)
+    if rsi_value is None:
+        regime = "unknown"
+    elif rsi_range_valid:
+        regime = "range"
+    elif rsi_trend_danger:
+        regime = "trend_extreme"
+    else:
+        regime = "trend"
+    if overbought:
+        rsi_signal = "SELL"
+    elif oversold:
+        rsi_signal = "BUY"
+    else:
+        rsi_signal = "NEUTRAL"
+    # Per PDF: in a trend the OB/OS read is a TRAP, not a signal.
+    rsi_signal_valid = bool(
+        rsi_signal != "NEUTRAL" and (rsi_range_valid or False)
+        and not rsi_trend_danger
+    )
+    if rsi_trend_danger and rsi_signal != "NEUTRAL":
+        rsi_trap_reason = (
+            "rsi_extreme_in_trend_is_continuation_not_reversal"
+        )
+    elif rsi_signal != "NEUTRAL" and not rsi_range_valid:
+        rsi_trap_reason = "rsi_extreme_outside_range_regime"
+    else:
+        rsi_trap_reason = None
+    return {
+        "available": tc is not None or technical is not None,
+        "rsi_value": rsi_value,
+        "regime": regime,
+        "overbought": overbought,
+        "oversold": oversold,
+        "rsi_signal": rsi_signal,
+        "rsi_signal_valid": rsi_signal_valid,
+        "rsi_trap_reason": rsi_trap_reason,
+        "source": "technical_confluence_v1.indicator_context",
+    }
+
+
+def _ma_granville_context_panel(
+    *, tc: dict | None, technical: dict | None, market: dict | None,
+) -> dict:
+    """PDF: ma_periods / ma_slope / price_vs_ma / pullback_to_ma /
+    bounce_from_ma / breakdown_from_ma / granville_pattern / direction /
+    confidence / reason.
+
+    Computed from already-recorded sma_20 / sma_50 / close on the trace.
+    No fresh recompute.
+    """
+    ind = (tc or {}).get("indicator_context") or {}
+    sma20 = sma50 = close = None
+    if technical is not None:
+        sma20 = technical.get("sma_20")
+        sma50 = technical.get("sma_50")
+    if market is not None:
+        close = market.get("close")
+    have_data = (
+        sma20 is not None and sma50 is not None and close is not None
+    )
+    if not have_data:
+        return {
+            "available": False,
+            "unavailable_reason": "missing sma_20 / sma_50 / close on trace",
+            "ma_periods": [20, 50],
+            "source": "trace.technical + trace.market",
+        }
+    if sma20 > sma50:
+        ma_slope = "rising"
+    elif sma20 < sma50:
+        ma_slope = "falling"
+    else:
+        ma_slope = "flat"
+    if close > max(sma20, sma50):
+        price_vs_ma = "above_both"
+    elif close < min(sma20, sma50):
+        price_vs_ma = "below_both"
+    else:
+        price_vs_ma = "between_mas"
+    # Granville-ish proximity heuristics (no recompute — pure
+    # comparisons of the bar's own close vs MA values already on trace)
+    near_sma20 = bool(abs(close - sma20) <= 0.001 * abs(sma20))
+    near_sma50 = bool(abs(close - sma50) <= 0.001 * abs(sma50))
+    pullback_to_ma = bool(
+        ma_slope == "rising" and price_vs_ma in ("between_mas", "above_both")
+        and (near_sma20 or near_sma50)
+    )
+    bounce_from_ma = bool(
+        ma_slope == "rising" and price_vs_ma == "above_both"
+        and (near_sma20 or near_sma50)
+    )
+    breakdown_from_ma = bool(
+        ma_slope == "rising" and price_vs_ma == "below_both"
+    )
+    if ma_slope == "rising" and price_vs_ma == "above_both" and pullback_to_ma:
+        granville_pattern = "trend_pullback_buy"
+        direction = "BUY"
+    elif ma_slope == "rising" and breakdown_from_ma:
+        granville_pattern = "trend_failure_sell"
+        direction = "SELL"
+    elif ma_slope == "falling" and price_vs_ma == "below_both" and (near_sma20 or near_sma50):
+        granville_pattern = "trend_pullback_sell"
+        direction = "SELL"
+    elif ma_slope == "falling" and price_vs_ma == "above_both":
+        granville_pattern = "trend_failure_buy"
+        direction = "BUY"
+    elif ma_slope == "rising":
+        granville_pattern = "trend_continuation_buy"
+        direction = "BUY"
+    elif ma_slope == "falling":
+        granville_pattern = "trend_continuation_sell"
+        direction = "SELL"
+    else:
+        granville_pattern = "no_pattern"
+        direction = "NEUTRAL"
+    # Confidence: stronger when slope agrees with price_vs_ma.
+    if (ma_slope == "rising" and price_vs_ma == "above_both") or (
+        ma_slope == "falling" and price_vs_ma == "below_both"
+    ):
+        confidence = 0.7
+    elif granville_pattern.startswith("trend_failure"):
+        confidence = 0.55
+    else:
+        confidence = 0.4
+    reason = (
+        f"ma20={sma20:.5f} ma50={sma50:.5f} close={close:.5f} "
+        f"slope={ma_slope} price_vs_ma={price_vs_ma} "
+        f"pattern={granville_pattern}"
+    )
+    ma_trend_support = ind.get("ma_trend_support")
+    return {
+        "available": True,
+        "ma_periods": [20, 50],
+        "ma_slope": ma_slope,
+        "price_vs_ma": price_vs_ma,
+        "pullback_to_ma": pullback_to_ma,
+        "bounce_from_ma": bounce_from_ma,
+        "breakdown_from_ma": breakdown_from_ma,
+        "granville_pattern": granville_pattern,
+        "direction": direction,
+        "confidence": confidence,
+        "ma_trend_support": ma_trend_support,
+        "sma_20": sma20,
+        "sma_50": sma50,
+        "close": close,
+        "source": "trace.technical + trace.technical_confluence",
+        "reason": reason,
+    }
+
+
+def _bollinger_lifecycle_panel(
+    *, tc: dict | None, technical: dict | None,
+) -> dict:
+    """PDF: squeeze / expansion / band_walk / breakout_after_squeeze /
+    reversal_risk / bb_signal_valid / reason.
+
+    Pure read from technical_confluence.indicator_context (squeeze /
+    expansion / band_walk already computed there, future-leak safe by
+    construction).
+    """
+    ind = (tc or {}).get("indicator_context") or {}
+    bb_squeeze = ind.get("bb_squeeze")
+    bb_expansion = ind.get("bb_expansion")
+    bb_band_walk = ind.get("bb_band_walk")
+    bb_position = (
+        technical.get("bb_position") if technical is not None else None
+    )
+    if bb_squeeze is None and bb_expansion is None and bb_band_walk is None:
+        return {
+            "available": False,
+            "unavailable_reason": (
+                "indicator_context missing bb_* (insufficient_data?)"
+            ),
+            "source": "technical_confluence_v1.indicator_context",
+        }
+    breakout_after_squeeze = bool(bb_expansion and not bb_squeeze)
+    # Reversal risk: band_walk = trend continuation, not reversal — but
+    # an over-extension into a band can flag pullback risk. We keep it
+    # conservative: reversal risk only when band_walk AND bb_position
+    # past 0.95/0.05 (extreme).
+    reversal_risk = bool(
+        bb_band_walk and bb_position is not None
+        and (bb_position >= 0.95 or bb_position <= 0.05)
+    )
+    bb_signal_valid = bool(breakout_after_squeeze or bb_band_walk)
+    if bb_squeeze:
+        lifecycle_phase = "squeeze"
+    elif breakout_after_squeeze:
+        lifecycle_phase = "post_squeeze_breakout"
+    elif bb_band_walk:
+        lifecycle_phase = "band_walk"
+    elif bb_expansion:
+        lifecycle_phase = "expansion"
+    else:
+        lifecycle_phase = "neutral"
+    reason = (
+        f"phase={lifecycle_phase} squeeze={bb_squeeze} "
+        f"expansion={bb_expansion} band_walk={bb_band_walk} "
+        f"bb_position={bb_position}"
+    )
+    return {
+        "available": True,
+        "lifecycle_phase": lifecycle_phase,
+        "bb_squeeze": bool(bb_squeeze),
+        "bb_expansion": bool(bb_expansion),
+        "bb_band_walk": bool(bb_band_walk),
+        "breakout_after_squeeze": breakout_after_squeeze,
+        "reversal_risk": reversal_risk,
+        "bb_signal_valid": bb_signal_valid,
+        "bb_position": bb_position,
+        "source": "technical_confluence_v1.indicator_context",
+        "reason": reason,
+    }
+
+
+def _grand_confluence_checklist_panel(
+    *, tc: dict | None, v2: dict, action: str | None,
+) -> dict:
+    """PDF: 12-item royal-road checklist with pass/warn/block totals.
+
+    Items:
+      1. higher_tf_alignment
+      2. dow_structure
+      3. support_resistance
+      4. trendline
+      5. chart_pattern
+      6. candlestick_confirmation
+      7. lower_tf_confirmation
+      8. indicator_environment
+      9. macro_alignment
+      10. invalidation_clear
+      11. rr_valid
+      12. reconstruction_quality
+    """
+    block = list(v2.get("block_reasons") or [])
+    cautions = list(v2.get("cautions") or [])
+    axes_b = (v2.get("evidence_axes") or {}).get("bullish") or {}
+    axes_s = (v2.get("evidence_axes") or {}).get("bearish") or {}
+    sr = v2.get("support_resistance_v2") or {}
+    tl = v2.get("trendline_context") or {}
+    cp = v2.get("chart_pattern_v2") or {}
+    ltf = v2.get("lower_tf_trigger") or {}
+    macro = v2.get("macro_alignment") or {}
+    sp = v2.get("structure_stop_plan") or {}
+    rq = v2.get("reconstruction_quality") or {}
+    risk_obs = (tc or {}).get("risk_plan_obs") or {}
+    vote = (tc or {}).get("vote_breakdown") or {}
+
+    items: list[dict] = []
+
+    def add(item_id: str, status: str, detail: str) -> None:
+        items.append({"item": item_id, "status": status, "detail": detail})
+
+    # 1. higher_tf_alignment
+    htf_aligned = vote.get("htf_alignment", "UNKNOWN")
+    if any("htf_counter_trend" in r for r in block):
+        add("higher_tf_alignment", "BLOCK",
+            "; ".join(r for r in block if "htf_counter_trend" in r))
+    elif htf_aligned in ("BUY", "SELL"):
+        add("higher_tf_alignment", "PASS", f"htf_alignment={htf_aligned}")
+    else:
+        add("higher_tf_alignment", "WARN",
+            f"htf_alignment={htf_aligned} (no explicit alignment)")
+    # 2. dow_structure
+    dow_b = bool(axes_b.get("bullish_structure"))
+    dow_s = bool(axes_s.get("bearish_structure"))
+    if dow_b or dow_s:
+        add("dow_structure", "PASS",
+            f"bullish={dow_b} bearish={dow_s}")
+    else:
+        add("dow_structure", "WARN", "no clear Dow structure code")
+    # 3. support_resistance
+    if any(r in (
+        "near_strong_resistance_for_buy",
+        "near_strong_support_for_sell",
+        "sr_fake_breakout",
+    ) for r in block):
+        add("support_resistance", "BLOCK",
+            "; ".join(r for r in block if r.startswith("near_") or r == "sr_fake_breakout"))
+    elif sr.get("near_strong_support") or sr.get("near_strong_resistance"):
+        add("support_resistance", "PASS",
+            f"strong_support={sr.get('near_strong_support')} "
+            f"strong_resistance={sr.get('near_strong_resistance')}")
+    else:
+        add("support_resistance", "WARN", "no strong S/R near close")
+    # 4. trendline
+    if tl.get("bullish_signal") or tl.get("bearish_signal"):
+        add("trendline", "PASS",
+            f"bullish={tl.get('bullish_signal')} bearish={tl.get('bearish_signal')}")
+    else:
+        add("trendline", "WARN", "no qualifying trendline signal")
+    # 5. chart_pattern
+    sel = cp.get("selected_patterns_top5") or []
+    if cp.get("bullish_breakout_confirmed") or cp.get("bearish_breakout_confirmed"):
+        add("chart_pattern", "PASS",
+            f"selected={[p.get('kind') for p in sel]}")
+    elif sel:
+        add("chart_pattern", "WARN",
+            f"selected but no breakout: {[p.get('kind') for p in sel]}")
+    else:
+        add("chart_pattern", "WARN", "no selected pattern")
+    # 6. candlestick_confirmation
+    cs = (tc or {}).get("candlestick_signal") or {}
+    has_bull = bool(
+        cs.get("bullish_pinbar") or cs.get("bullish_engulfing")
+        or cs.get("strong_bull_body")
+    )
+    has_bear = bool(
+        cs.get("bearish_pinbar") or cs.get("bearish_engulfing")
+        or cs.get("strong_bear_body")
+    )
+    if has_bull or has_bear:
+        add("candlestick_confirmation", "PASS",
+            f"bull={has_bull} bear={has_bear}")
+    else:
+        add("candlestick_confirmation", "WARN", "no bull/bear candle signal")
+    # 7. lower_tf_confirmation
+    if not ltf.get("available"):
+        add("lower_tf_confirmation", "WARN",
+            f"unavailable: {ltf.get('reason')}")
+    elif ltf.get("bullish_trigger") or ltf.get("bearish_trigger"):
+        add("lower_tf_confirmation", "PASS",
+            f"type={ltf.get('trigger_type')} "
+            f"strength={ltf.get('trigger_strength')}")
+    else:
+        add("lower_tf_confirmation", "WARN", "no trigger")
+    # 8. indicator_environment (RSI safe + BB lifecycle ok + MACD aligned)
+    ind = (tc or {}).get("indicator_context") or {}
+    if ind.get("rsi_trend_danger"):
+        add("indicator_environment", "WARN",
+            "rsi_trend_danger (extreme in trend)")
+    elif ind.get("bb_squeeze") or ind.get("bb_band_walk") or (
+        ind.get("macd_momentum_up") or ind.get("macd_momentum_down")
+    ):
+        add("indicator_environment", "PASS",
+            f"rsi_safe bb_squeeze={ind.get('bb_squeeze')} "
+            f"bb_walk={ind.get('bb_band_walk')} "
+            f"macd_up={ind.get('macd_momentum_up')} "
+            f"macd_down={ind.get('macd_momentum_down')}")
+    else:
+        add("indicator_environment", "WARN", "no indicator confirmation")
+    # 9. macro_alignment
+    if macro.get("macro_strong_against") not in (None, "UNKNOWN"):
+        add("macro_alignment", "BLOCK",
+            f"strong_against={macro.get('macro_strong_against')}")
+    elif any(
+        r in ("macro_strongly_against_buy", "macro_strongly_against_sell")
+        or r.startswith("macro_") for r in block
+    ):
+        add("macro_alignment", "BLOCK",
+            "; ".join(r for r in block if r.startswith("macro_")))
+    elif macro.get("macro_score") is not None:
+        add("macro_alignment", "PASS",
+            f"score={macro.get('macro_score'):.2f} "
+            f"bias={macro.get('currency_bias')}")
+    else:
+        add("macro_alignment", "WARN", "no macro context")
+    # 10. invalidation_clear
+    if "invalidation_unclear" in block:
+        add("invalidation_clear", "BLOCK", "invalidation_unclear")
+    elif risk_obs.get("invalidation_clear"):
+        add("invalidation_clear", "PASS",
+            f"distance_atr={risk_obs.get('structure_stop_distance_atr')}")
+    else:
+        add("invalidation_clear", "WARN",
+            "invalidation_unclear (soft) or no structure stop")
+    # 11. rr_valid
+    rr = sp.get("rr_realized")
+    if any(r.startswith("rr<") for r in block):
+        add("rr_valid", "BLOCK",
+            "; ".join(r for r in block if r.startswith("rr<")))
+    elif rr is not None and rr >= 1.5:
+        add("rr_valid", "PASS", f"rr_realized={rr:.2f}")
+    elif rr is not None:
+        add("rr_valid", "WARN", f"rr_realized={rr:.2f} (<1.5)")
+    else:
+        add("rr_valid", "WARN", "no rr computed")
+    # 12. reconstruction_quality
+    total_rq = float(rq.get("total_reconstruction_score", 0.0))
+    if "insufficient_royal_road_reconstruction_quality" in block:
+        add("reconstruction_quality", "BLOCK",
+            f"total={total_rq:.3f} below threshold")
+    elif total_rq >= 0.5:
+        add("reconstruction_quality", "PASS", f"total={total_rq:.3f}")
+    else:
+        add("reconstruction_quality", "WARN",
+            f"total={total_rq:.3f} (borderline)")
+
+    n_pass = sum(1 for it in items if it["status"] == "PASS")
+    n_warn = sum(1 for it in items if it["status"] == "WARN")
+    n_block = sum(1 for it in items if it["status"] == "BLOCK")
+    return {
+        "available": True,
+        "items": items,
+        "total_items": len(items),
+        "total_pass": n_pass,
+        "total_warn": n_warn,
+        "total_block": n_block,
+        "final_action": action or "HOLD",
+        "block_reasons": block,
+        "cautions": cautions,
+        "source": "trace.royal_road_decision_v2 + technical_confluence_v1",
+    }
+
+
+def _invalidation_explanation_panel(*, v2: dict) -> dict:
+    """PDF: selected_stop_price / atr_stop_price / structure_stop_price /
+    invalidation_structure / invalidation_level / invalidation_status /
+    why_this_stop_invalidates_the_setup / rr_selected / reason."""
+    sp = v2.get("structure_stop_plan")
+    sr = v2.get("support_resistance_v2") or {}
+    cp = v2.get("chart_pattern_v2") or {}
+    if not sp:
+        return {
+            "available": False,
+            "unavailable_reason": "no structure_stop_plan attached",
+            "source": "trace.royal_road_decision_v2.structure_stop_plan",
+        }
+    chosen_mode = sp.get("chosen_mode")
+    outcome = sp.get("outcome")
+    selected_stop = sp.get("stop_price")
+    atr_stop = sp.get("atr_stop_price")
+    structure_stop = sp.get("structure_stop_price")
+    rr_selected = sp.get("rr_realized")
+    # Identify the structural anchor (which level / pattern the stop
+    # leans on).
+    invalidation_structure = "atr_only"
+    invalidation_level = None
+    if structure_stop is not None and chosen_mode != "atr":
+        # Match against selected zones by closest price.
+        for lvl in sr.get("selected_level_zones_top5", []):
+            zlow = lvl.get("zone_low")
+            zhigh = lvl.get("zone_high")
+            if zlow is not None and zhigh is not None and (
+                zlow <= structure_stop <= zhigh
+            ):
+                invalidation_structure = f"sr_zone:{lvl.get('kind')}"
+                invalidation_level = {
+                    "zone_low": zlow, "zone_high": zhigh,
+                    "kind": lvl.get("kind"),
+                    "touch_count": lvl.get("touch_count"),
+                    "confidence": lvl.get("confidence"),
+                }
+                break
+        if invalidation_level is None:
+            for p in cp.get("selected_patterns_top5", []):
+                inv = p.get("invalidation_price")
+                if inv is not None and abs(inv - structure_stop) < 1e-6:
+                    invalidation_structure = f"pattern:{p.get('kind')}"
+                    invalidation_level = {
+                        "pattern_kind": p.get("kind"),
+                        "neckline": p.get("neckline"),
+                        "invalidation_price": inv,
+                    }
+                    break
+        if invalidation_structure == "atr_only":
+            invalidation_structure = "structure_no_anchor_match"
+    if outcome in ("invalid_too_close", "invalid_no_structure"):
+        invalidation_status = "invalid"
+    elif outcome == "hybrid_atr_fallback":
+        invalidation_status = "fallback_atr"
+    elif selected_stop is None:
+        invalidation_status = "missing"
+    else:
+        invalidation_status = "valid"
+    if invalidation_status == "invalid":
+        why = (
+            f"stop plan rejected (outcome={outcome}); "
+            "the structure stop violated distance / availability rules"
+        )
+    elif invalidation_status == "fallback_atr":
+        why = (
+            "no clean structure anchor → fell back to ATR-based stop; "
+            "the setup invalidates only at the ATR distance, not at a "
+            "specific market structure"
+        )
+    elif invalidation_structure.startswith("sr_zone"):
+        why = (
+            f"a close beyond {selected_stop} would breach the {invalidation_structure} "
+            f"zone the setup is built on, removing the structural reason for the trade"
+        )
+    elif invalidation_structure.startswith("pattern"):
+        why = (
+            f"a close beyond {selected_stop} invalidates the "
+            f"{invalidation_structure}, so the breakout / setup no longer holds"
+        )
+    elif chosen_mode == "atr":
+        why = (
+            f"ATR-distance stop at {selected_stop}; the trade "
+            "invalidates when price moves N×ATR against entry"
+        )
+    else:
+        why = "no clear invalidation path documented for this stop plan"
+    reason = (
+        f"mode={chosen_mode} outcome={outcome} stop={selected_stop} "
+        f"structure={invalidation_structure} status={invalidation_status}"
+    )
+    return {
+        "available": True,
+        "selected_stop_price": selected_stop,
+        "atr_stop_price": atr_stop,
+        "structure_stop_price": structure_stop,
+        "chosen_mode": chosen_mode,
+        "outcome": outcome,
+        "invalidation_structure": invalidation_structure,
+        "invalidation_level": invalidation_level,
+        "invalidation_status": invalidation_status,
+        "why_this_stop_invalidates_the_setup": why,
+        "rr_selected": rr_selected,
+        "source": "trace.royal_road_decision_v2.structure_stop_plan",
+        "reason": reason,
+    }
+
+
+def _current_runtime_indicator_votes_panel(*, tc: dict | None) -> dict:
+    """PDF: rsi_vote / macd_vote / sma_vote / bb_vote / voted_action /
+    vote_count_buy / vote_count_sell / warning. Pure read of
+    technical_confluence.vote_breakdown.
+    """
+    if tc is None:
+        return {
+            "available": False,
+            "unavailable_reason": "technical_confluence slice absent on trace",
+            "source": "trace.technical_confluence.vote_breakdown",
+        }
+    vote = tc.get("vote_breakdown") or {}
+    if not vote:
+        return {
+            "available": False,
+            "unavailable_reason": "vote_breakdown not populated",
+            "source": "trace.technical_confluence.vote_breakdown",
+        }
+    ind = tc.get("indicator_context") or {}
+    rsi_value = ind.get("rsi_value")
+    if rsi_value is None:
+        rsi_vote = "NEUTRAL"
+    elif rsi_value < 30:
+        rsi_vote = "BUY"
+    elif rsi_value > 70:
+        rsi_vote = "SELL"
+    else:
+        rsi_vote = "NEUTRAL"
+    macd_up = ind.get("macd_momentum_up")
+    macd_down = ind.get("macd_momentum_down")
+    if macd_up:
+        macd_vote = "BUY"
+    elif macd_down:
+        macd_vote = "SELL"
+    else:
+        macd_vote = "NEUTRAL"
+    ma_trend = ind.get("ma_trend_support")
+    if ma_trend in ("BUY", "SELL"):
+        sma_vote = ma_trend
+    else:
+        sma_vote = "NEUTRAL"
+    # bb_vote: derived from buy/sell vote counts minus the other 3
+    # indicators we already classified. Without bb_position we cannot
+    # tell precisely; mark as UNKNOWN if not derivable.
+    n_buy = int(vote.get("indicator_buy_votes") or 0)
+    n_sell = int(vote.get("indicator_sell_votes") or 0)
+    bb_vote = "UNKNOWN"
+    bull_count_others = sum(1 for v in (rsi_vote, macd_vote, sma_vote) if v == "BUY")
+    bear_count_others = sum(1 for v in (rsi_vote, macd_vote, sma_vote) if v == "SELL")
+    if n_buy - bull_count_others == 1 and n_sell - bear_count_others == 0:
+        bb_vote = "BUY"
+    elif n_sell - bear_count_others == 1 and n_buy - bull_count_others == 0:
+        bb_vote = "SELL"
+    elif n_buy - bull_count_others == 0 and n_sell - bear_count_others == 0:
+        bb_vote = "NEUTRAL"
+    voted_action = vote.get("voted_action") or "HOLD"
+    warnings: list[str] = []
+    if rsi_vote != "NEUTRAL" and not ind.get("rsi_range_valid", False):
+        warnings.append("rsi_extreme_outside_range_regime")
+    if ind.get("rsi_trend_danger"):
+        warnings.append("rsi_trend_danger")
+    return {
+        "available": True,
+        "rsi_vote": rsi_vote,
+        "macd_vote": macd_vote,
+        "sma_vote": sma_vote,
+        "bb_vote": bb_vote,
+        "voted_action": voted_action,
+        "vote_count_buy": n_buy,
+        "vote_count_sell": n_sell,
+        "warning": "; ".join(warnings) if warnings else None,
+        "source": "trace.technical_confluence.vote_breakdown",
+    }
+
+
+def _build_checklist_panels(*, trace: Any, v2: dict) -> dict:
+    """Aggregate the 7 PDF-derived royal-road checklist panels."""
+    tc = _trace_technical_confluence(trace)
+    technical = _trace_technical(trace)
+    market = _trace_market(trace)
+    action = v2.get("action")
+    return {
+        "candlestick_interpretation": _candlestick_interpretation_panel(
+            tc=tc, v2=v2,
+        ),
+        "rsi_context": _rsi_context_panel(tc=tc, technical=technical),
+        "ma_granville_context": _ma_granville_context_panel(
+            tc=tc, technical=technical, market=market,
+        ),
+        "bollinger_lifecycle": _bollinger_lifecycle_panel(
+            tc=tc, technical=technical,
+        ),
+        "grand_confluence_checklist": _grand_confluence_checklist_panel(
+            tc=tc, v2=v2, action=action,
+        ),
+        "invalidation_explanation": _invalidation_explanation_panel(v2=v2),
+        "current_runtime_indicator_votes": (
+            _current_runtime_indicator_votes_panel(tc=tc)
+        ),
+    }
+
+
 def build_visual_audit_payload(
     *,
     trace: Any,
@@ -236,6 +1000,7 @@ def build_visual_audit_payload(
         title_parts.append(f"action={v2['action']}")
     title = " | ".join(title_parts)
 
+    checklist_panels = _build_checklist_panels(trace=trace, v2=v2)
     return {
         "schema_version": SCHEMA_VERSION,
         "parent_bar_ts": parent_iso,
@@ -250,6 +1015,7 @@ def build_visual_audit_payload(
         "best_setup": best,
         "reconstruction_quality": rq,
         "overlays": overlays,
+        "checklist_panels": checklist_panels,
         # Full v2 payload preserved so the audit is self-contained
         # (no need to read the JSONL trace separately).
         "royal_road_decision_v2": v2,
@@ -908,6 +1674,13 @@ pre { background: #f4f4f4; padding: 8px; overflow-x: auto; font-size: 12px; }
 img { max-width: 100%; border: 1px solid #ddd; }
 .section { margin-top: 16px; }
 .placeholder { color: #888; font-style: italic; }
+.checklist td.status-PASS { background: #d9f7d9; font-weight: bold; }
+.checklist td.status-WARN { background: #fff3cd; font-weight: bold; }
+.checklist td.status-BLOCK { background: #f8d7da; font-weight: bold; }
+.panel { background: #fafbfd; padding: 8px 10px; border: 1px solid #e0e0e0;
+  border-radius: 4px; margin-bottom: 10px; font-size: 13px; }
+.panel h3 { margin-top: 0; font-size: 14px; }
+.panel-unavailable { color: #888; font-style: italic; }
 """
 
 
@@ -1060,6 +1833,110 @@ def _render_steps_html(v2: dict) -> str:
     )
 
 
+def _render_grand_confluence_checklist_html(panel: dict) -> str:
+    if not panel.get("available"):
+        return (
+            f"<p class='panel-unavailable'>"
+            f"grand_confluence_checklist unavailable: "
+            f"{_html_escape(panel.get('unavailable_reason', ''))}</p>"
+        )
+    rows: list[str] = []
+    for it in panel.get("items", []):
+        status = it.get("status", "")
+        rows.append(
+            f"<tr><td>{_html_escape(it.get('item', ''))}</td>"
+            f"<td class='status-{_html_escape(status)}'>{_html_escape(status)}</td>"
+            f"<td>{_html_escape(it.get('detail', ''))}</td></tr>"
+        )
+    summary = (
+        f"<p>final_action=<b>{_html_escape(panel.get('final_action', ''))}</b> "
+        f"PASS={panel.get('total_pass', 0)} "
+        f"WARN={panel.get('total_warn', 0)} "
+        f"BLOCK={panel.get('total_block', 0)} "
+        f"(total={panel.get('total_items', 0)})</p>"
+    )
+    return (
+        summary
+        + "<table class='checklist'><thead><tr><th>item</th><th>status</th>"
+        "<th>detail</th></tr></thead><tbody>"
+        + "\n".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def _render_invalidation_explanation_html(panel: dict) -> str:
+    if not panel.get("available"):
+        return (
+            f"<p class='panel-unavailable'>"
+            f"invalidation_explanation unavailable: "
+            f"{_html_escape(panel.get('unavailable_reason', ''))}</p>"
+        )
+    return (
+        "<table>"
+        f"<tr><td>chosen_mode</td><td>{_html_escape(panel.get('chosen_mode'))}</td></tr>"
+        f"<tr><td>outcome</td><td>{_html_escape(panel.get('outcome'))}</td></tr>"
+        f"<tr><td>selected_stop_price</td><td>{panel.get('selected_stop_price')}</td></tr>"
+        f"<tr><td>atr_stop_price</td><td>{panel.get('atr_stop_price')}</td></tr>"
+        f"<tr><td>structure_stop_price</td><td>{panel.get('structure_stop_price')}</td></tr>"
+        f"<tr><td>invalidation_structure</td><td>{_html_escape(panel.get('invalidation_structure'))}</td></tr>"
+        f"<tr><td>invalidation_status</td><td><b>{_html_escape(panel.get('invalidation_status'))}</b></td></tr>"
+        f"<tr><td>rr_selected</td><td>{panel.get('rr_selected')}</td></tr>"
+        f"<tr><td>why_this_stop_invalidates_the_setup</td><td>"
+        f"{_html_escape(panel.get('why_this_stop_invalidates_the_setup', ''))}"
+        "</td></tr></table>"
+    )
+
+
+def _render_simple_panel_html(name: str, panel: dict) -> str:
+    if not panel.get("available"):
+        return (
+            f"<p class='panel-unavailable'>{_html_escape(name)} unavailable: "
+            f"{_html_escape(panel.get('unavailable_reason', ''))}</p>"
+        )
+    rows: list[str] = []
+    for k, v in panel.items():
+        if k in ("available", "source"):
+            continue
+        rows.append(
+            f"<tr><td>{_html_escape(k)}</td>"
+            f"<td>{_html_escape(json.dumps(v, default=str))}</td></tr>"
+        )
+    return "<table>" + "".join(rows) + "</table>"
+
+
+def _render_checklist_panels_html(panels: dict | None) -> str:
+    if not panels:
+        return "<p class='panel-unavailable'>no checklist panels</p>"
+    parts: list[str] = []
+    parts.append(
+        "<div class='panel'><h3>Grand Confluence Checklist</h3>"
+        + _render_grand_confluence_checklist_html(
+            panels.get("grand_confluence_checklist") or {}
+        )
+        + "</div>"
+    )
+    parts.append(
+        "<div class='panel'><h3>Invalidation Explanation</h3>"
+        + _render_invalidation_explanation_html(
+            panels.get("invalidation_explanation") or {}
+        )
+        + "</div>"
+    )
+    for label, key in (
+        ("Candlestick Interpretation", "candlestick_interpretation"),
+        ("RSI Context / Trap", "rsi_context"),
+        ("MA Granville Context", "ma_granville_context"),
+        ("Bollinger Lifecycle", "bollinger_lifecycle"),
+        ("Current Runtime Indicator Votes", "current_runtime_indicator_votes"),
+    ):
+        parts.append(
+            f"<div class='panel'><h3>{label}</h3>"
+            + _render_simple_panel_html(label, panels.get(key) or {})
+            + "</div>"
+        )
+    return "".join(parts)
+
+
 def _render_detail_html(
     *,
     case: dict,
@@ -1140,6 +2017,9 @@ def _render_detail_html(
         f"<tr><td>diff</td><td colspan='2'>{_html_escape(cmp_v1.get('difference_type', ''))}</td></tr>"
         "</table>"
     )
+    panels_html = _render_checklist_panels_html(
+        payload.get("checklist_panels")
+    )
     return (
         "<html><head><meta charset='utf-8'>"
         f"<title>{_html_escape(case['case_id'])}</title>"
@@ -1148,6 +2028,7 @@ def _render_detail_html(
         f"<p><a href='../../index.html'>&larr; back to index</a></p>"
         "<div class='case-detail'>"
         f"<div class='left'><h2>Main</h2>{main_img}"
+        f"<h2 class='section'>Royal Road Checklist Panels</h2>{panels_html}"
         f"<h2 class='section'>Multi Scale</h2>{multi_scale_html}"
         f"<h2 class='section'>Lower TF</h2>{lower_tf_html}"
         "</div>"
