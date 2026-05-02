@@ -2881,6 +2881,10 @@ img.thumb { width: 220px; height: auto; border: 1px solid #ddd; }
 .masterclass-detail .obs-tag { color: #888; font-weight: normal;
   font-size: 11px; margin-left: 4px; }
 .masterclass-detail-body { margin-top: 6px; }
+.masterclass-category { background: #fafbfd; border: 2px solid #94a3b8;
+  border-radius: 6px; padding: 6px 10px; margin: 8px 0; }
+.masterclass-category-title { cursor: pointer; font-weight: 700;
+  color: #334155; padding: 4px 0; font-size: 14px; }
 .masterclass-detail table.kv { font-size: 12px; }
 .masterclass-detail table.kv th { width: 30%; background: #eef3fa; }
 .masterclass-detail table.kv td.status-PASS { background: #d9f7d9; font-weight: bold; }
@@ -2967,6 +2971,31 @@ img.thumb { width: 220px; height: auto; border: 1px solid #ddd; }
 .wave-only-chart { display: block; max-width: 100%; height: auto;
   border: 1px solid #c5d2eb; border-radius: 4px; background: #fbfcff; }
 """
+
+
+def _setup_candidate_summary_ja(i: int, c: dict) -> str:
+    """User-facing JA summary line for a setup_candidate <details>.
+
+    Replaces the dev-style "candidate #1 side=BUY score=-0.300
+    confidence=0.55" string. Raw JSON stays inside <pre> for debug.
+    """
+    side = (c.get("side") or "?").upper()
+    side_ja = {"BUY": "BUY (買い)", "SELL": "SELL (売り)"}.get(side, side)
+    raw_score = c.get("score")
+    if isinstance(raw_score, (int, float)):
+        if raw_score >= 0.5:
+            strength_ja = "強い"
+        elif raw_score >= 0.0:
+            strength_ja = "やや弱い"
+        elif raw_score >= -0.5:
+            strength_ja = "やや逆"
+        else:
+            strength_ja = "強く逆"
+    else:
+        strength_ja = "—"
+    label = c.get("label") or ""
+    label_part = f", {_html_escape(label)}" if label else ""
+    return _html_escape(f"候補 #{i + 1}: {side_ja}{label_part} ({strength_ja})")
 
 
 def _html_escape(s: str) -> str:
@@ -3180,6 +3209,23 @@ def _render_grand_confluence_checklist_html(panel: dict) -> str:
     )
 
 
+def _safe_cell(v) -> str:
+    """User-facing cell value: None → "—", float NaN → "—", floats
+    formatted, others stringified. Prevents bare "None" / "NaN" from
+    leaking into HTML."""
+    if v is None:
+        return "—"
+    if isinstance(v, float):
+        try:
+            import math
+            if math.isnan(v):
+                return "—"
+        except Exception:  # noqa: BLE001
+            pass
+        return f"{v:.5f}"
+    return _html_escape(str(v))
+
+
 def _render_invalidation_explanation_html(panel: dict) -> str:
     if not panel.get("available"):
         return (
@@ -3189,16 +3235,16 @@ def _render_invalidation_explanation_html(panel: dict) -> str:
         )
     return (
         "<table>"
-        f"<tr><td>chosen_mode</td><td>{_html_escape(panel.get('chosen_mode'))}</td></tr>"
-        f"<tr><td>outcome</td><td>{_html_escape(panel.get('outcome'))}</td></tr>"
-        f"<tr><td>selected_stop_price</td><td>{panel.get('selected_stop_price')}</td></tr>"
-        f"<tr><td>atr_stop_price</td><td>{panel.get('atr_stop_price')}</td></tr>"
-        f"<tr><td>structure_stop_price</td><td>{panel.get('structure_stop_price')}</td></tr>"
-        f"<tr><td>invalidation_structure</td><td>{_html_escape(panel.get('invalidation_structure'))}</td></tr>"
-        f"<tr><td>invalidation_status</td><td><b>{_html_escape(panel.get('invalidation_status'))}</b></td></tr>"
-        f"<tr><td>rr_selected</td><td>{panel.get('rr_selected')}</td></tr>"
+        f"<tr><td>chosen_mode</td><td>{_safe_cell(panel.get('chosen_mode'))}</td></tr>"
+        f"<tr><td>outcome</td><td>{_safe_cell(panel.get('outcome'))}</td></tr>"
+        f"<tr><td>selected_stop_price</td><td>{_safe_cell(panel.get('selected_stop_price'))}</td></tr>"
+        f"<tr><td>atr_stop_price</td><td>{_safe_cell(panel.get('atr_stop_price'))}</td></tr>"
+        f"<tr><td>structure_stop_price</td><td>{_safe_cell(panel.get('structure_stop_price'))}</td></tr>"
+        f"<tr><td>invalidation_structure</td><td>{_safe_cell(panel.get('invalidation_structure'))}</td></tr>"
+        f"<tr><td>invalidation_status</td><td><b>{_safe_cell(panel.get('invalidation_status'))}</b></td></tr>"
+        f"<tr><td>rr_selected</td><td>{_safe_cell(panel.get('rr_selected'))}</td></tr>"
         f"<tr><td>why_this_stop_invalidates_the_setup</td><td>"
-        f"{_html_escape(panel.get('why_this_stop_invalidates_the_setup', ''))}"
+        f"{_safe_cell(panel.get('why_this_stop_invalidates_the_setup'))}"
         "</td></tr></table>"
     )
 
@@ -3265,12 +3311,14 @@ def _render_detail_html(
     cmp_v1 = v2.get("compared_to_current_runtime") or {}
     sym = case["symbol"]
     ts = case["ts"]
-    title = (
-        f"{sym} {ts} "
-        f"action={v2.get('action')} "
-        f"mode={v2.get('mode')} "
-        f"quality={(v2.get('reconstruction_quality') or {}).get('total_reconstruction_score', 0.0):.3f}"
-    )
+    # User-facing title (no dev-style best=/quality=/score=). The
+    # debug-style string is kept on payload["title"] for tests / JSON
+    # sidecars; this rendering uses the sanitized JA version.
+    action_label = v2.get("action") or "?"
+    mode_label = v2.get("mode") or ""
+    title = f"{sym} {ts} 判断: {action_label}"
+    if mode_label:
+        title += f" (mode: {mode_label})"
     # Resolve the actual chart filename to <img>: PNG > SVG > placeholder.
     main_path = chart_main_status.get("path")
     if chart_main_status.get("available") and main_path:
@@ -3319,16 +3367,15 @@ def _render_detail_html(
         )
     setup_candidates = v2.get("setup_candidates") or []
     setup_html = "".join(
-        f"<details open><summary>candidate #{i+1} side={c.get('side')} "
-        f"score={c.get('score'):.3f} confidence={c.get('confidence')}</summary>"
+        f"<details><summary>{_setup_candidate_summary_ja(i, c)}</summary>"
         f"<pre>{_html_escape(json.dumps(c, indent=2, default=str))}</pre>"
         "</details>"
         for i, c in enumerate(setup_candidates)
-    ) or "<p class='placeholder'>no setup candidates</p>"
+    ) or "<p class='placeholder'>セットアップ候補なし</p>"
     best_setup = v2.get("best_setup")
     best_html = (
         f"<pre>{_html_escape(json.dumps(best_setup, indent=2, default=str))}</pre>"
-        if best_setup else "<p class='placeholder'>None</p>"
+        if best_setup else "<p class='placeholder'>該当なし</p>"
     )
     block_reasons = v2.get("block_reasons") or []
     cautions = v2.get("cautions") or []
@@ -4240,20 +4287,42 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
             + check_rows + "</table></div>"
         )
 
-    # ── Tier 3: 詳細パネル (19 個の <details>) ──
+    # ── Tier 3: 詳細パネル (19 個 — カテゴリ別 details にまとめる) ──
     parts.append(
-        "<h4>詳細パネル (19 機能 — observation-only)</h4>"
+        "<h4>詳細パネル (19 機能 — observation-only、カテゴリ別)</h4>"
     )
 
-    def _detail(title_ja: str, body_html: str, *, open_: bool = False) -> str:
+    # Each panel is rendered into the per-category buffer; categories
+    # are emitted as collapsed <details> blocks at the end of Tier 3.
+    _detail_categories: dict[str, list[str]] = {
+        "波形・構造":      [],
+        "ローソク足":      [],
+        "MA・グランビル": [],
+        "指標 (BB/RSI/MACD/Div)": [],
+        "フィボ":         [],
+        "監査・サマリ":   [],
+        "損切り・運用":   [],
+    }
+
+    def _detail(
+        title_ja: str, body_html: str, *,
+        open_: bool = False, category: str = "波形・構造",
+    ) -> str:
+        """Render one detail panel and route it into its category
+        bucket. Returns the empty string so the existing
+        `parts.append(_detail(...))` call sites continue to work — the
+        actual HTML is emitted later via _emit_categorized_details()."""
         attr = " open" if open_ else ""
-        return (
+        html = (
             f"<details class='masterclass-detail'{attr}>"
             f"<summary>{_html_escape(title_ja)} "
             f"<span class='obs-tag'>(observation-only)</span></summary>"
             f"<div class='masterclass-detail-body'>{body_html}</div>"
             "</details>"
         )
+        bucket = _detail_categories.setdefault(category, [])
+        bucket.append(html)
+        return ""  # actual emission happens via the category block
 
     def _kv_table(rows: list[tuple[str, str]]) -> str:
         body = "".join(
@@ -4278,7 +4347,10 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
             f"<p class='placeholder'>判定不可: "
             f"{cs.get('unavailable_reason', '')}</p>"
         )
-    parts.append(_detail("1. ローソク足の解剖 (candlestick anatomy)", body))
+    parts.append(_detail(
+        "1. ローソク足の解剖 (candlestick anatomy)", body,
+        category="ローソク足",
+    ))
 
     # 2. 上位足1本の下位足解剖
     lt = panels.get("parent_bar_lower_tf_anatomy") or {}
@@ -4294,7 +4366,10 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
             f"<p class='placeholder'>下位足データなし: "
             f"{lt.get('unavailable_reason', '')}</p>"
         )
-    parts.append(_detail("2. 上位足1本の下位足解剖 (parent_bar lower-TF)", body))
+    parts.append(_detail(
+        "2. 上位足1本の下位足解剖 (parent_bar lower-TF)", body,
+        category="ローソク足",
+    ))
 
     # 3. ダウ構造
     dow = panels.get("dow_structure_review") or {}
@@ -4313,7 +4388,10 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
             f"<p class='placeholder'>ダウ判定不可: "
             f"{dow.get('unavailable_reason', '')}</p>"
         )
-    parts.append(_detail("3. ダウ構造 (Dow structure)", body, open_=True))
+    parts.append(_detail(
+        "3. ダウ構造 (Dow structure)", body, open_=True,
+        category="波形・構造",
+    ))
 
     # 4. 波形 / パターン解剖
     pat = panels.get("chart_pattern_anatomy_v2") or {}
@@ -4339,7 +4417,10 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
             f"<p class='placeholder'>パターン判定不可: "
             f"{pat.get('unavailable_reason', '')}</p>"
         )
-    parts.append(_detail("4. 波形 / パターン解剖 (pattern anatomy v2)", body, open_=True))
+    parts.append(_detail(
+        "4. 波形 / パターン解剖 (pattern anatomy v2)", body, open_=True,
+        category="波形・構造",
+    ))
 
     # 5. 水平線心理
     lvl = panels.get("level_psychology_review") or {}
@@ -4362,7 +4443,10 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
             f"<p class='placeholder'>水平線判定不可: "
             f"{lvl.get('unavailable_reason', '')}</p>"
         )
-    parts.append(_detail("5. 水平線心理 (level psychology)", body))
+    parts.append(_detail(
+        "5. 水平線心理 (level psychology)", body,
+        category="波形・構造",
+    ))
 
     # 6. インジケーター環境ルーター
     er = panels.get("indicator_environment_router") or {}
@@ -4380,7 +4464,10 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
             f"<p class='placeholder'>環境判定不可: "
             f"{er.get('unavailable_reason', '')}</p>"
         )
-    parts.append(_detail("6. インジケーター環境 (env router)", body))
+    parts.append(_detail(
+        "6. インジケーター環境 (env router)", body,
+        category="指標 (BB/RSI/MACD/Div)",
+    ))
 
     # 7. MAコンテキスト
     ma = panels.get("ma_context_review") or {}
@@ -4402,7 +4489,10 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
             f"<p class='placeholder'>MA判定不可: "
             f"{ma.get('unavailable_reason', '')}</p>"
         )
-    parts.append(_detail("7. MA / グランビル (MA context)", body))
+    parts.append(_detail(
+        "7. MA / グランビル (MA context)", body,
+        category="MA・グランビル",
+    ))
 
     # 8. グランビル
     gr = panels.get("granville_entry_review") or {}
@@ -4419,7 +4509,10 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
             f"<p class='placeholder'>グランビル判定不可: "
             f"{gr.get('unavailable_reason', '')}</p>"
         )
-    parts.append(_detail("8. グランビル法則 (Granville)", body))
+    parts.append(_detail(
+        "8. グランビル法則 (Granville)", body,
+        category="MA・グランビル",
+    ))
 
     # 9. BB ライフサイクル
     bb = panels.get("bollinger_lifecycle_review") or {}
@@ -4438,7 +4531,10 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
             f"<p class='placeholder'>BB判定不可: "
             f"{bb.get('unavailable_reason', '')}</p>"
         )
-    parts.append(_detail("9. BB ライフサイクル (BB lifecycle)", body))
+    parts.append(_detail(
+        "9. BB ライフサイクル (BB lifecycle)", body,
+        category="指標 (BB/RSI/MACD/Div)",
+    ))
 
     # 10. RSI レジームフィルター
     rsi = panels.get("rsi_regime_filter") or {}
@@ -4455,7 +4551,10 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
             f"<p class='placeholder'>RSI判定不可: "
             f"{rsi.get('unavailable_reason', '')}</p>"
         )
-    parts.append(_detail("10. RSI レジームフィルター", body))
+    parts.append(_detail(
+        "10. RSI レジームフィルター", body,
+        category="指標 (BB/RSI/MACD/Div)",
+    ))
 
     # 11. ダイバージェンス
     dv = panels.get("divergence_review") or {}
@@ -4468,7 +4567,10 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
         ("意味", dv.get("meaning_ja", "")),
         ("注意", dv.get("warning_ja", "")),
     ])
-    parts.append(_detail("11. ダイバージェンス (divergence)", body))
+    parts.append(_detail(
+        "11. ダイバージェンス (divergence)", body,
+        category="指標 (BB/RSI/MACD/Div)",
+    ))
 
     # 12. MACD architecture
     md = panels.get("macd_architecture_review") or {}
@@ -4491,7 +4593,10 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
             f"<p class='placeholder'>MACD判定不可: "
             f"{md.get('unavailable_reason', '')}</p>"
         )
-    parts.append(_detail("12. MACD architecture", body))
+    parts.append(_detail(
+        "12. MACD architecture", body,
+        category="指標 (BB/RSI/MACD/Div)",
+    ))
 
     # 13. マルチタイムフレームストーリー
     mtf = panels.get("multi_timeframe_story") or {}
@@ -4508,7 +4613,10 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
             f"<p class='placeholder'>MTF判定不可: "
             f"{mtf.get('unavailable_reason', '')}</p>"
         )
-    parts.append(_detail("13. マルチタイムフレームストーリー", body, open_=True))
+    parts.append(_detail(
+        "13. マルチタイムフレームストーリー", body, open_=True,
+        category="波形・構造",
+    ))
 
     # 14. グランド・コンフルエンス
     gc = panels.get("grand_confluence_v2") or {}
@@ -4529,7 +4637,10 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
         )
     else:
         body = "<p class='placeholder'>コンフルエンス判定不可。</p>"
-    parts.append(_detail("14. グランド・コンフルエンス (9-axis)", body, open_=True))
+    parts.append(_detail(
+        "14. グランド・コンフルエンス (9-axis)", body, open_=True,
+        category="監査・サマリ",
+    ))
 
     # 15. インバリデーション
     inv = panels.get("invalidation_engine_v2") or {}
@@ -4550,7 +4661,10 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
             f"<p class='placeholder'>インバリデーション判定不可: "
             f"{inv.get('unavailable_reason', '')}</p>"
         )
-    parts.append(_detail("15. インバリデーション (invalidation)", body, open_=True))
+    parts.append(_detail(
+        "15. インバリデーション (invalidation)", body, open_=True,
+        category="損切り・運用",
+    ))
 
     # 16. 事前診断チェックリスト
     ck = panels.get("pre_trade_diagnostic_checklist_v1") or {}
@@ -4574,6 +4688,7 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
         body = "<p class='placeholder'>事前診断不可。</p>"
     parts.append(_detail(
         "16. 事前診断チェックリスト (pre-trade diagnostic)", body, open_=True,
+        category="監査・サマリ",
     ))
 
     # 17. Fibonacci context
@@ -4618,6 +4733,7 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
         )
     parts.append(_detail(
         "17. フィボナッチ (fibonacci_context_review)", body,
+        category="フィボ",
     ))
 
     # 18. Daily roadmap
@@ -4640,6 +4756,7 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
         body = "<p class='placeholder'>roadmap 判定不可。</p>"
     parts.append(_detail(
         "18. Daily 10k FX Roadmap (一部未接続)", body,
+        category="損切り・運用",
     ))
 
     # 19. Symbol macro briefing
@@ -4656,7 +4773,20 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
     ])
     parts.append(_detail(
         "19. 通貨ペア固有ファンダ (symbol_macro_briefing_review)", body,
+        category="損切り・運用",
     ))
+
+    # Emit categorized <details> groups (one per non-empty category).
+    for cat_name, panel_htmls in _detail_categories.items():
+        if not panel_htmls:
+            continue
+        parts.append(
+            f"<details class='masterclass-category' open>"
+            f"<summary class='masterclass-category-title'>"
+            f"{_html_escape(cat_name)} ({len(panel_htmls)} 件)</summary>"
+            + "".join(panel_htmls)
+            + "</details>"
+        )
 
     parts.append("</div>")
     return "".join(parts)
@@ -4890,12 +5020,11 @@ def _mobile_case_section_html(
     panels_html = _render_checklist_panels_html(panels)
 
     setup_html = "".join(
-        f"<details><summary>candidate #{i+1} side={c.get('side')} "
-        f"score={c.get('score'):.3f} confidence={c.get('confidence')}</summary>"
+        f"<details><summary>{_setup_candidate_summary_ja(i, c)}</summary>"
         f"<pre>{_html_escape(json.dumps(c, indent=2, default=str))}</pre>"
         "</details>"
         for i, c in enumerate(setup_candidates)
-    ) or "<p class='placeholder'>no setup candidates</p>"
+    ) or "<p class='placeholder'>セットアップ候補なし</p>"
 
     block_html = (
         "<ul>" + "".join(
