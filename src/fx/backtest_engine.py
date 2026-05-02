@@ -58,6 +58,10 @@ from .royal_road_decision_v2 import (
     compare_v2_vs_v1,
     decide_royal_road_v2,
 )
+from .royal_road_integrated_decision import (
+    PROFILE_NAME_V2_INTEGRATED as ROYAL_ROAD_PROFILE_INTEGRATED,
+    decide_royal_road_v2_integrated,
+)
 from .stop_modes import (
     DEFAULT_STOP_MODE,
     plan_stop,
@@ -599,6 +603,13 @@ def run_engine_backtest(
     # diagnostic heuristic; `exploratory` is for discovery and not for
     # adoption. See `royal_road_decision_modes.py`.
     royal_road_mode: str = DEFAULT_ROYAL_ROAD_MODE,
+    # Integrated profile mode (consulted only when decision_profile=
+    # "royal_road_decision_v2_integrated"). Two modes:
+    #   integrated_balanced  required-data missing → WARN
+    #   integrated_strict    required-data missing → HOLD
+    # Live / OANDA / paper do not call this function, so this cannot
+    # affect live trading.
+    integrated_mode: str = "integrated_balanced",
     # v2 inputs (consulted only when decision_profile=
     # "royal_road_decision_v2"). df_lower_tf must be a DataFrame whose
     # bars are at a finer interval than `interval`. lower_tf_interval
@@ -695,12 +706,22 @@ def run_engine_backtest(
     _decision_profile = validate_decision_profile(decision_profile)
     _royal_road_active = (_decision_profile == ROYAL_ROAD_PROFILE)
     _royal_road_v2_active = (_decision_profile == ROYAL_ROAD_PROFILE_V2)
+    _royal_road_integrated_active = (
+        _decision_profile == ROYAL_ROAD_PROFILE_INTEGRATED
+    )
     # Validate the mode upfront (raises ValueError on unknown values).
     # The kwarg is harmless when the profile is current_runtime, but we
     # still want unknown values to surface immediately rather than
     # waiting for the first royal-road bar.
     _royal_road_mode = get_royal_road_mode_config(royal_road_mode).name
     _stop_mode = validate_stop_mode(stop_mode)
+    # Integrated mode (only consulted when integrated profile active).
+    # Validate upfront so a typo doesn't silently fall through.
+    if _royal_road_integrated_active:
+        from .royal_road_integrated_decision import validate_integrated_mode
+        _integrated_mode = validate_integrated_mode(integrated_mode)
+    else:
+        _integrated_mode = integrated_mode
 
     # PR #21: resolve indicator-period overrides. None → existing
     # current_runtime defaults, non-None → flowed through.
@@ -995,7 +1016,12 @@ def run_engine_backtest(
         v2_compare_vs_current: dict | None = None
         v2_compare_vs_v1: dict | None = None
         v2_stop_plan = None
-        if _royal_road_active or _royal_road_v2_active:
+        decision_integrated: Decision | None = None
+        if (
+            _royal_road_active
+            or _royal_road_v2_active
+            or _royal_road_integrated_active
+        ):
             confluence_dict = build_technical_confluence(
                 df_window=df.iloc[: i + 1],
                 snapshot=snap,
@@ -1074,6 +1100,40 @@ def run_engine_backtest(
                     "structure_stop_plan"
                 )
                 decision = decision_v2
+            elif _royal_road_integrated_active:
+                # Integrated profile: opt-in only. Same panel inputs as
+                # v2 (so masterclass / source-pack panels match), but
+                # the action is decided by integrated evidence axes.
+                # NEVER reachable from live / OANDA / paper because
+                # those paths don't call run_engine_backtest.
+                from .decision_trace_build import macro_context_slice
+                _macro_slice = macro_context_slice(macro, ts)
+                _macro_dict = (
+                    _macro_slice.to_dict() if _macro_slice is not None else None
+                )
+                decision_integrated = decide_royal_road_v2_integrated(
+                    df_window=df.iloc[: i + 1],
+                    technical_confluence=confluence_dict,
+                    pattern=pattern,
+                    higher_timeframe_trend=higher_tf,
+                    risk_reward=risk_reward,
+                    risk_state=risk_state,
+                    atr_value=float(atr_value),
+                    last_close=float(price),
+                    symbol=symbol,
+                    macro_context=_macro_dict,
+                    df_lower_tf=df_lower_tf,
+                    lower_tf_interval=lower_tf_interval,
+                    stop_mode=_stop_mode,
+                    stop_atr_mult=stop_atr_mult,
+                    tp_atr_mult=tp_atr_mult,
+                    base_bar_close_ts=ts,
+                    mode=_integrated_mode,
+                )
+                v2_stop_plan = (decision_integrated.advisory or {}).get(
+                    "structure_stop_plan"
+                )
+                decision = decision_integrated
         else:
             decision = decision_current
 

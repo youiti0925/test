@@ -1266,6 +1266,7 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
         atr_period=runtime_kwargs.get("atr_period"),
         decision_profile=getattr(args, "decision_profile", "current_runtime"),
         royal_road_mode=getattr(args, "royal_road_mode", "balanced"),
+        integrated_mode=getattr(args, "integrated_mode", "integrated_balanced"),
         df_lower_tf=df_lower_tf_for_v2,
         lower_tf_interval=lower_tf_interval_for_v2,
         stop_mode=getattr(args, "stop_mode", "atr"),
@@ -2356,6 +2357,7 @@ def build_parser() -> argparse.ArgumentParser:
             "current_runtime",
             "royal_road_decision_v1",
             "royal_road_decision_v2",
+            "royal_road_decision_v2_integrated",
         ),
         help=(
             "Which decision profile drives BUY/SELL/HOLD. Default "
@@ -2363,10 +2365,29 @@ def build_parser() -> argparse.ArgumentParser:
             "`royal_road_decision_v1` (opt-in) reads "
             "technical_confluence_v1 and applies royal-road rules "
             "with strictness selected by --royal-road-mode. "
+            "`royal_road_decision_v2_integrated` (opt-in) elevates "
+            "wave / W-lines / fib / candlestick / dow / MA / RSI / "
+            "BB / MACD / invalidation / RR into first-class evidence "
+            "the action is built from; mode selected by "
+            "--integrated-mode. "
             "Backtest-only — live cmd_trade does not call "
             "run_engine_backtest, so this flag cannot affect live "
             "trading. The trace gains a `royal_road_decision` slice "
             "with comparison metadata when the profile is non-default."
+        ),
+    )
+    be.add_argument(
+        "--integrated-mode",
+        default="integrated_balanced",
+        choices=("integrated_balanced", "integrated_strict"),
+        help=(
+            "Strictness mode for `royal_road_decision_v2_integrated`. "
+            "`integrated_balanced` (default): required-data missing "
+            "(macro / daily_roadmap / symbol_macro_briefing) → WARN. "
+            "`integrated_strict`: required-data missing → HOLD. RR / "
+            "stop / invalidation / WNL still HOLD if missing in both "
+            "modes. Only consulted when --decision-profile is "
+            "royal_road_decision_v2_integrated."
         ),
     )
     from .royal_road_decision_modes import (
