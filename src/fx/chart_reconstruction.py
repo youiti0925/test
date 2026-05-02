@@ -44,9 +44,15 @@ from typing import Final
 import pandas as pd
 
 from .chart_patterns import detect_patterns
+from .pattern_shape_review import build_pattern_shape_review
 from .patterns import detect_swings
 from .support_resistance import detect_levels
 from .trendlines import detect_trendlines
+from .waveform_encoder import (
+    WaveSkeleton,  # noqa: F401  — used as type hint in annotations
+    empty_skeleton,
+    encode_wave_skeleton,
+)
 
 
 SCHEMA_VERSION: Final[str] = "chart_reconstruction_v2"
@@ -72,6 +78,11 @@ class ScaleAnalysis:
     pattern_candidates: list
     wave_structure: dict
     visual_quality: float
+    # Observation-only waveform skeleton + shape review (NOT consumed
+    # by royal_road_decision_v2's final action). Empty dicts when the
+    # encoder can't build a skeleton at this scale.
+    wave_skeleton: dict = field(default_factory=dict)
+    pattern_shape_review: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -86,6 +97,8 @@ class ScaleAnalysis:
             "pattern_candidates": list(self.pattern_candidates),
             "wave_structure": dict(self.wave_structure),
             "visual_quality": float(self.visual_quality),
+            "wave_skeleton": dict(self.wave_skeleton),
+            "pattern_shape_review": dict(self.pattern_shape_review),
         }
 
 
@@ -102,6 +115,8 @@ def empty_scale(scale: str, reason: str) -> ScaleAnalysis:
         pattern_candidates=[],
         wave_structure={},
         visual_quality=0.0,
+        wave_skeleton=empty_skeleton(scale, reason).to_dict(),
+        pattern_shape_review={},
     )
 
 
@@ -206,6 +221,9 @@ def _analyse_scale(
         n_patterns=len(pattern_candidates),
         n_trendlines=len(trendline_candidates),
     )
+    # Observation-only: encode a wave skeleton + per-scale shape review.
+    skel = encode_wave_skeleton(sub, scale=scale, atr_value=atr_value)
+    per_scale_review = build_pattern_shape_review({scale: skel})
     return ScaleAnalysis(
         scale=scale,
         bars_required=bars_required,
@@ -218,6 +236,8 @@ def _analyse_scale(
         pattern_candidates=pattern_candidates,
         wave_structure=wave_structure,
         visual_quality=quality,
+        wave_skeleton=skel.to_dict(),
+        pattern_shape_review=per_scale_review.to_dict(),
     )
 
 
@@ -229,16 +249,43 @@ def reconstruct_chart_multi_scale(
 ) -> dict:
     """Run the four-scale reconstruction and return a dict mapping
     scale name → ScaleAnalysis.to_dict(). Always includes all 4 scales
-    (unavailable ones report `unavailable_reason`)."""
+    (unavailable ones report `unavailable_reason`).
+
+    The result also includes a cross-scale `wave_shape_review` block
+    (observation-only, schema = pattern_shape_review_v1) that
+    aggregates per-scale shape matches into one human-readable summary
+    suitable for the visual_audit waveform-review section.
+    """
     out: dict = {"schema_version": SCHEMA_VERSION, "scales": {}}
     if df is None or atr_value is None or atr_value <= 0 or last_close is None:
         for sc in SCALES.keys():
             out["scales"][sc] = empty_scale(sc, "missing_inputs").to_dict()
-        return out
-    for sc in SCALES.keys():
-        out["scales"][sc] = _analyse_scale(
-            scale=sc, df=df, atr_value=atr_value, last_close=last_close,
+        out["wave_shape_review"] = build_pattern_shape_review(
+            {sc: None for sc in SCALES.keys()}
         ).to_dict()
+        return out
+    skeletons_by_scale: dict[str, WaveSkeleton | None] = {}
+    for sc in SCALES.keys():
+        analysis = _analyse_scale(
+            scale=sc, df=df, atr_value=atr_value, last_close=last_close,
+        )
+        out["scales"][sc] = analysis.to_dict()
+        if analysis.available:
+            # Reuse the per-scale skeleton dict to rebuild a WaveSkeleton-
+            # like object for cross-scale review. We re-encode for clarity
+            # so the same atr_value + visible window is honoured.
+            bars_required = SCALES[sc]
+            sub = df.iloc[-bars_required:] if len(df) >= bars_required else None
+            if sub is not None:
+                skel = encode_wave_skeleton(sub, scale=sc, atr_value=atr_value)
+                skeletons_by_scale[sc] = skel
+            else:
+                skeletons_by_scale[sc] = None
+        else:
+            skeletons_by_scale[sc] = None
+    out["wave_shape_review"] = build_pattern_shape_review(
+        skeletons_by_scale
+    ).to_dict()
     return out
 
 

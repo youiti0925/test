@@ -57,6 +57,9 @@ def test_payload_emits_required_top_level_keys():
         "profile", "mode", "action",
         "best_setup", "reconstruction_quality",
         "overlays", "checklist_panels", "royal_road_decision_v2",
+        # waveform shape audit additions (observation-only, NOT used
+        # by royal_road_decision_v2 final action logic).
+        "wave_shape_review", "entry_summary",
     }
     assert set(p.keys()) == expected
     assert p["schema_version"] == SCHEMA_VERSION
@@ -1335,3 +1338,76 @@ def test_smoke_generator_single_file_cli_writes_mobile_html(tmp_path: Path):
     assert "Grand Confluence Checklist" in body
     assert "demo_fixture_not_backtest_result" in body
     assert "current_runtime vs royal_road_v2" in body
+
+
+# ---------------------------------------------------------------------------
+# Waveform shape review additions (observation-only)
+# ---------------------------------------------------------------------------
+
+
+def test_payload_includes_wave_shape_review_observation_only():
+    """The audit payload exposes the cross-scale wave_shape_review
+    block surfaced from chart_reconstruction.reconstruct_chart_multi_scale.
+    """
+    df = _ohlcv()
+    res = run_engine_backtest(
+        df, "EURUSD=X", interval="1h", warmup=60,
+        decision_profile="royal_road_decision_v2",
+    )
+    tr = res.decision_traces[100]
+    p = build_visual_audit_payload(trace=tr, df=df)
+    assert p is not None
+    assert "wave_shape_review" in p
+    review = p["wave_shape_review"]
+    # may be empty for short histories, but must be a dict
+    assert isinstance(review, dict)
+    if review:
+        assert review.get("schema_version") == "pattern_shape_review_v1"
+        notes = review.get("audit_notes") or []
+        # Audit notes flag heuristic / observation-only nature
+        joined = " ".join(notes).lower()
+        assert (
+            "heuristic" in joined or "observation" in joined
+        ), f"expected unvalidated/observation-only note in {notes}"
+
+
+def test_payload_includes_entry_summary_for_v2_trace():
+    df = _ohlcv()
+    res = run_engine_backtest(
+        df, "EURUSD=X", interval="1h", warmup=60,
+        decision_profile="royal_road_decision_v2",
+    )
+    tr = res.decision_traces[100]
+    p = build_visual_audit_payload(trace=tr, df=df)
+    assert p is not None
+    es = p["entry_summary"]
+    assert es is not None
+    assert "action" in es
+    assert "entry_price_source" in es
+    assert "rr" in es
+    if es["action"] == "HOLD":
+        assert es["entry_price"] is None
+        assert es["entry_price_source"] == "no_entry_hold"
+    elif es["action"] in ("BUY", "SELL"):
+        assert es["entry_price_source"] in {
+            "parent_bar_close_fallback",
+            "parent_bar_close_unavailable",
+        }
+
+
+def test_mobile_html_includes_waveform_review_section(tmp_path: Path):
+    from src.fx.visual_audit import render_visual_audit_mobile_single_file
+    df, res = _v2_run()
+    out = tmp_path / "wave.html"
+    render_visual_audit_mobile_single_file(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df},
+        out_path=out, max_cases=2,
+    )
+    body = out.read_text()
+    # The "波形レビュー" Japanese label must appear (test is set tight to
+    # catch regressions if the section is renamed).
+    assert "波形レビュー" in body
+    assert "結論カード" in body
+    assert "wave-shape-review" in body
+    assert "entry-summary-card" in body

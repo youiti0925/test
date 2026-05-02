@@ -818,6 +818,93 @@ def _current_runtime_indicator_votes_panel(*, tc: dict | None) -> dict:
     }
 
 
+def _build_entry_summary(
+    *,
+    action: str | None,
+    last_close: float | None,
+    stop_plan: dict | None,
+) -> dict:
+    """Build a compact entry / stop / tp / RR summary for the audit.
+
+    For BUY / SELL: entry_price falls back to the visible window's last
+    close (parent_bar close) since the v2 payload does not store an
+    explicit entry price. The fallback is signalled via
+    `entry_price_source`.
+
+    For HOLD / unknown actions: entry_price is None, RR is None, and
+    `entry_price_source` is "no_entry_hold".
+
+    RR is computed only when entry / stop / take_profit are all
+    available and stop is on the correct side of entry.
+    """
+    sp = stop_plan or {}
+    if action not in ("BUY", "SELL"):
+        return {
+            "action": action,
+            "entry_price": None,
+            "entry_price_source": "no_entry_hold",
+            "stop_price": sp.get("stop_price"),
+            "structure_stop_price": sp.get("structure_stop_price"),
+            "atr_stop_price": sp.get("atr_stop_price"),
+            "take_profit_price": sp.get("take_profit_price"),
+            "risk": None,
+            "reward": None,
+            "rr": None,
+            "rr_unavailable_reason": "no_entry_hold",
+        }
+    if last_close is None:
+        return {
+            "action": action,
+            "entry_price": None,
+            "entry_price_source": "parent_bar_close_unavailable",
+            "stop_price": sp.get("stop_price"),
+            "structure_stop_price": sp.get("structure_stop_price"),
+            "atr_stop_price": sp.get("atr_stop_price"),
+            "take_profit_price": sp.get("take_profit_price"),
+            "risk": None, "reward": None, "rr": None,
+            "rr_unavailable_reason": "missing_entry_price",
+        }
+    entry = float(last_close)
+    stop = sp.get("stop_price")
+    tp = sp.get("take_profit_price")
+    risk: float | None = None
+    reward: float | None = None
+    rr: float | None = None
+    rr_reason: str | None = None
+    if stop is None or tp is None:
+        rr_reason = "missing_stop_or_tp"
+    else:
+        if action == "BUY":
+            risk_val = entry - float(stop)
+            reward_val = float(tp) - entry
+            if risk_val <= 0 or reward_val <= 0:
+                rr_reason = "stop_or_tp_on_wrong_side"
+            else:
+                risk, reward = risk_val, reward_val
+                rr = reward_val / risk_val
+        else:  # SELL
+            risk_val = float(stop) - entry
+            reward_val = entry - float(tp)
+            if risk_val <= 0 or reward_val <= 0:
+                rr_reason = "stop_or_tp_on_wrong_side"
+            else:
+                risk, reward = risk_val, reward_val
+                rr = reward_val / risk_val
+    return {
+        "action": action,
+        "entry_price": entry,
+        "entry_price_source": "parent_bar_close_fallback",
+        "stop_price": sp.get("stop_price"),
+        "structure_stop_price": sp.get("structure_stop_price"),
+        "atr_stop_price": sp.get("atr_stop_price"),
+        "take_profit_price": sp.get("take_profit_price"),
+        "risk": risk,
+        "reward": reward,
+        "rr": rr,
+        "rr_unavailable_reason": rr_reason,
+    }
+
+
 def _build_checklist_panels(*, trace: Any, v2: dict) -> dict:
     """Aggregate the 7 PDF-derived royal-road checklist panels."""
     tc = _trace_technical_confluence(trace)
@@ -887,6 +974,19 @@ def build_visual_audit_payload(
     stop_plan = v2.get("structure_stop_plan") or {}
     rq = v2.get("reconstruction_quality") or {}
     best = v2.get("best_setup")
+    multi_scale = v2.get("multi_scale_chart") or {}
+    wave_shape_review_dict = multi_scale.get("wave_shape_review") or {}
+    last_close: float | None = None
+    if n_visible > 0:
+        try:
+            last_close = float(visible["close"].iloc[-1])
+        except Exception:  # noqa: BLE001
+            last_close = None
+    entry_summary = _build_entry_summary(
+        action=v2.get("action"),
+        last_close=last_close,
+        stop_plan=stop_plan,
+    )
 
     # Per-overlay drawing coordinates that downstream renderers can
     # consume directly. All times are ISO strings; all prices are
@@ -1017,6 +1117,10 @@ def build_visual_audit_payload(
         "reconstruction_quality": rq,
         "overlays": overlays,
         "checklist_panels": checklist_panels,
+        # Observation-only waveform shape review (cross-scale).
+        # NOT consumed by royal_road_decision_v2; for human audit only.
+        "wave_shape_review": wave_shape_review_dict,
+        "entry_summary": entry_summary,
         # Full v2 payload preserved so the audit is self-contained
         # (no need to read the JSONL trace separately).
         "royal_road_decision_v2": v2,
@@ -2012,6 +2116,24 @@ img.thumb { width: 220px; height: auto; border: 1px solid #ddd; }
   .demo-banner { font-size: 13px; }
   .case-section { margin-bottom: 24px; }
 }
+
+/* observation-only waveform shape review section */
+.wave-shape-review { background: #f7f9ff; border: 1px solid #c5d2eb;
+  border-radius: 4px; padding: 8px 12px; margin: 8px 0; }
+.wave-shape-review .wave-table { font-size: 12px; }
+.wave-shape-review .wave-best-pattern { background: #fff; padding: 6px 8px;
+  border-left: 3px solid #2c5fa1; margin-top: 6px; }
+.wave-shape-review .audit-notes { color: #777; font-size: 11px; }
+.pattern-dissection { background: #fffaf0; border: 1px solid #f0d49a;
+  border-radius: 4px; padding: 6px 10px; margin: 6px 0; }
+.pattern-dissection .dissection-table { font-size: 12px; }
+.entry-summary-card { background: #f0f8f0; border: 2px solid #6fb56f;
+  border-radius: 6px; padding: 10px 14px; margin: 8px 0; }
+.entry-summary-card .entry-table { font-size: 13px; max-width: 360px; }
+.entry-summary-card .small { color: #555; font-size: 11px; margin: 2px 0; }
+.hold-waveform-note { background: #fff5e6; border: 1px solid #d8a662;
+  border-radius: 4px; padding: 8px 12px; margin: 8px 0; }
+.hold-waveform-note h3 { margin-top: 6px; font-size: 13px; }
 """
 
 
@@ -2671,6 +2793,203 @@ def render_visual_audit_report(
 MOBILE_SCHEMA_VERSION: Final[str] = "visual_audit_mobile_v1"
 
 
+def _render_wave_shape_review_html(review: dict | None) -> str:
+    """Render the cross-scale waveform shape review block (Japanese)."""
+    if not review or not review.get("per_scale"):
+        return (
+            "<div class='wave-shape-review'>"
+            "<p class='placeholder'>波形情報不足 (waveform data unavailable)</p>"
+            "</div>"
+        )
+    per_scale = review.get("per_scale") or {}
+    rows: list[str] = []
+    for scale, info in per_scale.items():
+        if not info.get("available"):
+            rows.append(
+                f"<tr><td>{_html_escape(scale)}</td>"
+                f"<td colspan='3'>履歴不足</td></tr>"
+            )
+            continue
+        score = info.get("shape_score")
+        score_str = (
+            f"{score:.2f}" if isinstance(score, (int, float)) else "—"
+        )
+        rows.append(
+            f"<tr><td>{_html_escape(scale)}</td>"
+            f"<td>{_html_escape(info.get('human_label') or '')}</td>"
+            f"<td>{_html_escape(info.get('status') or '')}</td>"
+            f"<td>{_html_escape(score_str)}</td></tr>"
+        )
+    best = review.get("best_pattern") or {}
+    best_html = ""
+    if best:
+        best_html = (
+            "<div class='wave-best-pattern'>"
+            f"<p><b>best pattern:</b> "
+            f"{_html_escape(best.get('human_label') or best.get('kind') or '')}"
+            f" / status={_html_escape(best.get('status') or '')}"
+            f" / shape_score={float(best.get('shape_score') or 0.0):.2f}"
+            f" / 方向={_html_escape(best.get('side_bias') or '')}"
+            "</p>"
+            f"<p>{_html_escape(best.get('human_explanation') or '')}</p>"
+            "</div>"
+        )
+    notes = review.get("audit_notes") or []
+    notes_html = (
+        "<p class='audit-notes'>"
+        + " / ".join(_html_escape(n) for n in notes)
+        + "</p>"
+    ) if notes else ""
+    return (
+        "<div class='wave-shape-review'>"
+        f"<p>{_html_escape(review.get('overall_summary_ja') or '')}</p>"
+        "<table class='wave-table'>"
+        "<tr><th>スケール</th><th>形</th><th>状態</th><th>shape_score</th></tr>"
+        + "".join(rows) + "</table>"
+        + best_html
+        + f"<p><b>エントリー解釈:</b> {_html_escape(review.get('entry_interpretation_ja') or '')}</p>"
+        + f"<p><b>リスク注意:</b> {_html_escape(review.get('risk_note_ja') or '')}</p>"
+        + notes_html
+        + "</div>"
+    )
+
+
+def _render_pattern_dissection_html(review: dict | None) -> str:
+    """If a best_pattern is present, render its labelled parts (B1, B2,
+    NL, BR, ...) as a small definition list. Returns "" when no best
+    pattern is available or matched_parts is empty.
+    """
+    if not review:
+        return ""
+    best = review.get("best_pattern") or {}
+    if not best:
+        return ""
+    parts = best.get("matched_parts") or {}
+    if not parts:
+        return ""
+    label_map = {
+        "first_bottom": "B1 (1回目の底)",
+        "second_bottom": "B2 (2回目の底)",
+        "first_top": "P1 (1回目の天井)",
+        "second_top": "P2 (2回目の天井)",
+        "neckline_peak": "NL (ネックライン)",
+        "neckline_trough": "NL (ネックライン)",
+        "left_shoulder": "LS (左肩)",
+        "right_shoulder": "RS (右肩)",
+        "head": "H (頭)",
+        "neckline_left_peak": "NL (左ピーク)",
+        "neckline_right_peak": "NL (右ピーク)",
+        "neckline_left_trough": "NL (左谷)",
+        "neckline_right_trough": "NL (右谷)",
+        "breakout": "BR (ブレイク)",
+        "prior_high": "事前の高値",
+        "prior_low": "事前の安値",
+        "impulse_start": "ポール始点",
+        "impulse_end": "ポール終点",
+        "consolidation_high": "持ち合い高値",
+        "consolidation_low": "持ち合い安値",
+        "apex": "収束点",
+    }
+    rows = "".join(
+        f"<tr><td>{_html_escape(label_map.get(name, name))}</td>"
+        f"<td>{('—' if idx is None else int(idx))}</td></tr>"
+        for name, idx in parts.items()
+    )
+    family_label = best.get("kind", "")
+    family_marker_map = {
+        "double_bottom": "DB1",
+        "double_top": "DT1",
+        "head_and_shoulders": "HS1",
+        "inverse_head_and_shoulders": "IHS1",
+        "bullish_flag": "FL1",
+        "bearish_flag": "FL1",
+        "rising_wedge": "WG1",
+        "falling_wedge": "WG1",
+        "ascending_triangle": "TR1",
+        "descending_triangle": "TR1",
+        "symmetric_triangle": "TR1",
+    }
+    marker = family_marker_map.get(family_label, family_label)
+    return (
+        "<div class='pattern-dissection'>"
+        f"<p><b>{_html_escape(marker)}</b> = "
+        f"{_html_escape(best.get('human_label') or family_label)}</p>"
+        "<table class='dissection-table'>"
+        "<tr><th>部位</th><th>波形 pivot index</th></tr>"
+        + rows + "</table></div>"
+    )
+
+
+def _render_entry_summary_html(es: dict | None) -> str:
+    """Render entry / stop / tp / RR conclusion card (Japanese)."""
+    if not es:
+        return ""
+    action = es.get("action") or "?"
+    e = es.get("entry_price")
+    s = es.get("stop_price")
+    tp = es.get("take_profit_price")
+    rr = es.get("rr")
+
+    def _fmt(v):
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):.5f}"
+        except Exception:  # noqa: BLE001
+            return _html_escape(str(v))
+
+    rr_str = f"{rr:.2f}" if isinstance(rr, (int, float)) else "計算不可"
+    rr_reason = es.get("rr_unavailable_reason")
+    rr_reason_html = (
+        f"<p class='small'>RR算出不可理由: {_html_escape(rr_reason)}</p>"
+        if rr is None and rr_reason else ""
+    )
+    src = es.get("entry_price_source") or ""
+    return (
+        "<div class='entry-summary-card'>"
+        f"<h3>結論カード (entry / stop / RR)</h3>"
+        f"<p>action: <b>{_html_escape(action)}</b></p>"
+        f"<table class='entry-table'>"
+        f"<tr><td>entry_price</td><td>{_fmt(e)}</td></tr>"
+        f"<tr><td>structure_stop</td><td>{_fmt(es.get('structure_stop_price'))}</td></tr>"
+        f"<tr><td>atr_stop</td><td>{_fmt(es.get('atr_stop_price'))}</td></tr>"
+        f"<tr><td>selected_stop</td><td>{_fmt(s)}</td></tr>"
+        f"<tr><td>take_profit</td><td>{_fmt(tp)}</td></tr>"
+        f"<tr><td>RR</td><td>{rr_str}</td></tr>"
+        "</table>"
+        f"<p class='small'>entry_price_source: {_html_escape(src)}</p>"
+        + rr_reason_html
+        + "</div>"
+    )
+
+
+def _hold_waveform_extra_html(
+    *, action: str | None, review: dict | None,
+) -> str:
+    """When action is HOLD, surface what shape-only readings would
+    have suggested vs what royal v2 actually requires.
+    """
+    if action != "HOLD" or not review:
+        return ""
+    best = review.get("best_pattern") or {}
+    if not best:
+        return (
+            "<div class='hold-waveform-note'>"
+            "<p>波形情報不足 (waveform data unavailable)</p>"
+            "</div>"
+        )
+    return (
+        "<div class='hold-waveform-note'>"
+        "<h3>波形上は入れそうに見える点</h3>"
+        f"<ul><li>{_html_escape(best.get('human_label') or '')} "
+        f"({_html_escape(best.get('status') or '')})</li>"
+        f"<li>{_html_escape(best.get('human_explanation') or '')}</li></ul>"
+        "<h3>それでも王道v2が見送った理由</h3>"
+        f"<p>{_html_escape(review.get('risk_note_ja') or '')}</p>"
+        "</div>"
+    )
+
+
 def _mobile_case_section_html(
     *,
     section_id: str,
@@ -2758,11 +3077,30 @@ def _mobile_case_section_html(
         "compared_to_current_runtime": cmp_v1,
     }
 
+    wave_review = payload.get("wave_shape_review") or {}
+    entry_summary = payload.get("entry_summary") or {}
+    wave_review_html = _render_wave_shape_review_html(wave_review)
+    pattern_dissection_html = _render_pattern_dissection_html(wave_review)
+    entry_summary_html = _render_entry_summary_html(entry_summary)
+    hold_waveform_html = _hold_waveform_extra_html(
+        action=v2.get("action"), review=wave_review,
+    )
+
     return (
         f"<section class='case-section' id='{_html_escape(section_id)}'>"
         f"<h2>{title}</h2>"
         "<h3>chart</h3>"
         + chart_html
+        + "<h3>結論カード (entry / stop / RR)</h3>"
+        + entry_summary_html
+        + "<h3>波形レビュー (waveform shape review — observation only)</h3>"
+        + wave_review_html
+        + (
+            "<h3>パターン解剖 (pattern parts)</h3>"
+            + pattern_dissection_html
+            if pattern_dissection_html else ""
+        )
+        + (hold_waveform_html if hold_waveform_html else "")
         + "<h3>Royal Road Checklist Panels</h3>"
         + panels_html
         + "<h3>current_runtime vs royal_road_v2</h3>"

@@ -66,8 +66,15 @@ def test_each_scale_emits_required_keys():
             "unavailable_reason", "swing_points",
             "level_zone_candidates", "trendline_candidates",
             "pattern_candidates", "wave_structure", "visual_quality",
+            # waveform / shape additions (observation-only)
+            "wave_skeleton", "pattern_shape_review",
         ):
             assert key in s, f"scale {sc} missing key {key}"
+    assert "wave_shape_review" in out, "cross-scale wave_shape_review missing"
+    assert (
+        out["wave_shape_review"]["schema_version"]
+        == "pattern_shape_review_v1"
+    )
 
 
 def test_no_data_returns_all_unavailable():
@@ -88,3 +95,27 @@ def test_visual_quality_in_unit_interval():
     for sc in ("micro", "short", "medium", "long"):
         v = out["scales"][sc]["visual_quality"]
         assert 0.0 <= v <= 1.0
+
+
+def test_wave_skeleton_attached_per_scale():
+    df = _df(1100)
+    atr_v = float(compute_atr(df, 14).iloc[-1])
+    out = reconstruct_chart_multi_scale(
+        df, atr_value=atr_v, last_close=float(df["close"].iloc[-1]),
+    )
+    for sc in ("short", "medium", "long"):
+        skel = out["scales"][sc]["wave_skeleton"]
+        assert skel["schema_version"] == "wave_skeleton_v1"
+        assert skel["scale"] == sc
+        # bars_used positive when scale is available
+        assert skel["bars_used"] > 0
+
+
+def test_no_data_includes_empty_wave_shape_review():
+    out = reconstruct_chart_multi_scale(
+        None, atr_value=None, last_close=None,
+    )
+    assert "wave_shape_review" in out
+    review = out["wave_shape_review"]
+    assert review["schema_version"] == "pattern_shape_review_v1"
+    assert review["best_pattern"] is None
