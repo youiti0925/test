@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Royal Road Visual Audit Mobile Preview</title>
+  <style>
+    body {
+      font-family: -apple-system, sans-serif;
+      margin: 12px;
+      color: #222;
+      line-height: 1.5;
+    }
+    h1 { font-size: 20px; }
+    .note {
+      background: #fff8e1;
+      border: 1px solid #f9a825;
+      padding: 8px 12px;
+      border-radius: 4px;
+      font-size: 14px;
+      margin: 8px 0 16px;
+    }
+    ul { padding-left: 20px; }
+    li { margin: 8px 0; font-size: 16px; }
+    a { color: #1565c0; text-decoration: none; }
+    a:hover, a:active { text-decoration: underline; }
+    .desc { color: #555; font-size: 13px; margin-top: 2px; }
+    @media (max-width: 800px) {
+      body { margin: 8px; }
+      h1 { font-size: 18px; }
+      li { font-size: 15px; }
+    }
+  </style>
+</head>
+<body>
+  <h1>Royal Road Visual Audit Mobile Preview</h1>
+  <p class="note">
+    UI verification only. The two demo files below are handcrafted
+    fixtures (<code>demo_fixture_not_backtest_result</code>) and are
+    NOT real backtest output. The normal report is generated from a
+    deterministic synthetic OHLC sample (no live data).
+  </p>
+  <ul>
+    <li>
+      <a href="./structure_stop_anchor_demo_mobile.html">
+        Structure stop anchor demo
+      </a>
+      <div class="desc">
+        BUY case where the structure stop is anchored to a selected
+        SUPPORT zone (sr_zone:support).
+      </div>
+    </li>
+    <li>
+      <a href="./current_vs_royal_diff_demo_mobile.html">
+        Current vs Royal diff demo
+      </a>
+      <div class="desc">
+        current_runtime=BUY but royal_v2=HOLD
+        (difference_type=current_buy_royal_hold).
+      </div>
+    </li>
+    <li>
+      <a href="./normal_v2_report_mobile.html">
+        Normal v2 report sample
+      </a>
+      <div class="desc">
+        First 5 cases from a deterministic synthetic backtest with
+        royal_road_decision_v2 profile.
+      </div>
+    </li>
+  </ul>
+</body>
+</html>
