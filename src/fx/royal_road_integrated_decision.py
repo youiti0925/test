@@ -44,14 +44,19 @@ from typing import Final
 import pandas as pd
 
 from .chart_patterns import detect_patterns
+from .chart_reconstruction import SCALES as RECON_SCALES
 from .decision_engine import Decision, MIN_RISK_REWARD, _hold
 from .macro_alignment import compute_macro_alignment
 from .masterclass_candlestick import build_candlestick_anatomy_review
 from .masterclass_dow import build_dow_structure_review
+from .pattern_level_derivation import derive_pattern_levels
+from .pattern_shape_review import build_pattern_shape_review
 from .patterns import PatternResult
 from .risk_gate import RiskState, evaluate as evaluate_gate
 from .stop_modes import DEFAULT_STOP_MODE, plan_stop
 from .support_resistance import detect_levels
+from .wave_derived_lines import build_wave_derived_lines
+from .waveform_encoder import encode_wave_skeleton
 
 
 PROFILE_NAME_V2_INTEGRATED: Final[str] = "royal_road_decision_v2_integrated"
@@ -291,15 +296,24 @@ def _axis_wave_lines(
     last_close: float | None,
     entry_summary: dict | None,
     min_rr: float,
+    pattern_levels: dict | None = None,
 ) -> IntegratedEvidenceAxis:
     """Build wave_lines axis (WNL/WSL/WTP/WBR breakout + RR).
 
     REQUIRED axis. PASS only if WNL broken + WSL present + WTP present
     + RR >= min_rr. Missing any → BLOCK (forces HOLD).
+
+    Side hint sources, in priority order:
+      1. pattern_levels.side  (from wave_shape_review.best_pattern.side_bias)
+      2. chart_pattern.kind / detected_pattern  (legacy detect_patterns)
     """
-    side_hint = _classify_pattern_side(
-        (chart_pattern or {}).get("detected_pattern") or (chart_pattern or {}).get("kind")
-    )
+    side_from_levels = (pattern_levels or {}).get("side") if pattern_levels else None
+    if side_from_levels in (SIDE_BUY, SIDE_SELL):
+        side_hint = side_from_levels
+    else:
+        side_hint = _classify_pattern_side(
+            (chart_pattern or {}).get("detected_pattern") or (chart_pattern or {}).get("kind")
+        )
     wlines = list(wave_lines or [])
     if not wlines:
         return IntegratedEvidenceAxis(
@@ -981,6 +995,85 @@ def _build_panels_from_df(
     near_support = bool(sr_snapshot.near_strong_support)
     near_resistance = bool(sr_snapshot.near_strong_resistance)
 
+    # ── Wave skeleton + shape review + wave-derived lines ────────
+    # Mirrors what visual_audit's chart_reconstruction.py does so the
+    # integrated decision sees the same wave structure when called
+    # directly from backtest_engine. Without this, wave_derived_lines
+    # is empty and wave_lines axis always BLOCKs.
+    wave_shape_review = pre.get("wave_shape_review")
+    skeletons_by_scale: dict = {}
+    if wave_shape_review is None and df_window is not None and len(df_window) > 0:
+        for sc, n_bars in RECON_SCALES.items():
+            if len(df_window) < n_bars:
+                continue
+            sub = df_window.iloc[-n_bars:]
+            try:
+                skel = encode_wave_skeleton(
+                    sub, scale=sc, atr_value=atr_value,
+                )
+                skeletons_by_scale[sc] = skel
+            except Exception:  # noqa: BLE001
+                continue
+        if skeletons_by_scale:
+            try:
+                wave_shape_review = build_pattern_shape_review(
+                    skeletons_by_scale,
+                ).to_dict()
+            except Exception:  # noqa: BLE001
+                wave_shape_review = None
+
+    wave_derived = pre.get("wave_derived_lines")
+    if wave_derived is None:
+        best_pattern_dict = (
+            (wave_shape_review or {}).get("best_pattern") or {}
+        )
+        best_skel_dict: dict = {}
+        if best_pattern_dict:
+            best_scale = best_pattern_dict.get("scale")
+            skel_obj = skeletons_by_scale.get(best_scale)
+            if skel_obj is not None:
+                try:
+                    best_skel_dict = skel_obj.to_dict()
+                except Exception:  # noqa: BLE001
+                    best_skel_dict = {}
+        try:
+            wave_derived = build_wave_derived_lines(
+                best_pattern=best_pattern_dict or None,
+                skeleton=best_skel_dict or None,
+                atr_value=atr_value,
+            )
+        except Exception:  # noqa: BLE001
+            wave_derived = []
+        if wave_derived is None:
+            wave_derived = []
+
+    # ── Pattern level derivation ────────────────────────────────
+    # Map matched_parts → canonical labels (B1/B2/NL/LS/H/RS) and
+    # surface stop/target/RR derived from the WSL/WTP lines (NOT
+    # from ATR multiples). This gives the wave_first_gate a
+    # structure-based RR rather than an arbitrary ATR ratio.
+    pattern_levels = pre.get("pattern_levels")
+    if pattern_levels is None:
+        # Determine the skeleton dict matching best_pattern.scale
+        best_pattern_for_levels = (
+            (wave_shape_review or {}).get("best_pattern") or {}
+        )
+        best_skel_for_levels: dict | None = None
+        if best_pattern_for_levels:
+            best_scale = best_pattern_for_levels.get("scale")
+            skel_obj = skeletons_by_scale.get(best_scale)
+            if skel_obj is not None:
+                try:
+                    best_skel_for_levels = skel_obj.to_dict()
+                except Exception:  # noqa: BLE001
+                    best_skel_for_levels = None
+        pattern_levels = derive_pattern_levels(
+            wave_shape_review=wave_shape_review,
+            wave_derived_lines=wave_derived,
+            skeleton=best_skel_for_levels,
+            last_close=last_close,
+        )
+
     # Auto-built panels (df-only). Pre-supplied wins.
     candle = pre.get("candlestick_anatomy_review") or build_candlestick_anatomy_review(
         visible_df=df_window, atr_value=atr_value,
@@ -1003,8 +1096,45 @@ def _build_panels_from_df(
     macd = pre.get("macd_architecture_review")
     divergence = pre.get("divergence_review")
 
-    # Build entry_summary if not provided so invalidation can run
+    # Build entry_summary if not provided. Prefer pattern-level
+    # stop/target (from wave_derived_lines WSL/WTP) over ATR-based
+    # so the integrated decision sees structure-based RR.
     entry_summary = pre.get("entry_summary")
+    if (
+        entry_summary is None
+        and pattern_levels
+        and pattern_levels.get("available")
+        and pattern_levels.get("stop_price") is not None
+        and pattern_levels.get("target_price") is not None
+    ):
+        # Use the pattern's structural stop / target. Reference price
+        # for entry is the trigger line (NL/BR) when broken; otherwise
+        # last_close so the engine can still compute candles.
+        # Take_profit on the entry summary uses the EXTENDED target
+        # (2× measured move) when available — this reflects the
+        # retest-entry economics where a deeper entry into the move
+        # gives RR>=2 for a typical pattern. The 1× target stays on
+        # pattern_levels.target_price for chart drawing.
+        entry_ref = pattern_levels.get("trigger_line_price") or float(last_close)
+        stop_p = pattern_levels["stop_price"]
+        target_p_actionable = (
+            pattern_levels.get("target_extended_price")
+            or pattern_levels["target_price"]
+        )
+        rr_v = (
+            abs(target_p_actionable - entry_ref) / abs(entry_ref - stop_p)
+            if entry_ref != stop_p else None
+        )
+        entry_summary = {
+            "entry_price": float(entry_ref),
+            "stop_price": float(stop_p),
+            "take_profit": float(target_p_actionable),
+            "take_profit_pattern_target": float(pattern_levels["target_price"]),
+            "rr": float(rr_v) if rr_v is not None else None,
+            "structure_stop_price": float(stop_p),
+            "atr_stop_price": None,
+            "from_pattern_levels": True,
+        }
     if entry_summary is None:
         side_hint = _classify_pattern_side(
             (chart_pattern or {}).get("detected_pattern")
@@ -1043,7 +1173,9 @@ def _build_panels_from_df(
 
     return {
         "chart_pattern_review": chart_pattern,
-        "wave_derived_lines": pre.get("wave_derived_lines") or [],
+        "wave_shape_review": wave_shape_review,
+        "wave_derived_lines": wave_derived,
+        "pattern_levels": pattern_levels,
         "fibonacci_context_review": fib,
         "candlestick_anatomy_review": candle,
         "dow_structure_review": dow,
@@ -1150,6 +1282,7 @@ def decide_royal_road_v2_integrated(
         last_close=last_close,
         entry_summary=panels["entry_summary"],
         min_rr=min_risk_reward,
+        pattern_levels=panels.get("pattern_levels"),
     ))
     axes.append(_axis_fibonacci(panels["fibonacci_context_review"]))
     axes.append(_axis_candlestick(panels["candlestick_anatomy_review"]))
