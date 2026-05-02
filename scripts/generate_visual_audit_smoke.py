@@ -376,11 +376,14 @@ def main() -> int:
         choices=("normal_v2_report",
                  "structure_stop_anchor_demo",
                  "current_vs_royal_diff_demo",
+                 "double_bottom_shape_demo",
+                 "double_top_shape_demo",
+                 "head_and_shoulders_shape_demo",
+                 "inverse_head_and_shoulders_shape_demo",
                  "all"),
         default="all",
-        help="Which sample mode to generate. 'all' runs all three "
-             "into <out>/normal_v2_report, <out>/structure_stop_anchor_demo, "
-             "<out>/current_vs_royal_diff_demo subdirectories.",
+        help="Which sample mode to generate. 'all' runs every demo "
+             "into <out>/<mode> subdirectories.",
     )
     p.add_argument("--max-cases", type=int, default=25)
     p.add_argument(
@@ -448,6 +451,15 @@ def main() -> int:
                     out_path=mobile_dir / "current_vs_royal_diff_demo_mobile.html",
                 ),
             ))
+        # Pattern-shape deterministic demos (DB / DT / HS / IHS).
+        # These are mobile-only — no per-mode multi-file directory.
+        for demo_mode, builder in _PATTERN_SHAPE_DEMO_BUILDERS.items():
+            if args.mode in (demo_mode, "all"):
+                fname = f"{demo_mode}_mobile.html"
+                mobile_runs.append((
+                    fname,
+                    builder(out_path=mobile_dir / fname),
+                ))
         print("=" * 60)
         print(f"mobile single-file output dir: {mobile_dir}")
         for fname, r in mobile_runs:
@@ -570,6 +582,298 @@ def _build_current_diff_demo_mobile(*, out_path: Path) -> dict:
             "only; not a backtest result."
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Pattern-shape deterministic demos (DB / DT / HS / IHS)
+#
+# These produce synthetic OHLC matching one of the four named reversal
+# patterns and render a single mobile HTML each. They are FIXTURES for
+# UI verification of the pattern-dissection chart (DB1/B1/B2/NL/BR/WSL/WTP
+# etc.); they are NOT backtest results. The orchestrator marks each one
+# with `demo_fixture_not_backtest_result=True`.
+#
+# The synthetic OHLC follows a piecewise-linear price curve close to the
+# corresponding pattern_template, plus light Gaussian noise so the
+# encoder's swing detector has something to bite on.
+# ---------------------------------------------------------------------------
+
+
+def _piecewise_curve(knots: list[tuple[float, float]], n: int) -> "np.ndarray":
+    """Linear interpolation between (x, y) knots over n points in [0,1]."""
+    xs = np.array([k[0] for k in knots], dtype=float)
+    ys = np.array([k[1] for k in knots], dtype=float)
+    target = np.linspace(0.0, 1.0, n)
+    return np.interp(target, xs, ys)
+
+
+def _ohlc_from_curve(
+    base: "np.ndarray", *, seed: int = 11, noise: float = 0.005,
+    base_price: float = 1.10, scale: float = 0.05,
+) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    n = len(base)
+    idx = pd.date_range("2025-01-01", periods=n, freq="1h", tz="UTC")
+    close = base_price + (base + rng.normal(0.0, noise, size=n)) * scale
+    return pd.DataFrame({
+        "open": close - 0.0001,
+        "high": close + 0.0008,
+        "low": close - 0.0008,
+        "close": close,
+        "volume": [1000] * n,
+    }, index=idx)
+
+
+def _double_bottom_ohlcv(n: int = 320, seed: int = 11) -> pd.DataFrame:
+    """Synthetic OHLC matching the double_bottom template.
+
+    Length is 320 bars so the medium scale (last 300) captures the
+    full pattern. The pattern itself spans the ENTIRE window so the
+    encoder's ZigZag filter sees clean pivots regardless of which
+    scale it runs against.
+    """
+    knots = [
+        (0.00, 0.70), (0.20, 0.05), (0.45, 0.55),
+        (0.70, 0.10), (1.00, 0.90),
+    ]
+    return _ohlc_from_curve(_piecewise_curve(knots, n), seed=seed)
+
+
+def _double_top_ohlcv(n: int = 320, seed: int = 13) -> pd.DataFrame:
+    knots = [
+        (0.00, 0.30), (0.20, 0.95), (0.45, 0.45),
+        (0.70, 0.90), (1.00, 0.10),
+    ]
+    return _ohlc_from_curve(_piecewise_curve(knots, n), seed=seed)
+
+
+def _head_and_shoulders_ohlcv(n: int = 320, seed: int = 17) -> pd.DataFrame:
+    knots = [
+        (0.00, 0.35), (0.15, 0.75), (0.30, 0.55),
+        (0.50, 0.95), (0.70, 0.55), (0.85, 0.75),
+        (1.00, 0.10),
+    ]
+    return _ohlc_from_curve(_piecewise_curve(knots, n), seed=seed)
+
+
+def _inverse_hs_ohlcv(n: int = 320, seed: int = 19) -> pd.DataFrame:
+    knots = [
+        (0.00, 0.65), (0.15, 0.25), (0.30, 0.45),
+        (0.50, 0.05), (0.70, 0.45), (0.85, 0.25),
+        (1.00, 0.90),
+    ]
+    return _ohlc_from_curve(_piecewise_curve(knots, n), seed=seed)
+
+
+def _build_pattern_shape_demo_payload(
+    *,
+    df: pd.DataFrame,
+    parent_idx: int,
+    action: str,
+    force_kind: str | None = None,
+) -> tuple[dict, float, pd.Timestamp]:
+    """Compute multi_scale_chart on the visible window of `df` so the
+    encoder picks up the pattern, then plug that into a v2 payload
+    skeleton so the existing audit pipeline renders it correctly.
+
+    The wave_shape_review and wave_derived_lines are derived inside
+    `build_visual_audit_payload` from this multi_scale_chart, so we
+    don't need to construct them by hand.
+
+    `force_kind`: when set (e.g. "double_bottom"), forces the
+    cross-scale wave_shape_review.best_pattern to that pattern kind.
+    For deterministic demos this guarantees the dissection chart
+    shows the expected pattern even when DB / IHS or DT / HS tie
+    on shape_score. The forced match is computed against the
+    largest-scale skeleton that has pivots, with the matcher restricted
+    to templates of the requested kind.
+    """
+    from src.fx.chart_reconstruction import reconstruct_chart_multi_scale
+    from src.fx.pattern_shape_matcher import match_skeleton
+    from src.fx.pattern_templates import templates_by_kind
+    from src.fx.risk import atr as compute_atr
+    from src.fx.waveform_encoder import encode_wave_skeleton
+
+    visible = df.iloc[: parent_idx + 1]
+    parent_ts = visible.index[-1]
+    last_close = float(visible["close"].iloc[-1])
+    atr_v = float(compute_atr(visible, 14).iloc[-1])
+    multi = reconstruct_chart_multi_scale(
+        visible, atr_value=atr_v, last_close=last_close,
+    )
+    if force_kind:
+        # Override wave_shape_review.best_pattern: pick the largest
+        # scale that has a non-empty skeleton, restrict the matcher
+        # to templates of `force_kind`, and use that match.
+        from src.fx.chart_reconstruction import SCALES as _SCALES
+
+        forced_match = None
+        forced_scale = None
+        for scale_name in ("long", "medium", "short", "micro"):
+            bars_required = _SCALES[scale_name]
+            if len(visible) < bars_required:
+                continue
+            sub = visible.iloc[-bars_required:]
+            skel = encode_wave_skeleton(
+                sub, scale=scale_name, atr_value=atr_v,
+            )
+            if not skel.pivots:
+                continue
+            templates = templates_by_kind(force_kind)
+            if not templates:
+                continue
+            matches = match_skeleton(skel, templates=templates)
+            if matches and matches[0].shape_score >= 0.5:
+                forced_match = matches[0]
+                forced_scale = scale_name
+                break
+        if forced_match is not None:
+            review_dict = multi.get("wave_shape_review") or {}
+            review_dict["best_pattern"] = forced_match.to_dict()
+            # Ensure per_scale entry for forced_scale reflects the
+            # forced match so downstream consumers stay consistent.
+            per = review_dict.get("per_scale") or {}
+            if forced_scale in per:
+                per[forced_scale]["best_shape"] = forced_match.kind
+                per[forced_scale]["shape_score"] = (
+                    float(forced_match.shape_score)
+                )
+                per[forced_scale]["status"] = forced_match.status
+                per[forced_scale]["human_label"] = forced_match.human_label
+                per[forced_scale]["trade_context"] = (
+                    forced_match.human_explanation
+                )
+            review_dict["per_scale"] = per
+            multi["wave_shape_review"] = review_dict
+    v2 = _empty_v2_payload(action=action)
+    v2["multi_scale_chart"] = multi
+    if action in ("BUY", "SELL"):
+        sign = 1.0 if action == "BUY" else -1.0
+        stop_off = max(atr_v * 1.5, 0.001)
+        tp_off = max(atr_v * 3.0, 0.002)
+        v2["structure_stop_plan"] = {
+            "chosen_mode": "structure", "outcome": "structure",
+            "stop_price": last_close - sign * stop_off,
+            "structure_stop_price": last_close - sign * stop_off,
+            "atr_stop_price": last_close - sign * stop_off,
+            "take_profit_price": last_close + sign * tp_off,
+            "rr_realized": 2.0, "invalidation_reason": None,
+        }
+    else:
+        v2["structure_stop_plan"] = None
+    return v2, last_close, parent_ts
+
+
+def _build_pattern_shape_demo_mobile(
+    *,
+    out_path: Path,
+    df: pd.DataFrame,
+    parent_idx: int,
+    action: str,
+    pattern_label: str,
+    banner: str,
+    force_kind: str | None = None,
+) -> dict:
+    sym = "EURUSD=X"
+    v2, close, parent_ts = _build_pattern_shape_demo_payload(
+        df=df, parent_idx=parent_idx, action=action,
+        force_kind=force_kind,
+    )
+    tr = _make_demo_trace(
+        symbol=sym, timestamp=parent_ts, v2_payload=v2,
+        technical_confluence=_empty_tc(close=close),
+        close=close,
+    )
+    return render_visual_audit_mobile_single_file(
+        traces=[tr],
+        df_by_symbol={sym: df},
+        out_path=out_path,
+        max_cases=1,
+        title=f"visual_audit_mobile_v1 — {pattern_label}",
+        demo_fixture_banner=banner,
+    )
+
+
+def _build_double_bottom_shape_demo_mobile(*, out_path: Path) -> dict:
+    return _build_pattern_shape_demo_mobile(
+        out_path=out_path,
+        df=_double_bottom_ohlcv(),
+        parent_idx=319,
+        action="HOLD",
+        pattern_label="double_bottom_shape_demo",
+        force_kind="double_bottom",
+        banner=(
+            "double_bottom_shape_demo — synthetic OHLC matching the "
+            "double_bottom template. Used to verify pattern-dissection "
+            "rendering (DB1 / B1 / B2 / NL / BR / WSL / WTP). Not a "
+            "backtest result."
+        ),
+    )
+
+
+def _build_double_top_shape_demo_mobile(*, out_path: Path) -> dict:
+    return _build_pattern_shape_demo_mobile(
+        out_path=out_path,
+        df=_double_top_ohlcv(),
+        parent_idx=319,
+        action="HOLD",
+        pattern_label="double_top_shape_demo",
+        force_kind="double_top",
+        banner=(
+            "double_top_shape_demo — synthetic OHLC matching the "
+            "double_top template. Used to verify pattern-dissection "
+            "rendering (DT1 / P1 / P2 / NL / BR / WSL / WTP). Not a "
+            "backtest result."
+        ),
+    )
+
+
+def _build_head_and_shoulders_shape_demo_mobile(*, out_path: Path) -> dict:
+    return _build_pattern_shape_demo_mobile(
+        out_path=out_path,
+        df=_head_and_shoulders_ohlcv(),
+        parent_idx=319,
+        action="HOLD",
+        pattern_label="head_and_shoulders_shape_demo",
+        force_kind="head_and_shoulders",
+        banner=(
+            "head_and_shoulders_shape_demo — synthetic OHLC matching "
+            "the head_and_shoulders template. Used to verify pattern-"
+            "dissection rendering (HS1 / LS / H / RS / NL / BR / WSL / "
+            "WTP). Not a backtest result."
+        ),
+    )
+
+
+def _build_inverse_head_and_shoulders_shape_demo_mobile(
+    *, out_path: Path,
+) -> dict:
+    return _build_pattern_shape_demo_mobile(
+        out_path=out_path,
+        df=_inverse_hs_ohlcv(),
+        parent_idx=319,
+        action="HOLD",
+        pattern_label="inverse_head_and_shoulders_shape_demo",
+        force_kind="inverse_head_and_shoulders",
+        banner=(
+            "inverse_head_and_shoulders_shape_demo — synthetic OHLC "
+            "matching the inverse_head_and_shoulders template. Used to "
+            "verify pattern-dissection rendering (IHS1 / LS / H / RS / "
+            "NL / BR / WSL / WTP). Not a backtest result."
+        ),
+    )
+
+
+_PATTERN_SHAPE_DEMO_BUILDERS = {
+    "double_bottom_shape_demo":
+        _build_double_bottom_shape_demo_mobile,
+    "double_top_shape_demo":
+        _build_double_top_shape_demo_mobile,
+    "head_and_shoulders_shape_demo":
+        _build_head_and_shoulders_shape_demo_mobile,
+    "inverse_head_and_shoulders_shape_demo":
+        _build_inverse_head_and_shoulders_shape_demo_mobile,
+}
 
 
 if __name__ == "__main__":

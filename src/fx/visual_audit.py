@@ -2813,6 +2813,11 @@ img.thumb { width: 220px; height: auto; border: 1px solid #ddd; }
   padding: 6px 8px; margin-top: 6px; font-size: 12px; }
 .line-count-summary-v2 .note-warn { background: #ffe5e0; border-left: 3px solid #c62828;
   padding: 6px 8px; margin-top: 6px; font-size: 12px; }
+.wave-line-legend { background: #f7f9ff; border-left: 3px solid #0d47a1;
+  padding: 6px 12px; margin: 6px 0; font-size: 12px; }
+.wave-line-legend .small { margin: 2px 0; }
+.wave-line-legend-list { margin: 4px 0 4px 18px; padding: 0; }
+.wave-line-legend-list li { margin: 2px 0; }
 /* wave overlay (drawn on top of candle chart) */
 .wave-skeleton-line { pointer-events: none; }
 .wave-pivot-dot { pointer-events: none; }
@@ -3749,6 +3754,124 @@ def _render_line_count_summary_html(
     )
 
 
+_PATTERN_KIND_LABEL_JA: Final[dict] = {
+    "double_bottom": "ダブルボトム候補",
+    "double_top": "ダブルトップ候補",
+    "head_and_shoulders": "三尊候補",
+    "inverse_head_and_shoulders": "逆三尊候補",
+    "bullish_flag": "上昇フラッグ候補",
+    "bearish_flag": "下降フラッグ候補",
+    "rising_wedge": "上昇ウェッジ候補",
+    "falling_wedge": "下降ウェッジ候補",
+    "ascending_triangle": "上昇三角形候補",
+    "descending_triangle": "下降三角形候補",
+    "symmetric_triangle": "対称三角形候補",
+}
+
+
+def _build_user_facing_title(
+    *,
+    payload: dict,
+    wave_derived: list[dict] | None,
+) -> str:
+    """User-facing chart title.
+
+    Format:
+      判断: <action> / 波形候補: <human_label> / 参考線: <W*-id, ...>
+
+    Replaces the previous developer-facing
+    "best=SELL score=-0.300 | quality=0.628 | action=SELL".
+    """
+    v2 = payload.get("royal_road_decision_v2") or {}
+    action = v2.get("action") or "?"
+    review = payload.get("wave_shape_review") or {}
+    best = review.get("best_pattern") or {}
+    kind = best.get("kind") or ""
+    parts: list[str] = [f"判断: {_html_escape(action)}"]
+    if kind:
+        parts.append(
+            f"波形候補: {_html_escape(_PATTERN_KIND_LABEL_JA.get(kind, kind))}"
+        )
+    if wave_derived:
+        ids = sorted({l.get("id", "") for l in wave_derived if l.get("id")})
+        if ids:
+            # Cap at 6 ids to keep the title readable on phones.
+            shown = ids[:6]
+            tail = "" if len(ids) <= 6 else f" 他{len(ids) - 6}本"
+            parts.append(
+                f"参考線: {_html_escape(', '.join(shown))}{tail}"
+            )
+    return " / ".join(parts)
+
+
+def _render_wave_line_legend_html(
+    wave_derived: list[dict] | None,
+) -> str:
+    """Render a tiny legend of the W* line ids that appear on the
+    chart, placed RIGHT BEFORE the chart so the reader knows what to
+    look for. Only includes line kinds that are actually present.
+    """
+    if not wave_derived:
+        return ""
+    kinds_present = {l.get("kind", "") for l in wave_derived}
+    items: list[str] = []
+    if any(
+        l.get("kind") == "neckline" for l in wave_derived
+    ):
+        items.append("<li><b>WNL</b> = ネックライン</li>")
+    if any(k in ("pattern_upper", "pattern_lower") for k in kinds_present):
+        items.append(
+            "<li><b>WUP / WLOW</b> = パターン上限 / 下限</li>"
+        )
+    if "pattern_breakout" in kinds_present:
+        items.append("<li><b>WBR</b> = ブレイク確認線</li>")
+    if "pattern_invalidation" in kinds_present:
+        items.append(
+            "<li><b>WSL</b> = 波形が崩れる損切り候補</li>"
+        )
+    if "pattern_target" in kinds_present:
+        items.append(
+            "<li><b>WTP</b> = 波形から見た利確候補</li>"
+        )
+    # Pivot-part lines (B1/B2/P1/P2/LS/H/RS) — only the family-level
+    # explanation; individual labels are already on the chart.
+    if any(
+        k in ("pivot_low", "pivot_high", "shoulder", "head")
+        for k in kinds_present
+    ):
+        items.append(
+            "<li><b>WB1/WB2/WP1/WP2/WLS/WH/WRS</b> = 波形の主要ピボット</li>"
+        )
+    if not items:
+        return ""
+    return (
+        "<div class='wave-line-legend'>"
+        "<p class='small'><b>このチャートの波形由来ライン:</b></p>"
+        "<ul class='wave-line-legend-list'>"
+        + "".join(items)
+        + "</ul>"
+        "</div>"
+    )
+
+
+def _wave_only_chart_heading(kind: str | None) -> str:
+    """Section heading for the wave-only chart, more descriptive when
+    the matched pattern is one of the four named reversal patterns."""
+    headings = {
+        "double_bottom":
+            "パターン部位チャート (ダブルボトム: DB1 / B1 / B2 / NL / BR / WSL / WTP)",
+        "double_top":
+            "パターン部位チャート (ダブルトップ: DT1 / P1 / P2 / NL / BR / WSL / WTP)",
+        "head_and_shoulders":
+            "パターン部位チャート (三尊: HS1 / LS / H / RS / NL / BR / WSL / WTP)",
+        "inverse_head_and_shoulders":
+            "パターン部位チャート (逆三尊: IHS1 / LS / H / RS / NL / BR / WSL / WTP)",
+    }
+    return headings.get(
+        kind or "", "波形だけ表示 (wave-only chart)",
+    )
+
+
 def _hold_waveform_extra_html(
     *,
     action: str | None,
@@ -3922,11 +4045,14 @@ def _mobile_case_section_html(
     setup_candidates = v2.get("setup_candidates") or []
     block_reasons = v2.get("block_reasons") or []
     cautions = v2.get("cautions") or []
+    # User-facing title (replaces developer "best=SELL score=-0.300 | ..."
+    # display). Format: 判断: <action> / 波形候補: <kind> / 参考線: <W*-ids>.
+    user_title = _build_user_facing_title(
+        payload=payload,
+        wave_derived=payload.get("wave_derived_lines") or [],
+    )
     title = (
-        f"{_html_escape(case_label)} "
-        f"action={_html_escape(v2.get('action') or '')} "
-        f"mode={_html_escape(v2.get('mode') or '')} "
-        f"quality={float(rq.get('total_reconstruction_score', 0.0)):.3f}"
+        f"{_html_escape(case_label)} — {user_title}"
     )
 
     if svg_xml is not None:
@@ -4015,14 +4141,18 @@ def _mobile_case_section_html(
         f"<div class='wave-only-wrap'>{wave_only_svg}</div>"
         if wave_only_svg else ""
     )
+    legend_html = _render_wave_line_legend_html(wave_derived)
+    wave_only_kind = (wave_overlay or {}).get("kind", "") if wave_overlay else ""
+    wave_only_heading = _wave_only_chart_heading(wave_only_kind)
 
     return (
         f"<section class='case-section' id='{_html_escape(section_id)}'>"
         f"<h2>{title}</h2>"
-        "<h3>chart</h3>"
+        + (legend_html if legend_html else "")
+        + "<h3>chart</h3>"
         + chart_html
         + (
-            "<h3>波形だけ表示 (wave-only chart)</h3>"
+            f"<h3>{_html_escape(wave_only_heading)}</h3>"
             + wave_only_html
             if wave_only_html else ""
         )
@@ -4109,6 +4239,12 @@ def render_visual_audit_mobile_single_file(
         # Pick the wave overlay (best_pattern's scale) for chart drawing.
         wave_overlay = _select_wave_overlay(payload)
         wd_lines = payload.get("wave_derived_lines") or []
+        # User-facing chart title (replaces dev "best=... | quality=..."
+        # text drawn inside the SVG). Format:
+        # 判断: <action> / 波形候補: <kind> / 参考線: <W*-ids>.
+        svg_user_title = _build_user_facing_title(
+            payload=payload, wave_derived=wd_lines,
+        )
         # Build the inline SVG chart string (or None on failure).
         svg_xml: str | None = None
         if df is not None and len(df) > 0:
@@ -4118,7 +4254,7 @@ def render_visual_audit_mobile_single_file(
                     df=df, end_ts=end_ts,
                     n_bars=int(payload.get("bars_used_in_render") or 0),
                     overlays=payload.get("overlays") or {},
-                    title=payload.get("title", ""),
+                    title=svg_user_title,
                     wave_overlay=wave_overlay,
                     wave_derived_lines=wd_lines,
                 )
