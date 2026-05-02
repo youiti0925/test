@@ -1124,6 +1124,35 @@ def build_visual_audit_payload(
     title = " | ".join(title_parts)
 
     checklist_panels = _build_checklist_panels(trace=trace, v2=v2)
+
+    # Masterclass observation-only panels (16 features). Built from
+    # the technical_confluence + visible df + everything already
+    # computed above. Carries observation_only=True and
+    # used_in_decision=False on every panel; never participates in
+    # royal_road_decision_v2's final action.
+    from .masterclass_aggregate import build_masterclass_panels
+    technical_confluence_dict = _trace_technical_confluence(trace)
+    macro_align = v2.get("macro_alignment") or {}
+    masterclass_panels = build_masterclass_panels(
+        visible_df=visible,
+        parent_bar_ts=parent_ts,
+        technical_dict=technical_dict,
+        technical_confluence=technical_confluence_dict,
+        overlays=overlays,
+        wave_shape_review=wave_shape_review_dict,
+        wave_derived_lines=wave_derived_lines,
+        entry_summary=entry_summary,
+        invalidation_explanation=checklist_panels.get(
+            "invalidation_explanation"
+        ),
+        df_lower_tf=None,
+        higher_tf_trend=None,
+        macro_score=(
+            float(macro_align.get("macro_score"))
+            if macro_align.get("macro_score") is not None else None
+        ),
+    )
+
     return {
         "schema_version": SCHEMA_VERSION,
         "parent_bar_ts": parent_iso,
@@ -1146,6 +1175,9 @@ def build_visual_audit_payload(
         # Wave-derived lines (WNL / WB1 / WB2 / WSL / WTP / ...).
         # Each line carries used_in_decision=False; observation-only.
         "wave_derived_lines": wave_derived_lines,
+        # Masterclass observation-only audit panels (16 features).
+        # NOT consumed by royal_road_decision_v2; for human audit only.
+        "masterclass_panels": masterclass_panels,
         # Full v2 payload preserved so the audit is self-contained
         # (no need to read the JSONL trace separately).
         "royal_road_decision_v2": v2,
@@ -2818,6 +2850,24 @@ img.thumb { width: 220px; height: auto; border: 1px solid #ddd; }
 .wave-line-legend .small { margin: 2px 0; }
 .wave-line-legend-list { margin: 4px 0 4px 18px; padding: 0; }
 .wave-line-legend-list li { margin: 2px 0; }
+/* Masterclass observation-only panels (16 features) */
+.masterclass-panels { margin: 8px 0; }
+.masterclass-detail { background: #f9faff; border: 1px solid #d0d7e8;
+  border-radius: 4px; margin: 6px 0; padding: 6px 10px; }
+.masterclass-detail summary { cursor: pointer; font-weight: 600;
+  color: #0d3a6a; font-size: 13px; }
+.masterclass-detail .obs-tag { color: #888; font-weight: normal;
+  font-size: 11px; margin-left: 4px; }
+.masterclass-detail-body { margin-top: 6px; }
+.masterclass-detail table.kv { font-size: 12px; }
+.masterclass-detail table.kv th { width: 30%; background: #eef3fa; }
+.masterclass-detail table.kv td.status-PASS { background: #d9f7d9; font-weight: bold; }
+.masterclass-detail table.kv td.status-WARN { background: #fff3cd; font-weight: bold; }
+.masterclass-detail table.kv td.status-BLOCK { background: #f8d7da; font-weight: bold; }
+.masterclass-detail table.kv td.status-UNKNOWN { background: #e0e0e0; }
+.masterclass-detail table.kv td.status-YES { background: #d9f7d9; font-weight: bold; }
+.masterclass-detail table.kv td.status-NO { background: #f8d7da; font-weight: bold; }
+.masterclass-detail .small { color: #555; font-size: 11px; margin: 4px 0; }
 /* wave overlay (drawn on top of candle chart) */
 .wave-skeleton-line { pointer-events: none; }
 .wave-pivot-dot { pointer-events: none; }
@@ -3854,6 +3904,367 @@ def _render_wave_line_legend_html(
     )
 
 
+def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
+    """Render the 16 Masterclass observation-only panels.
+
+    Each panel is wrapped in a <details> so the user can fold the
+    sections away on a phone (the case section is already long).
+    All panels are flagged "(observation-only)" so the reader knows
+    they don't influence the v2 final action.
+    """
+    if not panels_dict or not panels_dict.get("available"):
+        return (
+            "<div class='masterclass-panels'>"
+            "<p class='placeholder'>Masterclass パネル情報なし。</p>"
+            "</div>"
+        )
+    panels = panels_dict.get("panels") or {}
+    parts: list[str] = ["<div class='masterclass-panels'>"]
+
+    def _detail(title_ja: str, body_html: str, *, open_: bool = False) -> str:
+        attr = " open" if open_ else ""
+        return (
+            f"<details class='masterclass-detail'{attr}>"
+            f"<summary>{_html_escape(title_ja)} "
+            f"<span class='obs-tag'>(observation-only)</span></summary>"
+            f"<div class='masterclass-detail-body'>{body_html}</div>"
+            "</details>"
+        )
+
+    def _kv_table(rows: list[tuple[str, str]]) -> str:
+        body = "".join(
+            f"<tr><th>{_html_escape(k)}</th><td>{_html_escape(v)}</td></tr>"
+            for k, v in rows
+        )
+        return f"<table class='kv'>{body}</table>"
+
+    def _safe_str(v) -> str:
+        if v is None:
+            return "—"
+        if isinstance(v, bool):
+            return "✓" if v else "✗"
+        if isinstance(v, float):
+            return f"{v:.4f}"
+        return str(v)
+
+    # 1. ローソク足の解剖
+    cs = panels.get("candlestick_anatomy_review") or {}
+    if cs.get("available"):
+        body = _kv_table([
+            ("bar_type", cs.get("bar_type", "")),
+            ("direction", cs.get("direction", "")),
+            ("特徴", cs.get("special_marker") or "—"),
+            ("意味", cs.get("meaning_ja", "")),
+            ("文脈", cs.get("context_ja", "")),
+            ("注意", cs.get("warning_ja", "")),
+        ])
+    else:
+        body = (
+            f"<p class='placeholder'>判定不可: "
+            f"{cs.get('unavailable_reason', '')}</p>"
+        )
+    parts.append(_detail("1. ローソク足の解剖 (candlestick anatomy)", body))
+
+    # 2. 上位足1本の下位足解剖
+    lt = panels.get("parent_bar_lower_tf_anatomy") or {}
+    if lt.get("available"):
+        body = _kv_table([
+            ("下位足の波形", lt.get("lower_tf_wave") or "—"),
+            ("状態", lt.get("lower_tf_status") or "—"),
+            ("shape_score", _safe_str(lt.get("shape_score"))),
+            ("意味", lt.get("meaning_ja", "")),
+        ])
+    else:
+        body = (
+            f"<p class='placeholder'>下位足データなし: "
+            f"{lt.get('unavailable_reason', '')}</p>"
+        )
+    parts.append(_detail("2. 上位足1本の下位足解剖 (parent_bar lower-TF)", body))
+
+    # 3. ダウ構造
+    dow = panels.get("dow_structure_review") or {}
+    if dow.get("available"):
+        body = _kv_table([
+            ("trend", dow.get("trend", "")),
+            ("last 4 sequence", " / ".join(dow.get("last_4_sequence", []))),
+            ("trend_break_price", _safe_str(dow.get("trend_break_price"))),
+            ("reversal_confirm",
+             _safe_str(dow.get("reversal_confirmation_price"))),
+            ("failure_swing", _safe_str(dow.get("failure_swing"))),
+            ("status", dow.get("status_ja", "")),
+        ])
+    else:
+        body = (
+            f"<p class='placeholder'>ダウ判定不可: "
+            f"{dow.get('unavailable_reason', '')}</p>"
+        )
+    parts.append(_detail("3. ダウ構造 (Dow structure)", body, open_=True))
+
+    # 4. 波形 / パターン解剖
+    pat = panels.get("chart_pattern_anatomy_v2") or {}
+    if pat.get("available"):
+        parts_list = "".join(
+            f"<li><b>{_html_escape(p['label'])}</b>: "
+            f"{'✓' if p['present'] else '✗'}</li>"
+            for p in pat.get("expected_parts") or []
+        )
+        body = (
+            _kv_table([
+                ("detected_pattern", pat.get("detected_pattern", "")),
+                ("status", pat.get("status_label_ja", "")),
+                ("side_bias", pat.get("side_bias", "")),
+                ("shape_score", _safe_str(pat.get("shape_score"))),
+                ("summary", pat.get("summary_ja", "")),
+                ("次の確認", pat.get("next_check_ja", "")),
+            ])
+            + f"<p class='small'><b>期待される部位:</b></p><ul>{parts_list}</ul>"
+        )
+    else:
+        body = (
+            f"<p class='placeholder'>パターン判定不可: "
+            f"{pat.get('unavailable_reason', '')}</p>"
+        )
+    parts.append(_detail("4. 波形 / パターン解剖 (pattern anatomy v2)", body, open_=True))
+
+    # 5. 水平線心理
+    lvl = panels.get("level_psychology_review") or {}
+    if lvl.get("available") and lvl.get("levels"):
+        rows = "".join(
+            f"<tr><td>{_html_escape(l['level_id'])}</td>"
+            f"<td>{_html_escape(l['kind'])}</td>"
+            f"<td>{_html_escape(l['phase'])}</td>"
+            f"<td>{_html_escape(l['psychology_ja'])}</td>"
+            f"<td>{_html_escape(l['order_flow_ja'])}</td></tr>"
+            for l in lvl["levels"]
+        )
+        body = (
+            "<table class='kv'><tr><th>id</th><th>kind</th>"
+            "<th>phase</th><th>心理</th><th>注文フロー</th></tr>"
+            + rows + "</table>"
+        )
+    else:
+        body = (
+            f"<p class='placeholder'>水平線判定不可: "
+            f"{lvl.get('unavailable_reason', '')}</p>"
+        )
+    parts.append(_detail("5. 水平線心理 (level psychology)", body))
+
+    # 6. インジケーター環境ルーター
+    er = panels.get("indicator_environment_router") or {}
+    if er.get("available"):
+        body = _kv_table([
+            ("market_regime", er.get("market_regime", "")),
+            ("優先するインジケーター",
+             " / ".join(er.get("preferred_indicators") or [])),
+            ("優先しないインジケーター",
+             " / ".join(er.get("deprioritized_indicators") or [])),
+            ("理由", er.get("reason_ja", "")),
+        ])
+    else:
+        body = (
+            f"<p class='placeholder'>環境判定不可: "
+            f"{er.get('unavailable_reason', '')}</p>"
+        )
+    parts.append(_detail("6. インジケーター環境 (env router)", body))
+
+    # 7. MAコンテキスト
+    ma = panels.get("ma_context_review") or {}
+    if ma.get("available"):
+        body = _kv_table([
+            ("配列", "上昇配列" if ma.get("is_uptrend_stack")
+             else "下降配列" if ma.get("is_downtrend_stack")
+             else "混在"),
+            ("SMA20傾き(%)", _safe_str(ma.get("sma_20_slope_pct"))),
+            ("SMA50傾き(%)", _safe_str(ma.get("sma_50_slope_pct"))),
+            ("乖離率(%)", _safe_str(ma.get("deviation_pct"))),
+            ("過剰乖離", _safe_str(ma.get("over_extended"))),
+            ("SMA20押し目", _safe_str(ma.get("pullback_to_sma_20"))),
+            ("SMA20戻り", _safe_str(ma.get("rebound_to_sma_20"))),
+            ("summary", ma.get("summary_ja", "")),
+        ])
+    else:
+        body = (
+            f"<p class='placeholder'>MA判定不可: "
+            f"{ma.get('unavailable_reason', '')}</p>"
+        )
+    parts.append(_detail("7. MA / グランビル (MA context)", body))
+
+    # 8. グランビル
+    gr = panels.get("granville_entry_review") or {}
+    if gr.get("available"):
+        body = _kv_table([
+            ("MA方向", gr.get("ma_direction", "")),
+            ("価格 vs MA", gr.get("price_vs_ma", "")),
+            ("パターン", gr.get("pattern", "")),
+            ("意味", gr.get("meaning_ja", "")),
+            ("罠注意", gr.get("trap_warning_ja", "")),
+        ])
+    else:
+        body = (
+            f"<p class='placeholder'>グランビル判定不可: "
+            f"{gr.get('unavailable_reason', '')}</p>"
+        )
+    parts.append(_detail("8. グランビル法則 (Granville)", body))
+
+    # 9. BB ライフサイクル
+    bb = panels.get("bollinger_lifecycle_review") or {}
+    if bb.get("available"):
+        body = _kv_table([
+            ("stage", bb.get("stage", "")),
+            ("squeeze", _safe_str(bb.get("bb_squeeze"))),
+            ("expansion", _safe_str(bb.get("bb_expansion"))),
+            ("band_walk", _safe_str(bb.get("bb_band_walk"))),
+            ("bb_position", _safe_str(bb.get("bb_position"))),
+            ("反転リスク", _safe_str(bb.get("reversal_risk"))),
+            ("意味", bb.get("meaning_ja", "")),
+        ])
+    else:
+        body = (
+            f"<p class='placeholder'>BB判定不可: "
+            f"{bb.get('unavailable_reason', '')}</p>"
+        )
+    parts.append(_detail("9. BB ライフサイクル (BB lifecycle)", body))
+
+    # 10. RSI レジームフィルター
+    rsi = panels.get("rsi_regime_filter") or {}
+    if rsi.get("available"):
+        body = _kv_table([
+            ("rsi_value", _safe_str(rsi.get("rsi_value"))),
+            ("regime", rsi.get("regime", "")),
+            ("raw_signal", rsi.get("raw_signal", "")),
+            ("usable_signal", _safe_str(rsi.get("usable_signal"))),
+            ("罠理由", rsi.get("trap_reason_ja", "")),
+        ])
+    else:
+        body = (
+            f"<p class='placeholder'>RSI判定不可: "
+            f"{rsi.get('unavailable_reason', '')}</p>"
+        )
+    parts.append(_detail("10. RSI レジームフィルター", body))
+
+    # 11. ダイバージェンス
+    dv = panels.get("divergence_review") or {}
+    body = _kv_table([
+        ("any_divergence", _safe_str(dv.get("any_divergence"))),
+        ("rsi_bullish", _safe_str(dv.get("rsi_bullish"))),
+        ("rsi_bearish", _safe_str(dv.get("rsi_bearish"))),
+        ("macd_bullish", _safe_str(dv.get("macd_bullish"))),
+        ("macd_bearish", _safe_str(dv.get("macd_bearish"))),
+        ("意味", dv.get("meaning_ja", "")),
+        ("注意", dv.get("warning_ja", "")),
+    ])
+    parts.append(_detail("11. ダイバージェンス (divergence)", body))
+
+    # 12. MACD architecture
+    md = panels.get("macd_architecture_review") or {}
+    if md.get("available"):
+        body = _kv_table([
+            ("macd / signal / hist",
+             f"{_safe_str(md.get('macd'))} / "
+             f"{_safe_str(md.get('macd_signal'))} / "
+             f"{_safe_str(md.get('macd_hist'))}"),
+            ("above_signal", _safe_str(md.get("above_signal"))),
+            ("above_zero", _safe_str(md.get("above_zero"))),
+            ("hist_sign", md.get("hist_sign", "")),
+            ("cross_event", md.get("cross_event", "")),
+            ("momentum", md.get("momentum", "")),
+            ("bias", md.get("bias", "")),
+            ("summary", md.get("summary_ja", "")),
+        ])
+    else:
+        body = (
+            f"<p class='placeholder'>MACD判定不可: "
+            f"{md.get('unavailable_reason', '')}</p>"
+        )
+    parts.append(_detail("12. MACD architecture", body))
+
+    # 13. マルチタイムフレームストーリー
+    mtf = panels.get("multi_timeframe_story") or {}
+    if mtf.get("available"):
+        body = _kv_table([
+            ("higher_tf", mtf.get("higher_tf", "")),
+            ("middle_tf", mtf.get("middle_tf") or "—"),
+            ("lower_tf", mtf.get("lower_tf") or "—"),
+            ("整合", _safe_str(mtf.get("tf_aligned"))),
+            ("ストーリー", mtf.get("story_ja", "")),
+        ])
+    else:
+        body = (
+            f"<p class='placeholder'>MTF判定不可: "
+            f"{mtf.get('unavailable_reason', '')}</p>"
+        )
+    parts.append(_detail("13. マルチタイムフレームストーリー", body, open_=True))
+
+    # 14. グランド・コンフルエンス
+    gc = panels.get("grand_confluence_v2") or {}
+    if gc.get("available"):
+        rows = "".join(
+            f"<tr><td>{_html_escape(a['axis'])}</td>"
+            f"<td class='status-{_html_escape(a['status'])}'>"
+            f"{_html_escape(a['status'])}</td>"
+            f"<td>{_html_escape(a['reason_ja'])}</td></tr>"
+            for a in gc.get("axes") or []
+        )
+        body = (
+            f"<p><b>{_html_escape(gc.get('label', ''))}</b> — "
+            f"{_html_escape(gc.get('summary_ja', ''))}</p>"
+            "<table class='kv confluence'>"
+            "<tr><th>axis</th><th>status</th><th>理由</th></tr>"
+            + rows + "</table>"
+        )
+    else:
+        body = "<p class='placeholder'>コンフルエンス判定不可。</p>"
+    parts.append(_detail("14. グランド・コンフルエンス (9-axis)", body, open_=True))
+
+    # 15. インバリデーション
+    inv = panels.get("invalidation_engine_v2") or {}
+    if inv.get("available"):
+        body = _kv_table([
+            ("setup_basis", " + ".join(inv.get("setup_basis") or [])),
+            ("entry_price", _safe_str(inv.get("entry_price"))),
+            ("stop_price", _safe_str(inv.get("stop_price"))),
+            ("structure_anchored",
+             _safe_str(inv.get("is_structure_anchored"))),
+            ("RR", _safe_str(inv.get("rr"))),
+            ("RR pass (≥2)", _safe_str(inv.get("rr_pass"))),
+            ("無効化される理由", inv.get("why_invalidates_ja", "")),
+            ("哲学", inv.get("philosophy_ja", "")),
+        ])
+    else:
+        body = (
+            f"<p class='placeholder'>インバリデーション判定不可: "
+            f"{inv.get('unavailable_reason', '')}</p>"
+        )
+    parts.append(_detail("15. インバリデーション (invalidation)", body, open_=True))
+
+    # 16. 事前診断チェックリスト
+    ck = panels.get("pre_trade_diagnostic_checklist_v1") or {}
+    if ck.get("available"):
+        rows = "".join(
+            f"<tr><td>{_html_escape(q['question_ja'])}</td>"
+            f"<td class='status-{_html_escape(q['status'])}'>"
+            f"{_html_escape(q['status'])}</td>"
+            f"<td>{_html_escape(q['reason_ja'])}</td></tr>"
+            for q in ck.get("questions") or []
+        )
+        body = (
+            f"<p><b>YES {ck.get('yes_count')} / NO {ck.get('no_count')} "
+            f"/ UNKNOWN {ck.get('unknown_count')}</b></p>"
+            f"<p>{_html_escape(ck.get('verdict_ja', ''))}</p>"
+            "<table class='kv'>"
+            "<tr><th>項目</th><th>状態</th><th>理由</th></tr>"
+            + rows + "</table>"
+        )
+    else:
+        body = "<p class='placeholder'>事前診断不可。</p>"
+    parts.append(_detail(
+        "16. 事前診断チェックリスト (pre-trade diagnostic)", body, open_=True,
+    ))
+
+    parts.append("</div>")
+    return "".join(parts)
+
+
 def _wave_only_chart_heading(kind: str | None) -> str:
     """Section heading for the wave-only chart, more descriptive when
     the matched pattern is one of the four named reversal patterns."""
@@ -4144,6 +4555,9 @@ def _mobile_case_section_html(
     legend_html = _render_wave_line_legend_html(wave_derived)
     wave_only_kind = (wave_overlay or {}).get("kind", "") if wave_overlay else ""
     wave_only_heading = _wave_only_chart_heading(wave_only_kind)
+    masterclass_panels_html = _render_masterclass_panels_html(
+        payload.get("masterclass_panels"),
+    )
 
     return (
         f"<section class='case-section' id='{_html_escape(section_id)}'>"
@@ -4170,6 +4584,8 @@ def _mobile_case_section_html(
             if pattern_dissection_html else ""
         )
         + (hold_waveform_html if hold_waveform_html else "")
+        + "<h3>Masterclass パネル (16機能 — observation only)</h3>"
+        + masterclass_panels_html
         + "<h3>Royal Road Checklist Panels</h3>"
         + panels_html
         + "<h3>current_runtime vs royal_road_v2</h3>"

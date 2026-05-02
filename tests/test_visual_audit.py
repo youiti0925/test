@@ -62,6 +62,8 @@ def test_payload_emits_required_top_level_keys():
         "wave_shape_review", "entry_summary",
         # wave-derived lines (WNL / WB1 / WB2 / WSL / WTP / ...)
         "wave_derived_lines",
+        # Masterclass observation-only audit panels (16 features)
+        "masterclass_panels",
     }
     assert set(p.keys()) == expected
     assert p["schema_version"] == SCHEMA_VERSION
