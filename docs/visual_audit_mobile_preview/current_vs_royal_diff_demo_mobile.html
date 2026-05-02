@@ -70,6 +70,16 @@ img.thumb { width: 220px; height: auto; border: 1px solid #ddd; }
 .hold-waveform-note { background: #fff5e6; border: 1px solid #d8a662;
   border-radius: 4px; padding: 8px 12px; margin: 8px 0; }
 .hold-waveform-note h3 { margin-top: 6px; font-size: 13px; }
+.hold-waveform-note .small { color: #555; font-size: 11px; }
+/* wave overlay (drawn on top of candle chart) */
+.wave-skeleton-line { pointer-events: none; }
+.wave-pivot-dot { pointer-events: none; }
+.wave-part-label-bg, .wave-part-label { pointer-events: none; }
+.wave-neckline { pointer-events: none; }
+/* standalone wave-only chart */
+.wave-only-wrap { margin: 8px 0; max-width: 100%; overflow-x: auto; }
+.wave-only-chart { display: block; max-width: 100%; height: auto;
+  border: 1px solid #c5d2eb; border-radius: 4px; background: #fbfcff; }
 /* chart-story-v2 css */
 
 .numbered-legend {
