@@ -188,7 +188,11 @@ def _df() -> pd.DataFrame:
     }, index=idx)
 
 
-def test_phase_a_scaffold_returns_hold():
+def test_minimal_inputs_return_hold_with_integrated_decision():
+    """With a flat 10-bar df and no panels, the integrated profile
+    must return HOLD (no W lines / no patterns / etc.) and surface the
+    integrated_decision dict on advisory. This pins down: a malformed
+    or empty input never silently emits BUY/SELL."""
     decision = decide_royal_road_v2_integrated(
         df_window=_df(),
         technical_confluence={},
@@ -209,14 +213,17 @@ def test_phase_a_scaffold_returns_hold():
     assert decision.action == "HOLD"
     assert decision.advisory.get("profile") == PROFILE_NAME_V2_INTEGRATED
     assert decision.advisory.get("mode") == "integrated_balanced"
-    assert decision.advisory.get("scaffold") is True
     integrated = decision.advisory.get("integrated_decision") or {}
     assert integrated.get("action") == "HOLD"
-    assert integrated.get("label") == "HOLD_PHASE_A_SCAFFOLD"
     assert integrated.get("schema_version") == "royal_road_integrated_decision_v1"
+    # block_reasons MUST be non-empty (no W lines, no patterns, etc.)
+    assert integrated.get("block_reasons"), (
+        "empty input must produce at least one block_reason — "
+        "otherwise HOLD is silent and confusing."
+    )
 
 
-def test_phase_a_scaffold_rejects_legacy_modes():
+def test_minimal_inputs_rejects_legacy_modes():
     """Passing a legacy v2 mode (e.g. "balanced") must raise — the
     integrated profile only accepts integrated_* modes."""
     with pytest.raises(ValueError):
