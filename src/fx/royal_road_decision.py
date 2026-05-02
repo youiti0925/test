@@ -336,6 +336,11 @@ SUPPORTED_DECISION_PROFILES: Final[tuple[str, ...]] = (
     "current_runtime",
     PROFILE_NAME,
     "royal_road_decision_v2",
+    # Opt-in integrated profile (audit information IS the decision).
+    # Backtest / visual_audit only — never wired into live / OANDA /
+    # paper. The new module is dormant until the CLI / backtest_engine
+    # dispatch lands in Phase C.
+    "royal_road_decision_v2_integrated",
 )
 
 
