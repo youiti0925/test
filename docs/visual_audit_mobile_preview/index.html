@@ -1,15 +1,15 @@
 <!doctype html>
-<html lang="en">
+<html lang="ja">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Royal Road Visual Audit Mobile Preview</title>
+  <title>王道 visual audit モバイルプレビュー</title>
   <style>
     body {
       font-family: -apple-system, sans-serif;
       margin: 12px;
       color: #222;
-      line-height: 1.5;
+      line-height: 1.6;
     }
     h1 { font-size: 20px; }
     .note {
@@ -21,10 +21,11 @@
       margin: 8px 0 16px;
     }
     ul { padding-left: 20px; }
-    li { margin: 8px 0; font-size: 16px; }
+    li { margin: 12px 0; font-size: 16px; }
     a { color: #1565c0; text-decoration: none; }
     a:hover, a:active { text-decoration: underline; }
-    .desc { color: #555; font-size: 13px; margin-top: 2px; }
+    .desc { color: #555; font-size: 13px; margin-top: 4px; }
+    .footer { color: #888; font-size: 12px; margin-top: 24px; }
     @media (max-width: 800px) {
       body { margin: 8px; }
       h1 { font-size: 18px; }
@@ -33,41 +34,55 @@
   </style>
 </head>
 <body>
-  <h1>Royal Road Visual Audit Mobile Preview</h1>
+  <h1>王道 visual audit モバイルプレビュー</h1>
+
   <p class="note">
-    UI verification only. The two demo files below are handcrafted
-    fixtures (<code>demo_fixture_not_backtest_result</code>) and are
-    NOT real backtest output. The normal report is generated from a
-    deterministic synthetic OHLC sample (no live data).
+    UI 確認用です。下のうち <strong>「損切りデモ」</strong>と
+    <strong>「現行 vs 王道 差分デモ」</strong>は
+    <code>demo_fixture_not_backtest_result</code> の
+    手作りフィクスチャで、<strong>実際のバックテスト結果ではありません</strong>。
+    <br>
+    「通常 v2 レポート」は決定論的な合成 OHLC を用いたサンプル
+    (live データではありません) です。
   </p>
+
   <ul>
     <li>
       <a href="./structure_stop_anchor_demo_mobile.html">
-        Structure stop anchor demo
+        ① 損切りデモ (structure stop anchor demo)
       </a>
       <div class="desc">
-        BUY case where the structure stop is anchored to a selected
-        SUPPORT zone (sr_zone:support).
+        BUY ケースで、損切り価格が選定された support ゾーンに紐づいている例。
+        Invalidation Explanation パネルが具体的な構造文 (sr_zone:support) を出します。
       </div>
     </li>
     <li>
       <a href="./current_vs_royal_diff_demo_mobile.html">
-        Current vs Royal diff demo
+        ② 現行 vs 王道 差分デモ (current vs royal diff demo)
       </a>
       <div class="desc">
-        current_runtime=BUY but royal_v2=HOLD
-        (difference_type=current_buy_royal_hold).
+        現行ロジック=BUY、王道v2=HOLD で判断が割れたケース
+        (difference_type=current_buy_royal_hold)。比較表のみ確認できます。
       </div>
     </li>
     <li>
       <a href="./normal_v2_report_mobile.html">
-        Normal v2 report sample
+        ③ 通常 v2 レポートサンプル (normal v2 report)
       </a>
       <div class="desc">
-        First 5 cases from a deterministic synthetic backtest with
-        royal_road_decision_v2 profile.
+        合成 OHLC で royal_road_decision_v2 を実行した代表 5 件。
+        各ケースに inline SVG チャート + 王道チェックパネル一式が付きます。
       </div>
     </li>
   </ul>
+
+  <div class="footer">
+    <p>
+      ブランチ: <code>artifact/visual-audit-mobile-preview</code><br>
+      生成元 commit: <code>b3d36af</code> (feat/royal-road-complete-v2)<br>
+      schema: <code>visual_audit_mobile_v1</code><br>
+      売買ロジック本体は無変更です。これは表示・監査情報のみの追加成果物です。
+    </p>
+  </div>
 </body>
 </html>
