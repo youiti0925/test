@@ -46,7 +46,10 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from src.fx.backtest_engine import run_engine_backtest  # noqa: E402
-from src.fx.visual_audit import render_visual_audit_report  # noqa: E402
+from src.fx.visual_audit import (  # noqa: E402
+    render_visual_audit_mobile_single_file,
+    render_visual_audit_report,
+)
 
 
 def _synthetic_ohlcv(n: int = 350, seed: int = 42) -> pd.DataFrame:
@@ -380,6 +383,18 @@ def main() -> int:
              "<out>/current_vs_royal_diff_demo subdirectories.",
     )
     p.add_argument("--max-cases", type=int, default=25)
+    p.add_argument(
+        "--single-file", action="store_true",
+        help="In addition to the regular per-mode reports, write "
+             "self-contained mobile-friendly HTML files into "
+             "<out>/mobile/<mode>_mobile.html (CSS + chart_main.svg "
+             "embedded inline, no external assets).",
+    )
+    p.add_argument(
+        "--mobile-cases", type=int, default=5,
+        help="Number of cases per single-file mobile HTML (only used "
+             "with --single-file). Defaults to 5; demos always have 1.",
+    )
     args = p.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -405,7 +420,156 @@ def main() -> int:
     for name, r in runs:
         print(f"[{name}] out={r['out_dir']} n_cases={r['n_cases']}")
         print(f"          summary={r['summary']}")
+
+    if args.single_file:
+        mobile_dir = args.out / "mobile"
+        mobile_dir.mkdir(parents=True, exist_ok=True)
+        mobile_runs: list[tuple[str, dict]] = []
+        # normal_v2_report — bundle up to mobile-cases cases.
+        if args.mode in ("normal_v2_report", "all"):
+            mobile_runs.append((
+                "normal_v2_report_mobile.html",
+                _build_normal_mobile(
+                    out_path=mobile_dir / "normal_v2_report_mobile.html",
+                    max_cases=args.mobile_cases,
+                ),
+            ))
+        if args.mode in ("structure_stop_anchor_demo", "all"):
+            mobile_runs.append((
+                "structure_stop_anchor_demo_mobile.html",
+                _build_structure_demo_mobile(
+                    out_path=mobile_dir / "structure_stop_anchor_demo_mobile.html",
+                ),
+            ))
+        if args.mode in ("current_vs_royal_diff_demo", "all"):
+            mobile_runs.append((
+                "current_vs_royal_diff_demo_mobile.html",
+                _build_current_diff_demo_mobile(
+                    out_path=mobile_dir / "current_vs_royal_diff_demo_mobile.html",
+                ),
+            ))
+        print("=" * 60)
+        print(f"mobile single-file output dir: {mobile_dir}")
+        for fname, r in mobile_runs:
+            print(f"[{fname}] n_cases={r['n_cases']} size={r['size_bytes']:,} bytes")
     return 0
+
+
+def _build_normal_mobile(*, out_path: Path, max_cases: int) -> dict:
+    df = _synthetic_ohlcv()
+    res = run_engine_backtest(
+        df, "EURUSD=X", interval="1h", warmup=60,
+        decision_profile="royal_road_decision_v2",
+    )
+    return render_visual_audit_mobile_single_file(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df},
+        out_path=out_path,
+        max_cases=max_cases,
+        title="visual_audit_mobile_v1 — normal_v2_report",
+    )
+
+
+def _build_structure_demo_mobile(*, out_path: Path) -> dict:
+    """Reuse the same handcrafted trace as run_structure_stop_anchor_demo
+    so the single-file output mirrors the multi-file demo content."""
+    df = _synthetic_ohlcv(n=300, seed=11)
+    sym = "EURUSD=X"
+    parent_ts = df.index[200]
+    close = float(df["close"].iloc[200])
+    structure_stop = close - 0.005
+    zone_low = structure_stop - 0.0008
+    zone_high = structure_stop + 0.0008
+    v2 = _empty_v2_payload(action="BUY")
+    v2["evidence_axes"]["bullish"] = {
+        "near_strong_support": True, "bullish_structure": True,
+    }
+    v2["evidence_axes_count"] = {"bullish": 2, "bearish": 0}
+    v2["support_resistance_v2"]["near_strong_support"] = True
+    v2["support_resistance_v2"]["selected_level_zones_top5"] = [{
+        "kind": "support", "price": structure_stop,
+        "zone_low": zone_low, "zone_high": zone_high,
+        "zone_width_atr": 0.6, "touch_count": 4,
+        "first_touch_ts": None, "last_touch_ts": None,
+        "first_touch_index": 50, "last_touch_index": 150,
+        "broken_count": 0, "role_reversal_count": 0,
+        "false_breakout_count": 0, "strength_score": 4.0,
+        "recency_score": 0.9, "distance_to_close_atr": 0.4,
+        "wick_touch_count": 3, "close_touch_count": 4,
+        "body_break_count": 0, "wick_fakeout_count": 0,
+        "rejection_count": 3, "confidence": 0.85,
+        "reasons": ["strong_multi_touch", "demo_fixture"],
+    }]
+    v2["structure_stop_plan"] = {
+        "chosen_mode": "structure", "outcome": "structure",
+        "stop_price": structure_stop, "structure_stop_price": structure_stop,
+        "atr_stop_price": close - 0.002,
+        "take_profit_price": close + 0.0075,
+        "rr_realized": 1.5, "invalidation_reason": None,
+    }
+    v2["reconstruction_quality"]["total_reconstruction_score"] = 0.62
+    v2["reconstruction_quality"]["level_quality_score"] = 0.85
+    v2["reconstruction_quality"]["stop_plan_quality_score"] = 1.0
+    tr = _make_demo_trace(
+        symbol=sym, timestamp=parent_ts, v2_payload=v2,
+        technical_confluence=_empty_tc(close=close),
+        close=close,
+    )
+    return render_visual_audit_mobile_single_file(
+        traces=[tr],
+        df_by_symbol={sym: df},
+        out_path=out_path,
+        max_cases=1,
+        title="visual_audit_mobile_v1 — structure_stop_anchor_demo",
+        demo_fixture_banner=(
+            "structure_stop_anchor_demo — handcrafted BUY case where "
+            "the structure_stop is anchored to a selected SUPPORT "
+            "zone. UI verification only; not a backtest result."
+        ),
+    )
+
+
+def _build_current_diff_demo_mobile(*, out_path: Path) -> dict:
+    df = _synthetic_ohlcv(n=250, seed=23)
+    sym = "EURUSD=X"
+    parent_ts = df.index[180]
+    close = float(df["close"].iloc[180])
+    v2 = _empty_v2_payload(action="HOLD")
+    v2["block_reasons"] = [
+        "insufficient_buy_evidence_axes_v2:1<2",
+        "insufficient_royal_road_reconstruction_quality",
+    ]
+    v2["cautions"] = ["macro_score_weak"]
+    v2["reconstruction_quality"]["total_reconstruction_score"] = 0.32
+    v2["compared_to_current_runtime"] = {
+        "current_action": "BUY", "royal_road_action": "HOLD",
+        "same_action": False, "difference_type": "current_buy_royal_hold",
+    }
+    v2["structure_stop_plan"] = {
+        "chosen_mode": "atr", "outcome": "atr",
+        "stop_price": close - 0.002, "structure_stop_price": None,
+        "atr_stop_price": close - 0.002,
+        "take_profit_price": close + 0.003,
+        "rr_realized": 1.5, "invalidation_reason": None,
+    }
+    tr = _make_demo_trace(
+        symbol=sym, timestamp=parent_ts, v2_payload=v2,
+        technical_confluence=_empty_tc(close=close),
+        close=close,
+    )
+    return render_visual_audit_mobile_single_file(
+        traces=[tr],
+        df_by_symbol={sym: df},
+        out_path=out_path,
+        max_cases=1,
+        title="visual_audit_mobile_v1 — current_vs_royal_diff_demo",
+        demo_fixture_banner=(
+            "current_vs_royal_diff_demo — handcrafted case where "
+            "current_runtime=BUY but royal_v2=HOLD "
+            "(difference_type=current_buy_royal_hold). UI verification "
+            "only; not a backtest result."
+        ),
+    )
 
 
 if __name__ == "__main__":

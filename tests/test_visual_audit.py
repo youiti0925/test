@@ -482,7 +482,7 @@ def test_candlestick_helper_has_body_and_wick_logic_in_source():
     import inspect
     from src.fx import visual_audit
     mpl_src = inspect.getsource(visual_audit._try_matplotlib_render)
-    svg_src = inspect.getsource(visual_audit._render_candle_svg)
+    svg_src = inspect.getsource(visual_audit._build_candle_svg_xml)
     # matplotlib path
     assert "vlines" in mpl_src, "matplotlib path should use vlines"
     assert "bullish" in mpl_src or "bull_x" in mpl_src
@@ -1135,3 +1135,203 @@ def test_chart_status_taxonomy_pinned_in_audit(tmp_path: Path):
         assert entry["renderer"] in allowed_renderers, (
             f"chart_status[{k}].renderer={entry['renderer']} not in taxonomy"
         )
+
+
+# ─────── Mobile / single-file output ────────────────────────────────
+
+
+def test_default_css_contains_responsive_media_query():
+    """Pin: the static CSS includes a `@media (max-width: 800px)` block
+    so the report scales on phones."""
+    from src.fx.visual_audit import _DEFAULT_CSS
+    assert "@media (max-width: 800px)" in _DEFAULT_CSS
+
+
+def test_responsive_css_makes_tables_horizontally_scrollable():
+    from src.fx.visual_audit import _DEFAULT_CSS
+    assert "overflow-x: auto" in _DEFAULT_CSS
+    # img / svg full-width inside the @media block.
+    assert "max-width: 100%" in _DEFAULT_CSS
+    # case-detail unstacks (display:block) on narrow viewports.
+    media_block = _DEFAULT_CSS.split("@media (max-width: 800px)")[1]
+    assert ".case-detail { display: block; }" in media_block
+    assert "img, svg { max-width: 100%; height: auto; }" in media_block
+
+
+def test_mobile_single_file_writes_self_contained_html(tmp_path: Path):
+    from src.fx.visual_audit import (
+        MOBILE_SCHEMA_VERSION, render_visual_audit_mobile_single_file,
+    )
+    df, res = _v2_run()
+    out = tmp_path / "mobile.html"
+    r = render_visual_audit_mobile_single_file(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df},
+        out_path=out, max_cases=3,
+    )
+    assert r["schema_version"] == MOBILE_SCHEMA_VERSION
+    assert MOBILE_SCHEMA_VERSION == "visual_audit_mobile_v1"
+    assert out.exists()
+    body = out.read_text()
+    # Self-contained: doctype, viewport meta, inline <style>.
+    assert "<!DOCTYPE html>" in body
+    assert "name='viewport'" in body
+    assert "<style>" in body
+    # No external <link rel='stylesheet'> reference (single file).
+    assert "<link rel=" not in body
+
+
+def test_mobile_single_file_inlines_svg_chart(tmp_path: Path):
+    from src.fx.visual_audit import render_visual_audit_mobile_single_file
+    df, res = _v2_run()
+    out = tmp_path / "m.html"
+    render_visual_audit_mobile_single_file(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df},
+        out_path=out, max_cases=3,
+    )
+    body = out.read_text()
+    # Inline <svg> with the candle classes the SVG renderer emits.
+    assert "<svg" in body
+    assert "class='wick'" in body
+    assert "candle-bull" in body or "candle-bear" in body
+    # No external chart_main.svg reference.
+    assert "chart_main.svg" not in body
+
+
+def test_mobile_single_file_includes_panels_and_comparison(tmp_path: Path):
+    from src.fx.visual_audit import render_visual_audit_mobile_single_file
+    df, res = _v2_run()
+    out = tmp_path / "m.html"
+    render_visual_audit_mobile_single_file(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df},
+        out_path=out, max_cases=3,
+    )
+    body = out.read_text()
+    for token in (
+        "Royal Road Checklist Panels",
+        "Grand Confluence Checklist",
+        "Invalidation Explanation",
+        "current_runtime vs royal_road_v2",
+        "setup_candidates",
+        "block_reasons",
+        "reconstruction_quality",
+    ):
+        assert token in body, f"missing section: {token}"
+
+
+def test_mobile_single_file_demo_banner_present(tmp_path: Path):
+    from src.fx.visual_audit import render_visual_audit_mobile_single_file
+    df, res = _v2_run()
+    out = tmp_path / "demo.html"
+    render_visual_audit_mobile_single_file(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df},
+        out_path=out, max_cases=2,
+        demo_fixture_banner="hand-crafted UI demo. not a backtest result.",
+    )
+    body = out.read_text()
+    assert "demo_fixture_not_backtest_result" in body
+    assert "demo-banner" in body
+    assert "hand-crafted UI demo. not a backtest result." in body
+
+
+def test_mobile_single_file_case_list_with_anchors(tmp_path: Path):
+    from src.fx.visual_audit import render_visual_audit_mobile_single_file
+    df, res = _v2_run()
+    out = tmp_path / "m.html"
+    r = render_visual_audit_mobile_single_file(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df},
+        out_path=out, max_cases=3,
+    )
+    body = out.read_text()
+    # Top case list has an anchor target id='case-list'.
+    assert "id='case-list'" in body
+    # Each case section gets a unique id and the case list links to it.
+    for c in r["cases"]:
+        sid = c["section_id"]
+        assert f"id='{sid}'" in body
+        assert f"href='#{sid}'" in body
+    # Back-to-list link for navigation on phone.
+    assert "back to case list" in body
+
+
+def test_mobile_single_file_no_future_leak(tmp_path: Path):
+    """Pin: even when df has bars beyond parent_bar_ts, the inline SVG
+    emitted by the mobile renderer must not reference timestamps past
+    the parent boundary."""
+    import re as _re
+    from src.fx.visual_audit import render_visual_audit_mobile_single_file
+    df_full = _ohlcv(400)
+    res = run_engine_backtest(
+        df_full.iloc[:200], "EURUSD=X", interval="1h", warmup=60,
+        decision_profile="royal_road_decision_v2",
+    )
+    out = tmp_path / "m.html"
+    render_visual_audit_mobile_single_file(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df_full},
+        out_path=out, max_cases=3,
+    )
+    body = out.read_text()
+    # parent_bar_ts texts inside the inline SVGs.
+    parents = _re.findall(r"parent_bar_ts=([^<]+?)<", body)
+    assert parents, "no parent_bar_ts marker found"
+    iso_ts = _re.findall(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:\d{2}|Z)",
+        body,
+    )
+    # Every timestamp in the file should be <= the maximum parent_bar_ts.
+    parent_max = max(pd.Timestamp(p) for p in parents)
+    for ts in iso_ts:
+        assert pd.Timestamp(ts) <= parent_max, (
+            f"future leak: {ts} > parent_max {parent_max}"
+        )
+
+
+def test_mobile_single_file_no_external_fetch(tmp_path: Path, monkeypatch):
+    """Pin: the mobile single-file path must not hit the network. We
+    block urllib.request.urlopen and confirm rendering still succeeds."""
+    import urllib.request
+    def _refuse(*a, **kw):
+        raise AssertionError("network access attempted in mobile renderer")
+    monkeypatch.setattr(urllib.request, "urlopen", _refuse)
+    from src.fx.visual_audit import render_visual_audit_mobile_single_file
+    df, res = _v2_run()
+    out = tmp_path / "m.html"
+    r = render_visual_audit_mobile_single_file(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df},
+        out_path=out, max_cases=2,
+    )
+    assert out.exists()
+    assert r["n_cases"] >= 1
+
+
+def test_smoke_generator_single_file_cli_writes_mobile_html(tmp_path: Path):
+    """End-to-end CLI test: run the smoke generator with --single-file
+    on the structure_stop_anchor_demo mode and confirm a mobile HTML
+    is written under <out>/mobile/."""
+    import subprocess, sys
+    repo = Path(__file__).resolve().parents[1]
+    out = tmp_path / "smoke"
+    proc = subprocess.run(
+        [sys.executable,
+         str(repo / "scripts" / "generate_visual_audit_smoke.py"),
+         "--out", str(out),
+         "--mode", "structure_stop_anchor_demo",
+         "--single-file"],
+        cwd=str(repo), capture_output=True, text=True, timeout=180,
+    )
+    assert proc.returncode == 0, (
+        f"generator failed:\nstdout={proc.stdout}\nstderr={proc.stderr}"
+    )
+    mobile_file = out / "mobile" / "structure_stop_anchor_demo_mobile.html"
+    assert mobile_file.exists()
+    body = mobile_file.read_text()
+    assert "<svg" in body
+    assert "Grand Confluence Checklist" in body
+    assert "demo_fixture_not_backtest_result" in body
+    assert "current_runtime vs royal_road_v2" in body

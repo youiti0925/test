@@ -32,9 +32,10 @@ respected. Pinned by `tests/test_visual_audit.py::test_future_bars_not_in_render
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Iterable
 
 import pandas as pd
 
@@ -1100,6 +1101,7 @@ __all__ = [
     "build_visual_audit_payload",
     "render_visual_audit",
     "render_visual_audit_report",
+    "render_visual_audit_mobile_single_file",
     "select_important_cases",
 ]
 
@@ -1275,6 +1277,317 @@ def select_important_cases(
     return out
 
 
+def _build_candle_svg_xml(
+    *,
+    df: pd.DataFrame,
+    end_ts: pd.Timestamp,
+    n_bars: int,
+    overlays: dict | None,
+    title: str,
+) -> str | None:
+    """Build the SVG candle-chart as an XML string.
+
+    Returns None when there is nothing to draw (no visible bars within
+    parent_bar_ts boundary). Future-leak safe: only bars with
+    `df.index <= end_ts` are visited.
+
+    All overlay rendering is included (selected/rejected SR zones,
+    selected/rejected trendlines, pattern lines, lower_tf trigger,
+    stop / take_profit / structure_stop / atr_stop, parent_bar marker).
+    """
+    if df is None or len(df) == 0 or n_bars <= 0:
+        return None
+    visible = df[df.index <= end_ts].tail(n_bars)
+    if len(visible) == 0:
+        return None
+    # ---- coordinate system -------------------------------------
+    W, H = 1200, 600
+    margin_l, margin_r, margin_t, margin_b = 60, 20, 28, 28
+    plot_w = W - margin_l - margin_r
+    plot_h = H - margin_t - margin_b
+    n = len(visible)
+    bar_w = max(2.0, plot_w / max(1, n))
+    body_w = max(1.5, bar_w * 0.6)
+    opens = visible["open"].astype(float).to_numpy()
+    highs = visible["high"].astype(float).to_numpy()
+    lows = visible["low"].astype(float).to_numpy()
+    closes = visible["close"].astype(float).to_numpy()
+    price_lo = float(min(lows.min(), opens.min(), closes.min()))
+    price_hi = float(max(highs.max(), opens.max(), closes.max()))
+    ovl_prices: list[float] = []
+    ov = overlays or {}
+    for lvl in (ov.get("level_zones_selected", [])
+                + ov.get("level_zones_rejected", [])):
+        for k in ("zone_low", "zone_high"):
+            v = lvl.get(k)
+            if v is not None:
+                ovl_prices.append(float(v))
+    for p in ov.get("patterns_selected", []):
+        for k in ("neckline", "invalidation_price", "target_price"):
+            v = p.get(k)
+            if v is None or isinstance(v, dict):
+                continue
+            try:
+                ovl_prices.append(float(v))
+            except (TypeError, ValueError):
+                continue
+    sp = ov.get("structure_stop_plan") or {}
+    for k in (
+        "stop_price", "take_profit_price",
+        "structure_stop_price", "atr_stop_price",
+    ):
+        v = sp.get(k)
+        if v is not None:
+            ovl_prices.append(float(v))
+    ltf = ov.get("lower_tf_trigger")
+    if ltf and ltf.get("trigger_price") is not None:
+        ovl_prices.append(float(ltf["trigger_price"]))
+    if ovl_prices:
+        price_lo = min(price_lo, min(ovl_prices))
+        price_hi = max(price_hi, max(ovl_prices))
+    if price_hi <= price_lo:
+        price_hi = price_lo + 1e-9
+    pad = (price_hi - price_lo) * 0.05
+    price_lo -= pad
+    price_hi += pad
+    price_range = price_hi - price_lo
+
+    def x_of(i: int) -> float:
+        return margin_l + (i + 0.5) * bar_w
+
+    def y_of(p: float) -> float:
+        return margin_t + (1.0 - (p - price_lo) / price_range) * plot_h
+
+    def fmt(v: float, decimals: int = 5) -> str:
+        return f"{v:.{decimals}f}"
+
+    parts: list[str] = []
+    parts.append(
+        f"<?xml version='1.0' encoding='UTF-8'?>\n"
+        f"<svg xmlns='http://www.w3.org/2000/svg' "
+        f"viewBox='0 0 {W} {H}' width='{W}' height='{H}' "
+        f"font-family='-apple-system, sans-serif' font-size='11'>"
+    )
+    parts.append(f"<rect x='0' y='0' width='{W}' height='{H}' fill='#fdfdfd'/>")
+    parts.append(
+        f"<rect x='{margin_l}' y='{margin_t}' width='{plot_w}' "
+        f"height='{plot_h}' fill='white' stroke='#bbb' stroke-width='0.5'/>"
+    )
+    for i in range(5):
+        frac = i / 4.0
+        p = price_lo + (1.0 - frac) * price_range
+        yp = margin_t + frac * plot_h
+        parts.append(
+            f"<line x1='{margin_l - 3}' y1='{yp:.1f}' x2='{margin_l}' "
+            f"y2='{yp:.1f}' stroke='#888' stroke-width='0.5'/>"
+        )
+        parts.append(
+            f"<text x='{margin_l - 6}' y='{yp + 3:.1f}' text-anchor='end' "
+            f"fill='#444'>{fmt(p)}</text>"
+        )
+    parts.append(
+        f"<text x='{margin_l}' y='18' fill='#222' font-weight='bold'>"
+        f"{_html_escape(title)}</text>"
+    )
+    for lvl in ov.get("level_zones_selected", []):
+        zlow = lvl.get("zone_low"); zhigh = lvl.get("zone_high")
+        if zlow is None or zhigh is None:
+            continue
+        kind = lvl.get("kind")
+        color = (
+            "#2e7d32" if kind == "support"
+            else "#c62828" if kind == "resistance"
+            else "#6a1b9a"
+        )
+        y_top = y_of(float(zhigh))
+        y_bot = y_of(float(zlow))
+        parts.append(
+            f"<rect class='sr-selected sr-{kind}' "
+            f"x='{margin_l}' y='{min(y_top, y_bot):.1f}' "
+            f"width='{plot_w}' height='{abs(y_bot - y_top):.1f}' "
+            f"fill='{color}' opacity='0.18'/>"
+        )
+    for lvl in ov.get("level_zones_rejected", []):
+        zlow = lvl.get("zone_low"); zhigh = lvl.get("zone_high")
+        if zlow is None or zhigh is None:
+            continue
+        y_top = y_of(float(zhigh))
+        y_bot = y_of(float(zlow))
+        parts.append(
+            f"<rect class='sr-rejected' "
+            f"x='{margin_l}' y='{min(y_top, y_bot):.1f}' "
+            f"width='{plot_w}' height='{abs(y_bot - y_top):.1f}' "
+            f"fill='#888' opacity='0.08'/>"
+        )
+    for i in range(n):
+        xi = x_of(i)
+        y_h = y_of(highs[i]); y_l = y_of(lows[i])
+        y_o = y_of(opens[i]); y_c = y_of(closes[i])
+        parts.append(
+            f"<line class='wick' x1='{xi:.1f}' y1='{y_h:.1f}' "
+            f"x2='{xi:.1f}' y2='{y_l:.1f}' stroke='#222' "
+            f"stroke-width='0.6'/>"
+        )
+        bull = closes[i] >= opens[i]
+        color = "#2e7d32" if bull else "#c62828"
+        body_top = min(y_o, y_c)
+        body_h = max(0.5, abs(y_c - y_o))
+        parts.append(
+            f"<rect class='body candle-{'bull' if bull else 'bear'}' "
+            f"x='{xi - body_w / 2:.1f}' y='{body_top:.1f}' "
+            f"width='{body_w:.1f}' height='{body_h:.1f}' "
+            f"fill='{color}'/>"
+        )
+    for t in ov.get("trendlines_selected", []):
+        slope = t.get("slope"); intercept = t.get("intercept")
+        anchors = t.get("anchor_indices") or []
+        if slope is None or intercept is None or len(anchors) < 2:
+            continue
+        i0 = int(anchors[0]); i1 = int(anchors[-1])
+        if i1 >= n:
+            i1 = n - 1
+        if i0 >= n or i1 <= i0:
+            continue
+        y0 = y_of(slope * i0 + intercept)
+        y1 = y_of(slope * i1 + intercept)
+        broken = bool(t.get("broken"))
+        opacity = "0.55" if broken else "0.9"
+        parts.append(
+            f"<line class='trendline-selected' x1='{x_of(i0):.1f}' "
+            f"y1='{y0:.1f}' x2='{x_of(i1):.1f}' y2='{y1:.1f}' "
+            f"stroke='#1565c0' stroke-width='1.4' opacity='{opacity}'/>"
+        )
+    for rj in ov.get("trendlines_rejected", []):
+        tdict = rj.get("trendline") or {}
+        slope = tdict.get("slope"); intercept = tdict.get("intercept")
+        anchors = tdict.get("anchor_indices") or []
+        if slope is None or intercept is None or len(anchors) < 2:
+            continue
+        i0 = int(anchors[0]); i1 = int(anchors[-1])
+        if i1 >= n:
+            i1 = n - 1
+        if i0 >= n or i1 <= i0:
+            continue
+        y0 = y_of(slope * i0 + intercept)
+        y1 = y_of(slope * i1 + intercept)
+        parts.append(
+            f"<line class='trendline-rejected' x1='{x_of(i0):.1f}' "
+            f"y1='{y0:.1f}' x2='{x_of(i1):.1f}' y2='{y1:.1f}' "
+            f"stroke='#888' stroke-width='0.7' opacity='0.5' "
+            f"stroke-dasharray='3,3'/>"
+        )
+    for p in ov.get("patterns_selected", []):
+        side = p.get("side_bias")
+        color = (
+            "#1b5e20" if side == "BUY"
+            else "#b71c1c" if side == "SELL"
+            else "#ef6c00"
+        )
+        nl = p.get("neckline")
+        if nl is not None and not isinstance(nl, dict):
+            yv = y_of(float(nl))
+            parts.append(
+                f"<line class='pattern-neckline' "
+                f"x1='{margin_l}' y1='{yv:.1f}' "
+                f"x2='{margin_l + plot_w}' y2='{yv:.1f}' "
+                f"stroke='{color}' stroke-width='1.0' "
+                f"stroke-dasharray='6,3' opacity='0.8'/>"
+            )
+        for line_key in ("upper_line", "lower_line"):
+            v = p.get(line_key)
+            if v is None:
+                continue
+            if isinstance(v, dict):
+                slope = v.get("slope"); intercept = v.get("intercept")
+                anchors = v.get("anchors") or v.get("anchor_indices") or []
+                if slope is None or intercept is None or len(anchors) < 2:
+                    continue
+                i0 = int(anchors[0]); i1 = int(anchors[-1])
+                if i1 >= n:
+                    i1 = n - 1
+                if i0 >= n or i1 <= i0:
+                    continue
+                y0 = y_of(slope * i0 + intercept)
+                y1 = y_of(slope * i1 + intercept)
+                parts.append(
+                    f"<line class='pattern-{line_key}' "
+                    f"x1='{x_of(i0):.1f}' y1='{y0:.1f}' "
+                    f"x2='{x_of(i1):.1f}' y2='{y1:.1f}' "
+                    f"stroke='{color}' stroke-width='1.0' "
+                    f"stroke-dasharray='6,3' opacity='0.8'/>"
+                )
+            else:
+                try:
+                    yv = y_of(float(v))
+                except (TypeError, ValueError):
+                    continue
+                parts.append(
+                    f"<line class='pattern-{line_key}' "
+                    f"x1='{margin_l}' y1='{yv:.1f}' "
+                    f"x2='{margin_l + plot_w}' y2='{yv:.1f}' "
+                    f"stroke='{color}' stroke-width='1.0' "
+                    f"stroke-dasharray='6,3' opacity='0.8'/>"
+                )
+    ltf = ov.get("lower_tf_trigger")
+    if ltf and ltf.get("trigger_price") is not None:
+        yp = y_of(float(ltf["trigger_price"]))
+        cx = x_of(n - 1)
+        triangle = (
+            f"M {cx - 6} {yp + 6} L {cx + 6} {yp + 6} L {cx} {yp - 6} Z"
+        )
+        parts.append(
+            f"<path class='lower-tf-trigger' d='{triangle}' "
+            f"fill='#fb8c00' opacity='0.9'/>"
+        )
+        parts.append(
+            f"<text x='{cx + 8}' y='{yp + 3:.1f}' fill='#bf360c'>"
+            f"trigger:{_html_escape(str(ltf.get('trigger_type')))}</text>"
+        )
+    sp = ov.get("structure_stop_plan") or {}
+    for key, color, label in (
+        ("stop_price", "#c62828", "stop"),
+        ("take_profit_price", "#2e7d32", "tp"),
+        ("structure_stop_price", "#6a1b9a", "structure_stop"),
+        ("atr_stop_price", "#ef6c00", "atr_stop"),
+    ):
+        v = sp.get(key)
+        if v is None:
+            continue
+        yv = y_of(float(v))
+        parts.append(
+            f"<line class='{label.replace('_','-')}-line' "
+            f"x1='{margin_l}' y1='{yv:.1f}' "
+            f"x2='{margin_l + plot_w}' y2='{yv:.1f}' "
+            f"stroke='{color}' stroke-width='1.2' "
+            f"stroke-dasharray='4,2' opacity='0.75'/>"
+        )
+        parts.append(
+            f"<text x='{margin_l + plot_w - 4}' y='{yv - 2:.1f}' "
+            f"text-anchor='end' fill='{color}'>{label}={fmt(float(v))}</text>"
+        )
+    parent_x = x_of(n - 1)
+    parts.append(
+        f"<line class='parent-bar-marker' x1='{parent_x:.1f}' "
+        f"y1='{margin_t}' x2='{parent_x:.1f}' "
+        f"y2='{margin_t + plot_h}' stroke='#222' stroke-width='0.7' "
+        f"stroke-dasharray='2,4' opacity='0.55'/>"
+    )
+    parts.append(
+        f"<text x='{parent_x - 4:.1f}' y='{margin_t + plot_h - 4:.1f}' "
+        f"text-anchor='end' fill='#222'>parent_bar_ts={end_ts.isoformat()}</text>"
+    )
+    parts.append(
+        f"<text x='{margin_l}' y='{margin_t + plot_h + 16}' fill='#444'>"
+        f"{visible.index[0].isoformat()}</text>"
+    )
+    parts.append(
+        f"<text x='{margin_l + plot_w}' y='{margin_t + plot_h + 16}' "
+        f"text-anchor='end' fill='#444'>{visible.index[-1].isoformat()}</text>"
+    )
+    parts.append("</svg>\n")
+    return "".join(parts)
+
+
 def _render_candle_svg(
     *,
     df: pd.DataFrame,
@@ -1284,348 +1597,21 @@ def _render_candle_svg(
     title: str,
     out_path: Path,
 ) -> dict:
-    """Dependency-free SVG fallback for the candle chart. Identical
-    overlay set to the matplotlib renderer (selected/rejected SR zones,
-    selected/rejected trendlines, pattern necklines, lower_tf trigger,
-    stop / take_profit / structure_stop / atr_stop, parent_bar marker).
-
-    Future-leak safe: only bars with `df.index <= end_ts` are drawn.
-    Returns a dict with `image_status`, `image_path`, `marker_file`.
-    """
+    """Thin wrapper around `_build_candle_svg_xml` that writes the SVG
+    to disk and returns the legacy `image_status` dict shape."""
     try:
-        if df is None or len(df) == 0 or n_bars <= 0:
+        xml = _build_candle_svg_xml(
+            df=df, end_ts=end_ts, n_bars=n_bars,
+            overlays=overlays, title=title,
+        )
+        if xml is None:
             marker = out_path.with_suffix(".image_unavailable")
             marker.write_text("no_visible_bars\n")
             return {
                 "image_status": "render_error:no_visible_bars",
                 "marker_file": str(marker),
             }
-        visible = df[df.index <= end_ts].tail(n_bars)
-        if len(visible) == 0:
-            marker = out_path.with_suffix(".image_unavailable")
-            marker.write_text("no_visible_bars\n")
-            return {
-                "image_status": "render_error:no_visible_bars",
-                "marker_file": str(marker),
-            }
-        # ---- coordinate system -------------------------------------
-        W, H = 1200, 600
-        margin_l, margin_r, margin_t, margin_b = 60, 20, 28, 28
-        plot_w = W - margin_l - margin_r
-        plot_h = H - margin_t - margin_b
-        n = len(visible)
-        bar_w = max(2.0, plot_w / max(1, n))
-        body_w = max(1.5, bar_w * 0.6)
-        opens = visible["open"].astype(float).to_numpy()
-        highs = visible["high"].astype(float).to_numpy()
-        lows = visible["low"].astype(float).to_numpy()
-        closes = visible["close"].astype(float).to_numpy()
-        price_lo = float(min(lows.min(), opens.min(), closes.min()))
-        price_hi = float(max(highs.max(), opens.max(), closes.max()))
-        # Expand range so overlay lines (stops, zones) above / below
-        # the visible candles still fit on the canvas.
-        ovl_prices: list[float] = []
-        ov = overlays or {}
-        for lvl in (ov.get("level_zones_selected", [])
-                    + ov.get("level_zones_rejected", [])):
-            for k in ("zone_low", "zone_high"):
-                v = lvl.get(k)
-                if v is not None:
-                    ovl_prices.append(float(v))
-        for p in ov.get("patterns_selected", []):
-            for k in ("neckline", "invalidation_price", "target_price"):
-                v = p.get(k)
-                if v is None or isinstance(v, dict):
-                    continue
-                try:
-                    ovl_prices.append(float(v))
-                except (TypeError, ValueError):
-                    continue
-        sp = ov.get("structure_stop_plan") or {}
-        for k in (
-            "stop_price", "take_profit_price",
-            "structure_stop_price", "atr_stop_price",
-        ):
-            v = sp.get(k)
-            if v is not None:
-                ovl_prices.append(float(v))
-        ltf = ov.get("lower_tf_trigger")
-        if ltf and ltf.get("trigger_price") is not None:
-            ovl_prices.append(float(ltf["trigger_price"]))
-        if ovl_prices:
-            price_lo = min(price_lo, min(ovl_prices))
-            price_hi = max(price_hi, max(ovl_prices))
-        if price_hi <= price_lo:
-            price_hi = price_lo + 1e-9
-        pad = (price_hi - price_lo) * 0.05
-        price_lo -= pad
-        price_hi += pad
-        price_range = price_hi - price_lo
-
-        def x_of(i: int) -> float:
-            return margin_l + (i + 0.5) * bar_w
-
-        def y_of(p: float) -> float:
-            # Higher price → smaller y (SVG y grows downward).
-            return margin_t + (1.0 - (p - price_lo) / price_range) * plot_h
-
-        def fmt(v: float, decimals: int = 5) -> str:
-            return f"{v:.{decimals}f}"
-
-        parts: list[str] = []
-        parts.append(
-            f"<?xml version='1.0' encoding='UTF-8'?>\n"
-            f"<svg xmlns='http://www.w3.org/2000/svg' "
-            f"viewBox='0 0 {W} {H}' width='{W}' height='{H}' "
-            f"font-family='-apple-system, sans-serif' font-size='11'>"
-        )
-        # Background + plot frame
-        parts.append(f"<rect x='0' y='0' width='{W}' height='{H}' fill='#fdfdfd'/>")
-        parts.append(
-            f"<rect x='{margin_l}' y='{margin_t}' width='{plot_w}' "
-            f"height='{plot_h}' fill='white' stroke='#bbb' stroke-width='0.5'/>"
-        )
-        # Y-axis price labels (5 ticks)
-        for i in range(5):
-            frac = i / 4.0
-            p = price_lo + (1.0 - frac) * price_range
-            yp = margin_t + frac * plot_h
-            parts.append(
-                f"<line x1='{margin_l - 3}' y1='{yp:.1f}' x2='{margin_l}' "
-                f"y2='{yp:.1f}' stroke='#888' stroke-width='0.5'/>"
-            )
-            parts.append(
-                f"<text x='{margin_l - 6}' y='{yp + 3:.1f}' text-anchor='end' "
-                f"fill='#444'>{fmt(p)}</text>"
-            )
-        # Title
-        parts.append(
-            f"<text x='{margin_l}' y='18' fill='#222' font-weight='bold'>"
-            f"{_html_escape(title)}</text>"
-        )
-
-        # ---- SR zones (selected first, rejected on top in lower opacity) ----
-        for lvl in ov.get("level_zones_selected", []):
-            zlow = lvl.get("zone_low"); zhigh = lvl.get("zone_high")
-            if zlow is None or zhigh is None:
-                continue
-            kind = lvl.get("kind")
-            color = (
-                "#2e7d32" if kind == "support"
-                else "#c62828" if kind == "resistance"
-                else "#6a1b9a"
-            )
-            y_top = y_of(float(zhigh))
-            y_bot = y_of(float(zlow))
-            parts.append(
-                f"<rect class='sr-selected sr-{kind}' "
-                f"x='{margin_l}' y='{min(y_top, y_bot):.1f}' "
-                f"width='{plot_w}' height='{abs(y_bot - y_top):.1f}' "
-                f"fill='{color}' opacity='0.18'/>"
-            )
-        for lvl in ov.get("level_zones_rejected", []):
-            zlow = lvl.get("zone_low"); zhigh = lvl.get("zone_high")
-            if zlow is None or zhigh is None:
-                continue
-            y_top = y_of(float(zhigh))
-            y_bot = y_of(float(zlow))
-            parts.append(
-                f"<rect class='sr-rejected' "
-                f"x='{margin_l}' y='{min(y_top, y_bot):.1f}' "
-                f"width='{plot_w}' height='{abs(y_bot - y_top):.1f}' "
-                f"fill='#888' opacity='0.08'/>"
-            )
-
-        # ---- Candles (wick + body) -----------------------------------
-        for i in range(n):
-            xi = x_of(i)
-            y_h = y_of(highs[i]); y_l = y_of(lows[i])
-            y_o = y_of(opens[i]); y_c = y_of(closes[i])
-            # Wick
-            parts.append(
-                f"<line class='wick' x1='{xi:.1f}' y1='{y_h:.1f}' "
-                f"x2='{xi:.1f}' y2='{y_l:.1f}' stroke='#222' "
-                f"stroke-width='0.6'/>"
-            )
-            bull = closes[i] >= opens[i]
-            color = "#2e7d32" if bull else "#c62828"
-            body_top = min(y_o, y_c)
-            body_h = max(0.5, abs(y_c - y_o))
-            parts.append(
-                f"<rect class='body candle-{'bull' if bull else 'bear'}' "
-                f"x='{xi - body_w / 2:.1f}' y='{body_top:.1f}' "
-                f"width='{body_w:.1f}' height='{body_h:.1f}' "
-                f"fill='{color}'/>"
-            )
-
-        # ---- Trendlines (selected) ----------------------------------
-        # Anchor indices are bar offsets in the FULL window. For SVG
-        # we map to the visible window: any anchor index >= len(df)
-        # is silently clipped — same behaviour as the matplotlib path.
-        full_len = len(df)
-        # Build a mapping from full-window index → visible-window index
-        # via timestamps (anchors are relative to df_window which the
-        # detector saw, which == the visible window for v2).
-        for t in ov.get("trendlines_selected", []):
-            slope = t.get("slope"); intercept = t.get("intercept")
-            anchors = t.get("anchor_indices") or []
-            if slope is None or intercept is None or len(anchors) < 2:
-                continue
-            i0 = int(anchors[0]); i1 = int(anchors[-1])
-            if i1 >= n:
-                i1 = n - 1
-            if i0 >= n or i1 <= i0:
-                continue
-            y0 = y_of(slope * i0 + intercept)
-            y1 = y_of(slope * i1 + intercept)
-            broken = bool(t.get("broken"))
-            opacity = "0.55" if broken else "0.9"
-            parts.append(
-                f"<line class='trendline-selected' x1='{x_of(i0):.1f}' "
-                f"y1='{y0:.1f}' x2='{x_of(i1):.1f}' y2='{y1:.1f}' "
-                f"stroke='#1565c0' stroke-width='1.4' opacity='{opacity}'/>"
-            )
-        for rj in ov.get("trendlines_rejected", []):
-            tdict = rj.get("trendline") or {}
-            slope = tdict.get("slope"); intercept = tdict.get("intercept")
-            anchors = tdict.get("anchor_indices") or []
-            if slope is None or intercept is None or len(anchors) < 2:
-                continue
-            i0 = int(anchors[0]); i1 = int(anchors[-1])
-            if i1 >= n:
-                i1 = n - 1
-            if i0 >= n or i1 <= i0:
-                continue
-            y0 = y_of(slope * i0 + intercept)
-            y1 = y_of(slope * i1 + intercept)
-            parts.append(
-                f"<line class='trendline-rejected' x1='{x_of(i0):.1f}' "
-                f"y1='{y0:.1f}' x2='{x_of(i1):.1f}' y2='{y1:.1f}' "
-                f"stroke='#888' stroke-width='0.7' opacity='0.5' "
-                f"stroke-dasharray='3,3'/>"
-            )
-
-        # ---- Patterns (neckline as horizontal, upper/lower as sloped) ----
-        for p in ov.get("patterns_selected", []):
-            side = p.get("side_bias")
-            color = (
-                "#1b5e20" if side == "BUY"
-                else "#b71c1c" if side == "SELL"
-                else "#ef6c00"
-            )
-            # neckline → single price (horizontal)
-            nl = p.get("neckline")
-            if nl is not None and not isinstance(nl, dict):
-                yv = y_of(float(nl))
-                parts.append(
-                    f"<line class='pattern-neckline' "
-                    f"x1='{margin_l}' y1='{yv:.1f}' "
-                    f"x2='{margin_l + plot_w}' y2='{yv:.1f}' "
-                    f"stroke='{color}' stroke-width='1.0' "
-                    f"stroke-dasharray='6,3' opacity='0.8'/>"
-                )
-            # upper_line / lower_line → may be a dict {slope, intercept,
-            # anchors} (sloped trend boundary) OR a scalar (horizontal).
-            for line_key in ("upper_line", "lower_line"):
-                v = p.get(line_key)
-                if v is None:
-                    continue
-                if isinstance(v, dict):
-                    slope = v.get("slope"); intercept = v.get("intercept")
-                    anchors = v.get("anchors") or v.get("anchor_indices") or []
-                    if slope is None or intercept is None or len(anchors) < 2:
-                        continue
-                    i0 = int(anchors[0]); i1 = int(anchors[-1])
-                    if i1 >= n:
-                        i1 = n - 1
-                    if i0 >= n or i1 <= i0:
-                        continue
-                    y0 = y_of(slope * i0 + intercept)
-                    y1 = y_of(slope * i1 + intercept)
-                    parts.append(
-                        f"<line class='pattern-{line_key}' "
-                        f"x1='{x_of(i0):.1f}' y1='{y0:.1f}' "
-                        f"x2='{x_of(i1):.1f}' y2='{y1:.1f}' "
-                        f"stroke='{color}' stroke-width='1.0' "
-                        f"stroke-dasharray='6,3' opacity='0.8'/>"
-                    )
-                else:
-                    try:
-                        yv = y_of(float(v))
-                    except (TypeError, ValueError):
-                        continue
-                    parts.append(
-                        f"<line class='pattern-{line_key}' "
-                        f"x1='{margin_l}' y1='{yv:.1f}' "
-                        f"x2='{margin_l + plot_w}' y2='{yv:.1f}' "
-                        f"stroke='{color}' stroke-width='1.0' "
-                        f"stroke-dasharray='6,3' opacity='0.8'/>"
-                    )
-
-        # ---- Lower TF trigger marker ---------------------------------
-        ltf = ov.get("lower_tf_trigger")
-        if ltf and ltf.get("trigger_price") is not None:
-            yp = y_of(float(ltf["trigger_price"]))
-            cx = x_of(n - 1)
-            triangle = (
-                f"M {cx - 6} {yp + 6} L {cx + 6} {yp + 6} L {cx} {yp - 6} Z"
-            )
-            parts.append(
-                f"<path class='lower-tf-trigger' d='{triangle}' "
-                f"fill='#fb8c00' opacity='0.9'/>"
-            )
-            parts.append(
-                f"<text x='{cx + 8}' y='{yp + 3:.1f}' fill='#bf360c'>"
-                f"trigger:{_html_escape(str(ltf.get('trigger_type')))}</text>"
-            )
-
-        # ---- Stop / TP / structure_stop / atr_stop -------------------
-        sp = ov.get("structure_stop_plan") or {}
-        for key, color, label in (
-            ("stop_price", "#c62828", "stop"),
-            ("take_profit_price", "#2e7d32", "tp"),
-            ("structure_stop_price", "#6a1b9a", "structure_stop"),
-            ("atr_stop_price", "#ef6c00", "atr_stop"),
-        ):
-            v = sp.get(key)
-            if v is None:
-                continue
-            yv = y_of(float(v))
-            parts.append(
-                f"<line class='{label.replace('_','-')}-line' "
-                f"x1='{margin_l}' y1='{yv:.1f}' "
-                f"x2='{margin_l + plot_w}' y2='{yv:.1f}' "
-                f"stroke='{color}' stroke-width='1.2' "
-                f"stroke-dasharray='4,2' opacity='0.75'/>"
-            )
-            parts.append(
-                f"<text x='{margin_l + plot_w - 4}' y='{yv - 2:.1f}' "
-                f"text-anchor='end' fill='{color}'>{label}={fmt(float(v))}</text>"
-            )
-
-        # ---- parent_bar marker (vertical at last visible bar) -------
-        parent_x = x_of(n - 1)
-        parts.append(
-            f"<line class='parent-bar-marker' x1='{parent_x:.1f}' "
-            f"y1='{margin_t}' x2='{parent_x:.1f}' "
-            f"y2='{margin_t + plot_h}' stroke='#222' stroke-width='0.7' "
-            f"stroke-dasharray='2,4' opacity='0.55'/>"
-        )
-        parts.append(
-            f"<text x='{parent_x - 4:.1f}' y='{margin_t + plot_h - 4:.1f}' "
-            f"text-anchor='end' fill='#222'>parent_bar_ts={end_ts.isoformat()}</text>"
-        )
-        # Time axis: first / last bar timestamp
-        parts.append(
-            f"<text x='{margin_l}' y='{margin_t + plot_h + 16}' fill='#444'>"
-            f"{visible.index[0].isoformat()}</text>"
-        )
-        parts.append(
-            f"<text x='{margin_l + plot_w}' y='{margin_t + plot_h + 16}' "
-            f"text-anchor='end' fill='#444'>{visible.index[-1].isoformat()}</text>"
-        )
-        parts.append("</svg>\n")
-        out_path.write_text("".join(parts))
+        out_path.write_text(xml)
         return {
             "image_status": "rendered",
             "image_path": str(out_path),
@@ -2005,6 +1991,27 @@ img.thumb { width: 220px; height: auto; border: 1px solid #ddd; }
 .renderer-tag { color: #666; font-size: 11px; margin: 2px 0 0 0; }
 .demo-banner { background: #fff8e1; border: 1px solid #f9a825;
   padding: 8px 12px; border-radius: 4px; margin: 8px 0; }
+
+/* Mobile / narrow viewport: collapse the 2-column detail layout, make
+   tables horizontally scrollable, and let charts use the full width.
+   Pinned by tests/test_visual_audit.py (responsive_css tests). */
+@media (max-width: 800px) {
+  body { margin: 4px; padding: 8px; font-size: 14px; }
+  h1 { font-size: 18px; }
+  h2 { font-size: 16px; }
+  h3 { font-size: 14px; }
+  .case-detail { display: block; }
+  .case-detail .left,
+  .case-detail .right { flex: none; min-width: 0; }
+  table { display: block; overflow-x: auto; white-space: nowrap; }
+  table.checklist { white-space: normal; }
+  img, svg { max-width: 100%; height: auto; }
+  img.thumb { width: 100%; max-width: 360px; }
+  pre { white-space: pre-wrap; word-break: break-word; }
+  .panel { margin-bottom: 12px; padding: 6px 8px; }
+  .demo-banner { font-size: 13px; }
+  .case-section { margin-bottom: 24px; }
+}
 """
 
 
@@ -2645,4 +2652,252 @@ def render_visual_audit_report(
         "out_dir": str(out_dir),
         "n_cases": len(cases_summary),
         "summary": summary,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Mobile single-file renderer (visual_audit_mobile_v1)
+# ---------------------------------------------------------------------------
+#
+# Bundles the index + N case detail sections + inline <svg> charts +
+# checklist panels into ONE self-contained HTML file. Useful for sharing
+# audit results to a phone (relative-link breakage avoided, charts
+# embedded, all CSS inline).
+#
+# Pinned by `tests/test_visual_audit.py::test_mobile_single_file_*`.
+# ---------------------------------------------------------------------------
+
+
+MOBILE_SCHEMA_VERSION: Final[str] = "visual_audit_mobile_v1"
+
+
+def _mobile_case_section_html(
+    *,
+    section_id: str,
+    case_label: str,
+    payload: dict,
+    svg_xml: str | None,
+    df_was_present: bool,
+) -> str:
+    """Render one case as a self-contained <section> block."""
+    v2 = payload.get("royal_road_decision_v2") or {}
+    cmp_v1 = v2.get("compared_to_current_runtime") or {}
+    panels = payload.get("checklist_panels") or {}
+    rq = v2.get("reconstruction_quality") or {}
+    setup_candidates = v2.get("setup_candidates") or []
+    block_reasons = v2.get("block_reasons") or []
+    cautions = v2.get("cautions") or []
+    title = (
+        f"{_html_escape(case_label)} "
+        f"action={_html_escape(v2.get('action') or '')} "
+        f"mode={_html_escape(v2.get('mode') or '')} "
+        f"quality={float(rq.get('total_reconstruction_score', 0.0)):.3f}"
+    )
+
+    if svg_xml is not None:
+        # Strip the XML prolog so the SVG can be embedded inline in HTML.
+        svg_inline = re.sub(
+            r"^<\?xml[^?]*\?>\s*", "", svg_xml, count=1, flags=re.S
+        )
+        chart_html = (
+            "<div class='chart-wrap'>" + svg_inline + "</div>"
+        )
+    else:
+        chart_html = (
+            "<p class='placeholder'>chart not available "
+            f"(df_present={df_was_present})</p>"
+        )
+
+    cmp_html = (
+        "<table>"
+        "<tr><th></th><th>current_runtime</th><th>royal_road_v2</th></tr>"
+        f"<tr><td>action</td><td>{_html_escape(cmp_v1.get('current_action', ''))}</td>"
+        f"<td>{_html_escape(cmp_v1.get('royal_road_action', ''))}</td></tr>"
+        f"<tr><td>same?</td><td colspan='2'>{cmp_v1.get('same_action')}</td></tr>"
+        f"<tr><td>diff</td><td colspan='2'>{_html_escape(cmp_v1.get('difference_type', ''))}</td></tr>"
+        "</table>"
+    )
+
+    panels_html = _render_checklist_panels_html(panels)
+
+    setup_html = "".join(
+        f"<details><summary>candidate #{i+1} side={c.get('side')} "
+        f"score={c.get('score'):.3f} confidence={c.get('confidence')}</summary>"
+        f"<pre>{_html_escape(json.dumps(c, indent=2, default=str))}</pre>"
+        "</details>"
+        for i, c in enumerate(setup_candidates)
+    ) or "<p class='placeholder'>no setup candidates</p>"
+
+    block_html = (
+        "<ul>" + "".join(
+            f"<li><b>{_html_escape(r)}</b></li>" for r in block_reasons
+        ) + "</ul>"
+        if block_reasons else "<p>(none)</p>"
+    )
+    cautions_html = (
+        "<ul>" + "".join(
+            f"<li>{_html_escape(c)}</li>" for c in cautions
+        ) + "</ul>"
+        if cautions else "<p>(none)</p>"
+    )
+
+    rq_html = f"<pre>{_html_escape(json.dumps(rq, indent=2, default=str))}</pre>"
+
+    raw_excerpt = {
+        "case_id": payload.get("case_id"),
+        "symbol": payload.get("symbol"),
+        "parent_bar_ts": payload.get("parent_bar_ts"),
+        "render_window_end_ts": payload.get("render_window_end_ts"),
+        "bars_used_in_render": payload.get("bars_used_in_render"),
+        "action": v2.get("action"),
+        "mode": v2.get("mode"),
+        "block_reasons": block_reasons,
+        "cautions": cautions,
+        "reconstruction_quality_total":
+            rq.get("total_reconstruction_score"),
+        "compared_to_current_runtime": cmp_v1,
+    }
+
+    return (
+        f"<section class='case-section' id='{_html_escape(section_id)}'>"
+        f"<h2>{title}</h2>"
+        "<h3>chart</h3>"
+        + chart_html
+        + "<h3>Royal Road Checklist Panels</h3>"
+        + panels_html
+        + "<h3>current_runtime vs royal_road_v2</h3>"
+        + cmp_html
+        + "<h3>setup_candidates</h3>"
+        + setup_html
+        + "<h3>block_reasons</h3>"
+        + block_html
+        + "<h3>cautions</h3>"
+        + cautions_html
+        + "<h3>reconstruction_quality</h3>"
+        + rq_html
+        + "<h3>audit summary (raw)</h3>"
+        + f"<pre>{_html_escape(json.dumps(raw_excerpt, indent=2, default=str))}</pre>"
+        "<p><a href='#case-list'>↑ back to case list</a></p>"
+        "</section>"
+    )
+
+
+def render_visual_audit_mobile_single_file(
+    *,
+    traces: Iterable[Any],
+    df_by_symbol: dict[str, pd.DataFrame],
+    df_lower_by_symbol: dict[str, pd.DataFrame] | None = None,
+    out_path: Path | str,
+    max_cases: int = 5,
+    title: str = "visual_audit_mobile_v1",
+    demo_fixture_banner: str | None = None,
+) -> dict:
+    """Generate ONE self-contained HTML file with up to `max_cases`
+    cases. Designed for sharing audit results to a phone where relative
+    links and multi-file layouts break easily.
+
+    Output is a single HTML document with:
+      - <meta name='viewport' content='width=device-width, initial-scale=1'>
+      - inline <style> (full _DEFAULT_CSS, including the @media block)
+      - top: case list with in-page anchors
+      - per case: inline <svg> chart + checklist panels + comparison +
+        setup_candidates + block_reasons + cautions + raw audit excerpt
+      - demo_fixture_banner emitted as a prominent banner when set
+
+    Future-leak: the chart SVG is built via `_build_candle_svg_xml`
+    which only reads `df.index <= parent_bar_ts`.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    selected = select_important_cases(traces, max_cases=max_cases)
+
+    sections: list[str] = []
+    list_items: list[str] = []
+    cases_meta: list[dict] = []
+
+    for idx, case in enumerate(selected, start=1):
+        sym = case["symbol"]
+        df = df_by_symbol.get(sym)
+        payload = build_visual_audit_payload(
+            trace=case["trace"],
+            df=df if df is not None else pd.DataFrame(),
+        )
+        if payload is None:
+            continue
+        section_id = f"case-{idx}"
+        v2 = payload.get("royal_road_decision_v2") or {}
+        action = v2.get("action") or "?"
+        ts = case.get("ts", "")
+        case_label = f"{sym} @ {ts} ({action})"
+        # Build the inline SVG chart string (or None on failure).
+        svg_xml: str | None = None
+        if df is not None and len(df) > 0:
+            try:
+                end_ts = pd.Timestamp(payload["parent_bar_ts"])
+                svg_xml = _build_candle_svg_xml(
+                    df=df, end_ts=end_ts,
+                    n_bars=int(payload.get("bars_used_in_render") or 0),
+                    overlays=payload.get("overlays") or {},
+                    title=payload.get("title", ""),
+                )
+            except Exception:  # noqa: BLE001
+                svg_xml = None
+        # Inject the case_id / symbol fields the section template uses.
+        payload["case_id"] = f"{sym}_{_safe_ts_for_path(ts)}"
+        payload["symbol"] = sym
+        sections.append(_mobile_case_section_html(
+            section_id=section_id,
+            case_label=case_label,
+            payload=payload,
+            svg_xml=svg_xml,
+            df_was_present=df is not None and len(df) > 0,
+        ))
+        list_items.append(
+            f"<li><a href='#{section_id}'>"
+            f"{_html_escape(case_label)} "
+            f"<span class='priority-tag'>"
+            f"[{_html_escape(case.get('priority', ''))}]</span>"
+            "</a></li>"
+        )
+        cases_meta.append({
+            "case_id": payload["case_id"],
+            "symbol": sym, "ts": ts,
+            "priority": case.get("priority"),
+            "action": action,
+            "section_id": section_id,
+        })
+
+    banner_html = (
+        f"<div class='demo-banner'><b>demo_fixture_not_backtest_result</b>: "
+        f"{_html_escape(demo_fixture_banner)}</div>"
+        if demo_fixture_banner else ""
+    )
+    case_list_html = (
+        "<section id='case-list'><h2>Case list</h2>"
+        + (f"<ul>{''.join(list_items)}</ul>" if list_items
+           else "<p class='placeholder'>(no cases)</p>")
+        + "</section>"
+    )
+
+    body = (
+        "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        f"<title>{_html_escape(title)}</title>"
+        f"<style>{_DEFAULT_CSS}</style>"
+        "</head><body>"
+        f"<h1>{_html_escape(title)}</h1>"
+        + banner_html
+        + f"<p>schema={MOBILE_SCHEMA_VERSION} cases={len(sections)}</p>"
+        + case_list_html
+        + "".join(sections)
+        + "</body></html>"
+    )
+    out_path.write_text(body)
+    return {
+        "schema_version": MOBILE_SCHEMA_VERSION,
+        "out_path": str(out_path),
+        "n_cases": len(sections),
+        "cases": cases_meta,
+        "size_bytes": out_path.stat().st_size,
+        "demo_fixture_not_backtest_result": bool(demo_fixture_banner),
     }
