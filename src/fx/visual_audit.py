@@ -2954,6 +2954,26 @@ img.thumb { width: 220px; height: auto; border: 1px solid #ddd; }
   border: 2px solid #1565c0; border-radius: 4px; padding: 6px 10px;
   margin: 4px 0 10px; font-size: 12px; }
 .decision-bridge .integrated-banner p { margin: 2px 0; }
+/* Phase F state cards (wave gate / breakout quality / entry status) */
+.decision-bridge .phase-f-section { background: #fffbf0;
+  border: 2px solid #c97b09; border-radius: 5px; padding: 8px 10px;
+  margin: 6px 0; }
+.decision-bridge .phase-f-cards h4 { color: #c97b09; margin: 0 0 6px;
+  font-size: 13px; }
+.decision-bridge .phase-f-card { background: white; border-radius: 4px;
+  padding: 6px 8px; margin: 4px 0; border-left: 4px solid #888; }
+.decision-bridge .phase-f-pass, .decision-bridge .phase-f-status-ready {
+  color: #2e7d32; font-weight: bold; }
+.decision-bridge .phase-f-warn,
+.decision-bridge .phase-f-status-wait-breakout,
+.decision-bridge .phase-f-status-wait-retest { color: #f9a825; font-weight: bold; }
+.decision-bridge .phase-f-block, .decision-bridge .phase-f-status-hold {
+  color: #c62828; font-weight: bold; }
+.decision-bridge .phase-f-bq-table { font-size: 11px; margin-top: 4px;
+  border-collapse: collapse; width: 100%; }
+.decision-bridge .phase-f-bq-table th { text-align: left;
+  padding: 2px 4px; background: #fff3cd; }
+.decision-bridge .phase-f-bq-table td { padding: 2px 4px; }
 .decision-bridge .bridge-tag-not-connected { background: #c62828; }
 .decision-bridge .bridge-tag-unknown { background: #888; }
 .decision-bridge .bridge-reason { color: #333; }
@@ -4040,6 +4060,119 @@ def _render_wave_line_legend_html(
     )
 
 
+def _render_phase_f_cards(
+    *,
+    entry_plan: dict,
+    breakout_quality: dict,
+    pattern_levels: dict,
+) -> str:
+    """Render the Phase F state cards (wave gate / breakout quality /
+    entry status) for the integrated profile bridge."""
+    # ── Wave-first gate card ──────────────────────────────────────
+    wave_status = "PASS"
+    wave_reason = ""
+    if not (pattern_levels or {}).get("available"):
+        wave_status = "BLOCK"
+        wave_reason = "波形パターンが認識されていません。"
+    elif not (pattern_levels or {}).get("parts"):
+        wave_status = "BLOCK"
+        wave_reason = "波形の主要部位 (B1/NL 等) がマップされていません。"
+    elif (pattern_levels or {}).get("trigger_line_price") is None:
+        wave_status = "BLOCK"
+        wave_reason = "トリガーライン (NL/BR) が引けていません。"
+    else:
+        kind = pattern_levels.get("pattern_kind") or "(unknown)"
+        side = pattern_levels.get("side") or "?"
+        wave_reason = (
+            f"波形 {_html_escape(kind)} ({side}) を認識。"
+            f"主要部位 {len((pattern_levels or {}).get('parts') or {})} 件。"
+        )
+    wave_class = f"phase-f-{wave_status.lower()}"
+
+    # ── Breakout quality card ────────────────────────────────────
+    bq_status = (breakout_quality or {}).get("status") or "WARN"
+    bq_class = f"phase-f-{bq_status.lower()}"
+    sub_rows = ""
+    for label_ja, key in (
+        ("ビルドアップ", "build_up_status"),
+        ("上位足一致", "trend_alignment_status"),
+        ("損切り注文蓄積", "stop_loss_accumulation_status"),
+    ):
+        s = (breakout_quality or {}).get(key) or "—"
+        s_class = f"phase-f-{str(s).lower()}"
+        reason_key = key.replace("_status", "_reason_ja")
+        reason = (breakout_quality or {}).get(reason_key) or ""
+        sub_rows += (
+            f"<tr><th>{_html_escape(label_ja)}</th>"
+            f"<td><span class='{s_class}'>{_html_escape(s)}</span></td>"
+            f"<td class='small'>{_html_escape(reason)}</td></tr>"
+        )
+
+    # ── Entry status card ────────────────────────────────────────
+    ep_status = (entry_plan or {}).get("entry_status") or "HOLD"
+    ep_side = (entry_plan or {}).get("side") or "—"
+    ep_status_class = f"phase-f-status-{ep_status.lower().replace('_', '-')}"
+    trigger_id = (entry_plan or {}).get("trigger_line_id") or "—"
+    trigger_price = (entry_plan or {}).get("trigger_line_price")
+    stop_price = (entry_plan or {}).get("stop_price")
+    target_price = (entry_plan or {}).get("target_price")
+    rr = (entry_plan or {}).get("rr")
+
+    def _fmt(v) -> str:
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):.5f}"
+        except Exception:  # noqa: BLE001
+            return str(v)
+
+    def _fmt_rr(v) -> str:
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):.2f}"
+        except Exception:  # noqa: BLE001
+            return str(v)
+
+    plan_reason = (entry_plan or {}).get("reason_ja") or ""
+    plan_wait = (entry_plan or {}).get("what_to_wait_for_ja") or ""
+
+    return (
+        "<div class='phase-f-cards'>"
+        + f"<h4>★ 王道統合ロジック (Phase F state)</h4>"
+
+        + f"<div class='phase-f-card {wave_class}'>"
+        + "<b>波形ゲート (P0):</b> "
+        + f"<span class='{wave_class}'>{_html_escape(wave_status)}</span>"
+        + f"<p class='small'>{_html_escape(wave_reason)}</p>"
+        + "</div>"
+
+        + f"<div class='phase-f-card {bq_class}'>"
+        + "<b>ブレイクアウト品質 (3条件):</b> "
+        + f"<span class='{bq_class}'>{_html_escape(bq_status)}</span>"
+        + "<table class='phase-f-bq-table'>"
+        + sub_rows
+        + "</table>"
+        + "</div>"
+
+        + f"<div class='phase-f-card {ep_status_class}'>"
+        + f"<b>エントリー状態:</b> "
+        + f"<span class='{ep_status_class}'>{_html_escape(ep_status)}</span>"
+        + f" <span class='small'>(side={_html_escape(ep_side)}, "
+        + f"trigger={_html_escape(trigger_id)} @ {_fmt(trigger_price)}, "
+        + f"stop={_fmt(stop_price)}, target={_fmt(target_price)}, "
+        + f"RR={_fmt_rr(rr)})</span>"
+        + f"<p class='small'>{_html_escape(plan_reason)}</p>"
+        + (
+            f"<p class='small'><i>待機: {_html_escape(plan_wait)}</i></p>"
+            if plan_wait else ""
+        )
+        + "</div>"
+
+        + "</div>"
+    )
+
+
 def _render_decision_bridge_html(
     bridge: dict | None,
     *,
@@ -4131,6 +4264,7 @@ def _render_decision_bridge_html(
     integrated_active = bool(bridge.get("integrated_profile_active"))
     integrated_mode = bridge.get("integrated_mode") or ""
     integrated_banner_html = ""
+    integrated_phase_f_html = ""
     if integrated_active:
         mode_ja = (
             "strict (必須データ未接続なら HOLD)"
@@ -4139,17 +4273,32 @@ def _render_decision_bridge_html(
         )
         integrated_banner_html = (
             "<div class='integrated-banner'>"
-            "<p><b>★ この判断は王道統合ロジックで出ています。</b></p>"
-            "<p>波形 / Wライン / フィボ / ローソク足 / ダウ / MA / RSI / "
-            "BB / MACD / 損切り / RR を統合して判定しています。"
-            f"mode = <b>{_html_escape(mode_ja)}</b>。</p>"
+            "<p><b>★ この判断は波形を最優先にした王道統合ロジックで出ています。</b></p>"
+            "<p>最初に波形・ネックライン・損切り・RR を確認し、"
+            "その後にブレイクアウト品質、フィボ、ローソク足、MA、RSI、MACD、BB を"
+            "補助として確認しています。</p>"
+            f"<p>mode = <b>{_html_escape(mode_ja)}</b>。</p>"
             "</div>"
         )
+        # Phase F state cards
+        ep = bridge.get("entry_plan") or {}
+        bq = bridge.get("breakout_quality_gate") or {}
+        pl = bridge.get("pattern_levels") or {}
+        if ep or bq or pl:
+            integrated_phase_f_html = (
+                "<div class='bridge-section phase-f-section'>"
+                + _render_phase_f_cards(
+                    entry_plan=ep, breakout_quality=bq,
+                    pattern_levels=pl,
+                )
+                + "</div>"
+            )
 
     return (
         "<div class='decision-bridge'>"
         "<h3>★ この判断の読み方 (decision bridge)</h3>"
         + integrated_banner_html
+        + integrated_phase_f_html
 
         + "<div class='bridge-section bridge-final-section'>"
         "<h4>1. 最終判断</h4>"

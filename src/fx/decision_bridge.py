@@ -139,6 +139,12 @@ def build_decision_bridge(payload: dict | None) -> dict:
         or integrated.get("schema_version") == "royal_road_integrated_decision_v1"
     )
     integrated_mode = integrated.get("mode") if is_integrated else None
+    # Phase F state — exposed at the top of the bridge output so
+    # visual_audit can render the entry status / breakout quality /
+    # wave-first gate cards prominently.
+    entry_plan_data = v2.get("entry_plan") if is_integrated else None
+    breakout_quality_data = v2.get("breakout_quality_gate") if is_integrated else None
+    pattern_levels_data = v2.get("pattern_levels") if is_integrated else None
 
     # ── USED / PARTIAL ─────────────────────────────────────────
     used: list[dict] = []
@@ -611,6 +617,11 @@ def build_decision_bridge(payload: dict | None) -> dict:
         "final_action_source": profile,
         "integrated_profile_active": bool(is_integrated),
         "integrated_mode": integrated_mode,
+        # Phase F state cards — visual_audit reads these to render
+        # the wave gate / breakout quality / entry status panels.
+        "entry_plan": entry_plan_data,
+        "breakout_quality_gate": breakout_quality_data,
+        "pattern_levels": pattern_levels_data,
         "summary_ja": summary_ja,
         "action_message_ja": action_message_ja,
         "plain_answer_ja": plain_answer_ja,

@@ -922,11 +922,57 @@ def _build_normal_integrated_mobile(
     )
 
 
-def _build_double_bottom_integrated_buy_demo_mobile(*, out_path: Path) -> dict:
-    """Hand-crafted double-bottom OHLCV driven through the integrated
-    profile so the resulting BUY action surfaces in the audit HTML.
+def _double_bottom_with_retest_ohlcv(n: int = 320, seed: int = 11) -> pd.DataFrame:
+    """DB curve that includes a post-breakout retest at the neckline,
+    ending with a clearly bullish confirmation bar. Designed to
+    produce READY/BUY through the integrated profile.
     """
-    df = _double_bottom_ohlcv()
+    knots = [
+        (0.00, 0.70),  # prior high
+        (0.15, 0.05),  # B1
+        (0.40, 0.55),  # NL
+        (0.65, 0.10),  # B2
+        (0.78, 0.62),  # breakout above NL
+        (0.86, 0.55),  # retest at NL
+        (1.00, 0.95),  # final bullish move
+    ]
+    df = _ohlc_from_curve(_piecewise_curve(knots, n), seed=seed)
+    # Force the LAST bar to be a clear bullish body so the candle
+    # anatomy review classifies it as bullish_engulfing / bullish_pinbar
+    # (the readme-builder default uses tiny bodies).
+    last_close = float(df["close"].iloc[-1])
+    last_open = last_close - 0.0030  # bullish body
+    df.iloc[-1, df.columns.get_loc("open")] = last_open
+    df.iloc[-1, df.columns.get_loc("low")] = last_open - 0.0002
+    df.iloc[-1, df.columns.get_loc("high")] = last_close + 0.0002
+    return df
+
+
+def _double_top_with_retest_ohlcv(n: int = 320, seed: int = 11) -> pd.DataFrame:
+    """DT curve with retest + bearish confirmation bar."""
+    knots = [
+        (0.00, 0.30),  # prior low
+        (0.15, 0.95),  # P1 (top)
+        (0.40, 0.45),  # NL (trough between tops)
+        (0.65, 0.90),  # P2 (top, similar height)
+        (0.78, 0.38),  # breakdown below NL
+        (0.86, 0.45),  # retest at NL
+        (1.00, 0.05),  # final bearish move
+    ]
+    df = _ohlc_from_curve(_piecewise_curve(knots, n), seed=seed)
+    last_close = float(df["close"].iloc[-1])
+    last_open = last_close + 0.0030  # bearish body
+    df.iloc[-1, df.columns.get_loc("open")] = last_open
+    df.iloc[-1, df.columns.get_loc("high")] = last_open + 0.0002
+    df.iloc[-1, df.columns.get_loc("low")] = last_close - 0.0002
+    return df
+
+
+def _build_double_bottom_integrated_buy_demo_mobile(*, out_path: Path) -> dict:
+    """Hand-crafted double-bottom + retest OHLCV driven through the
+    integrated profile so READY/BUY surfaces in the audit HTML.
+    """
+    df = _double_bottom_with_retest_ohlcv()
     sym = "EURUSD=X"
     res = run_engine_backtest(
         df, sym, interval="1h", warmup=30,
@@ -940,14 +986,14 @@ def _build_double_bottom_integrated_buy_demo_mobile(*, out_path: Path) -> dict:
         max_cases=3,
         title="visual_audit_mobile_v1 — double_bottom integrated BUY demo",
         demo_fixture_banner=(
-            "double_bottom デモ。波形 / WNL 突破 / WSL / WTP / ダウ反転 / "
-            "ローソク足 (at_support) を統合して判断します。"
+            "double_bottom + retest デモ。波形認識 → WNL 突破 → リターンムーブ"
+            "→ 確定足を経由して、READY / BUY が出るケースを含みます。"
         ),
     )
 
 
 def _build_double_top_integrated_sell_demo_mobile(*, out_path: Path) -> dict:
-    df = _double_top_ohlcv()
+    df = _double_top_with_retest_ohlcv()
     sym = "EURUSD=X"
     res = run_engine_backtest(
         df, sym, interval="1h", warmup=30,
@@ -961,8 +1007,8 @@ def _build_double_top_integrated_sell_demo_mobile(*, out_path: Path) -> dict:
         max_cases=3,
         title="visual_audit_mobile_v1 — double_top integrated SELL demo",
         demo_fixture_banner=(
-            "double_top デモ。波形 / WNL 割れ / WSL / WTP / ダウ転換 / "
-            "ローソク足 (into_resistance) を統合して判断します。"
+            "double_top + retest デモ。波形認識 → WNL 割れ → 戻り → 確定足"
+            "を経由して、READY / SELL が出るケースを含みます。"
         ),
     )
 
