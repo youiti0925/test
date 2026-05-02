@@ -164,33 +164,71 @@ def test_legacy_v2_keeps_audit_only_classification():
     assert audit_categories.get("fibonacci_context_review") == AUDIT_ONLY
 
 
-def test_integrated_upgrades_wave_to_used():
+def test_integrated_layout_p0_axes_in_used_list():
+    """P0 axes (wave_pattern, wave_lines, dow_structure,
+    invalidation_rr) MUST appear in used_for_final_decision when
+    integrated profile is active. raw panels go to audit_only."""
     bridge = build_decision_bridge(_payload(_integrated_v2_slice(action="BUY")))
-    by_cat = {e["category"]: e for e in bridge["audit_only_references"]}
-    assert by_cat["wave_shape_review"]["status"] == USED, by_cat["wave_shape_review"]
-    assert by_cat["wave_derived_lines"]["status"] == USED, by_cat["wave_derived_lines"]
+    used_cats = {e["category"] for e in bridge["used_for_final_decision"]}
+    # P0 axis entries must all be in used_for_final_decision
+    assert "wave_pattern_axis" in used_cats, used_cats
+    assert "wave_lines_axis" in used_cats, used_cats
+    assert "dow_structure_axis" in used_cats, used_cats
 
 
-def test_integrated_upgrades_fibonacci_when_pass():
+def test_integrated_layout_p1_axes_in_used_list():
+    """P1 axes (fibonacci, candlestick, ma, levels) → used list."""
     bridge = build_decision_bridge(_payload(_integrated_v2_slice(action="BUY")))
-    by_cat = {e["category"]: e for e in bridge["audit_only_references"]}
-    assert by_cat["fibonacci_context_review"]["status"] == USED
+    used_cats = {e["category"] for e in bridge["used_for_final_decision"]}
+    assert "fibonacci_axis" in used_cats, used_cats
+    assert "candlestick_axis" in used_cats, used_cats
 
 
-def test_integrated_downgrades_fibonacci_to_partial_when_warn():
-    """Integrated PASS=USED, WARN=PARTIAL, BLOCK=USED."""
+def test_integrated_layout_raw_panels_in_audit_only():
+    """raw panel display (Grand Confluence summary, raw masterclass,
+    wave raw display) must appear in audit_only_references — NOT in
+    used_for_final_decision — to make the distinction explicit."""
+    bridge = build_decision_bridge(_payload(_integrated_v2_slice(action="BUY")))
+    audit_cats = {e["category"] for e in bridge["audit_only_references"]}
+    assert "wave_shape_review_raw" in audit_cats, audit_cats
+    assert "wave_derived_lines_raw" in audit_cats, audit_cats
+    assert "masterclass_panels_raw" in audit_cats, audit_cats
+    # raw entries must all be AUDIT_ONLY status
+    for e in bridge["audit_only_references"]:
+        assert e["status"] == AUDIT_ONLY, (
+            f"raw panel entry {e['category']!r} must be AUDIT_ONLY, "
+            f"got {e['status']!r}"
+        )
+
+
+def test_integrated_fibonacci_pass_appears_as_used():
+    bridge = build_decision_bridge(_payload(_integrated_v2_slice(action="BUY")))
+    by_cat = {e["category"]: e for e in bridge["used_for_final_decision"]}
+    assert by_cat["fibonacci_axis"]["status"] == USED, by_cat["fibonacci_axis"]
+
+
+def test_integrated_fibonacci_warn_appears_as_partial():
+    """Integrated PASS=USED, WARN=PARTIAL (P1 — block-as-partial)."""
     bridge = build_decision_bridge(_payload(_integrated_v2_slice(
         action="BUY",
         axes_overrides={"source_pack_fibonacci": "WARN"},
     )))
-    by_cat = {e["category"]: e for e in bridge["audit_only_references"]}
-    assert by_cat["fibonacci_context_review"]["status"] == PARTIAL
+    by_cat = {e["category"]: e for e in bridge["used_for_final_decision"]}
+    assert by_cat["fibonacci_axis"]["status"] == PARTIAL
 
 
-def test_integrated_marks_masterclass_as_partial():
-    bridge = build_decision_bridge(_payload(_integrated_v2_slice(action="BUY")))
-    by_cat = {e["category"]: e for e in bridge["audit_only_references"]}
-    assert by_cat["masterclass_panels"]["status"] == PARTIAL
+def test_integrated_p0_block_reports_as_used_not_partial():
+    """When a P0 required axis BLOCKs (forces HOLD), the bridge
+    reports it as USED — the BLOCK actively drove the action."""
+    bridge = build_decision_bridge(_payload(_integrated_v2_slice(
+        action="HOLD",
+        block_reasons=["wave_lines_blocked"],
+        axes_overrides={"wave_derived_lines": "BLOCK"},
+    )))
+    by_cat = {e["category"]: e for e in bridge["used_for_final_decision"]}
+    assert by_cat["wave_lines_axis"]["status"] == USED, (
+        f"P0 BLOCK must report as USED, got {by_cat['wave_lines_axis']['status']!r}"
+    )
 
 
 def test_integrated_used_for_final_decision_uses_integrated_core():

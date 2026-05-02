@@ -63,6 +63,49 @@ def _entry(
     }
 
 
+def _axis_entry(
+    *,
+    category: str,
+    label_ja: str,
+    axis: dict,
+    use_block_as_used: bool,
+) -> dict:
+    """Render one IntegratedEvidenceAxis as a bridge entry.
+
+    `use_block_as_used=True` means BLOCK status is reported as USED
+    (the axis actively forced HOLD — which IS using it). This is
+    appropriate for required P0 axes. P1/P2 axes use
+    `use_block_as_used=False` so a BLOCK still reports as PARTIAL.
+    """
+    ax_status = (axis.get("status") or "").upper()
+    if ax_status == "PASS":
+        bridge_status = USED
+    elif ax_status == "WARN":
+        bridge_status = PARTIAL
+    elif ax_status == "BLOCK":
+        bridge_status = USED if use_block_as_used else PARTIAL
+    else:
+        bridge_status = PARTIAL
+    side = (axis.get("side") or "NEUTRAL")
+    strength = float(axis.get("strength") or 0.0)
+    reason_ja = (
+        f"axis={axis.get('axis')} side={side} "
+        f"status={ax_status} strength={strength:.2f}.\n"
+        + (axis.get("reason_ja") or "")
+    )
+    return _entry(
+        category=category,
+        label_ja=label_ja,
+        status=bridge_status,
+        reason_ja=reason_ja,
+        what_to_check_ja=(
+            f"raw panel そのものではなく、ここから作った evidence axis "
+            f"({axis.get('axis')}) が判断に使われています。"
+            "axis の status と reason_ja を確認してください。"
+        ),
+    )
+
+
 def build_decision_bridge(payload: dict | None) -> dict:
     """Build the decision_bridge_v1 dict from a visual_audit payload.
 
@@ -99,22 +142,114 @@ def build_decision_bridge(payload: dict | None) -> dict:
 
     # ── USED / PARTIAL ─────────────────────────────────────────
     used: list[dict] = []
+
+    # Pre-extract integrated axis statuses if available — these tell us
+    # exactly which audit module actually drove the action.
+    axis_status_by_source: dict[str, str] = {}
+    axes_by_axis: dict[str, dict] = {}
     if is_integrated:
+        for ax in integrated.get("axes") or []:
+            src = ax.get("source") or ""
+            stat = ax.get("status") or ""
+            ax_name = ax.get("axis") or ""
+            if src and stat:
+                axis_status_by_source[src] = stat
+            if ax_name:
+                axes_by_axis[ax_name] = ax
+
+    if is_integrated:
+        # Integrated profile: build the USED / PARTIAL list per
+        # Deep Research P0/P1/P2 spec ordering.
         used.append(_entry(
             category="royal_road_integrated_core",
             label_ja=f"王道統合判断 (integrated profile, mode={integrated_mode})",
             status=USED,
             reason_ja=(
-                f"最終 action ({action}) は integrated decision エンジンが、"
-                "波形 / Wライン / フィボ / ローソク足 / ダウ / MA / RSI / "
-                "BB / MACD / 損切り / RR / マクロ を統合して出しています。"
+                f"最終 action ({action}) は integrated decision エンジンが"
+                "出しています。波形 / Wライン / フィボ / ローソク足 / ダウ / "
+                "MA / RSI / BB / MACD / 損切り / RR / マクロ から作った "
+                "evidence axes を統合して判定しました。"
             ),
             what_to_check_ja=(
-                "下の audit_only_references で、各監査モジュールが integrated "
-                "axes でどの status (PASS/WARN/BLOCK) になったかを確認してください。"
+                "下の各 axis の status (PASS/WARN/BLOCK) と reason_ja を見て、"
+                "どの根拠が action に寄与したか確認してください。"
             ),
         ))
+
+        # ── P0: 王道の必須要素 (USED) ──
+        # 1. 波形認識
+        wp = axes_by_axis.get("wave_pattern")
+        if wp is not None:
+            used.append(_axis_entry(
+                category="wave_pattern_axis",
+                label_ja="波形認識 (P0 必須軸)",
+                axis=wp,
+                use_block_as_used=True,
+            ))
+        # 2. Wライン (WNL / WSL / WTP / WBR)
+        wl = axes_by_axis.get("wave_lines")
+        if wl is not None:
+            used.append(_axis_entry(
+                category="wave_lines_axis",
+                label_ja="W ライン (WNL/WSL/WTP/WBR — P0 必須軸)",
+                axis=wl,
+                use_block_as_used=True,
+            ))
+        # 3. ダウ構造
+        dw = axes_by_axis.get("dow_structure")
+        if dw is not None:
+            used.append(_axis_entry(
+                category="dow_structure_axis",
+                label_ja="ダウ構造 (P0 必須軸)",
+                axis=dw,
+                use_block_as_used=True,
+            ))
+        # 4. インバリデーション / RR
+        inv = axes_by_axis.get("invalidation_rr")
+        if inv is not None:
+            used.append(_axis_entry(
+                category="invalidation_rr_axis",
+                label_ja="インバリデーション / RR (P0 必須軸)",
+                axis=inv,
+                use_block_as_used=True,
+            ))
+
+        # ── P1: 補助軸 (PARTIAL / USED-on-PASS) ──
+        for axis_name, label_ja, category in (
+            ("levels", "サポレジ・レベル心理 (P1)", "levels_axis"),
+            ("candlestick", "ローソク足解剖 (P1)", "candlestick_axis"),
+            ("ma_context", "MA / グランビル (P1)", "ma_context_axis"),
+            ("fibonacci", "フィボナッチ位置 (P1)", "fibonacci_axis"),
+            ("macro", "マクロ整合 (P1)", "macro_axis"),
+            ("daily_roadmap", "Daily Roadmap (P1)", "daily_roadmap_axis"),
+            ("symbol_macro_briefing", "Symbol Macro Briefing (P1)",
+             "symbol_macro_briefing_axis"),
+        ):
+            ax = axes_by_axis.get(axis_name)
+            if ax is None:
+                continue
+            used.append(_axis_entry(
+                category=category, label_ja=label_ja, axis=ax,
+                use_block_as_used=False,
+            ))
+
+        # ── P2: 補助のみ (PARTIAL / never-alone) ──
+        for axis_name, label_ja, category in (
+            ("rsi_regime", "RSI レジーム (P2 補助のみ)", "rsi_axis"),
+            ("bollinger", "ボリンジャーバンド (P2 補助のみ)", "bb_axis"),
+            ("macd", "MACD (P2 補助のみ)", "macd_axis"),
+            ("divergence", "ダイバージェンス (P2 補助のみ)",
+             "divergence_axis"),
+        ):
+            ax = axes_by_axis.get(axis_name)
+            if ax is None:
+                continue
+            used.append(_axis_entry(
+                category=category, label_ja=label_ja, axis=ax,
+                use_block_as_used=False,
+            ))
     else:
+        # Legacy v2: existing classification (unchanged)
         used.append(_entry(
             category="royal_road_v2_core",
             label_ja="王道v2本体の判断",
@@ -128,97 +263,133 @@ def build_decision_bridge(payload: dict | None) -> dict:
                 "audit 表示は判断に影響しません。"
             ),
         ))
-    if stop_plan.get("stop_price") is not None:
-        used.append(_entry(
-            category="stop_plan",
-            label_ja="損切り / RR (structure_stop_plan)",
-            status=PARTIAL,
-            reason_ja=(
-                "v2 の stop_plan / RR 判定は最終判断に関係します。"
-                f"chosen_mode={stop_plan.get('chosen_mode')} "
-                f"outcome={stop_plan.get('outcome')}."
-            ),
-            what_to_check_ja=(
-                "結論カードの structure_stop / atr_stop / take_profit / "
-                "RR が表示されているか確認してください。"
-            ),
-        ))
-    if block_reasons:
-        used.append(_entry(
-            category="block_reasons",
-            label_ja="ブロック理由 (block_reasons)",
-            status=USED if action == "HOLD" else PARTIAL,
-            reason_ja=(
-                f"v2 が {len(block_reasons)} 件のブロック理由で判定。"
-                f"先頭: {block_reasons[0][:60]}"
-                if block_reasons[0] else
-                f"v2 が {len(block_reasons)} 件のブロック理由で判定。"
-            ),
-            what_to_check_ja=(
-                "block_reasons 一覧を見て、HOLD の根拠が納得できるか"
-                "確認してください。"
-            ),
-        ))
-    sr_v2 = v2.get("support_resistance_v2") or {}
-    if (
-        sr_v2.get("selected_level_zones_top5")
-        or sr_v2.get("near_strong_support")
-        or sr_v2.get("near_strong_resistance")
-    ):
-        used.append(_entry(
-            category="support_resistance_v2",
-            label_ja="サポレジ (support_resistance_v2)",
-            status=PARTIAL,
-            reason_ja=(
-                "v2 の SR 判定は evidence_axes を経由して判断に影響します。"
-            ),
-            what_to_check_ja=(
-                "緑/赤の SR 帯が現在価格と整合しているか確認してください。"
-            ),
-        ))
-
-    # ── AUDIT_ONLY (or USED/PARTIAL when integrated profile is active)
-    audit_only: list[dict] = []
-
-    # Pre-extract integrated axis statuses if available — these tell us
-    # exactly which audit module actually drove the action.
-    axis_status_by_source: dict[str, str] = {}
-    if is_integrated:
-        for ax in integrated.get("axes") or []:
-            src = ax.get("source") or ""
-            stat = ax.get("status") or ""
-            if src and stat:
-                axis_status_by_source[src] = stat
-
-        def _integrated_status(source_name: str, fallback: str = AUDIT_ONLY) -> str:
-            """Map integrated-axis status (PASS/WARN/BLOCK) → bridge
-            status (USED/PARTIAL/AUDIT_ONLY)."""
-            ax_status = axis_status_by_source.get(source_name)
-            if ax_status == "PASS":
-                return USED
-            if ax_status == "WARN":
-                return PARTIAL
-            if ax_status == "BLOCK":
-                return USED  # the BLOCK actively forced HOLD
-            return fallback
-
-    if payload.get("wave_shape_review"):
-        if is_integrated:
-            wave_status = _integrated_status("chart_patterns", USED)
-            audit_only.append(_entry(
-                category="wave_shape_review",
-                label_ja="波形認識 (waveform shape review)",
-                status=wave_status,
+        if stop_plan.get("stop_price") is not None:
+            used.append(_entry(
+                category="stop_plan",
+                label_ja="損切り / RR (structure_stop_plan)",
+                status=PARTIAL,
                 reason_ja=(
-                    "integrated profile: 波形は wave_pattern 軸として"
-                    "判断に使用されています。"
+                    "v2 の stop_plan / RR 判定は最終判断に関係します。"
+                    f"chosen_mode={stop_plan.get('chosen_mode')} "
+                    f"outcome={stop_plan.get('outcome')}."
                 ),
                 what_to_check_ja=(
-                    "チャート上の波形候補と integrated_decision の axes 表示が"
-                    "一致しているか確認してください。"
+                    "結論カードの structure_stop / atr_stop / take_profit / "
+                    "RR が表示されているか確認してください。"
                 ),
             ))
-        else:
+        if block_reasons:
+            used.append(_entry(
+                category="block_reasons",
+                label_ja="ブロック理由 (block_reasons)",
+                status=USED if action == "HOLD" else PARTIAL,
+                reason_ja=(
+                    f"v2 が {len(block_reasons)} 件のブロック理由で判定。"
+                    f"先頭: {block_reasons[0][:60]}"
+                    if block_reasons[0] else
+                    f"v2 が {len(block_reasons)} 件のブロック理由で判定。"
+                ),
+                what_to_check_ja=(
+                    "block_reasons 一覧を見て、HOLD の根拠が納得できるか"
+                    "確認してください。"
+                ),
+            ))
+        sr_v2 = v2.get("support_resistance_v2") or {}
+        if (
+            sr_v2.get("selected_level_zones_top5")
+            or sr_v2.get("near_strong_support")
+            or sr_v2.get("near_strong_resistance")
+        ):
+            used.append(_entry(
+                category="support_resistance_v2",
+                label_ja="サポレジ (support_resistance_v2)",
+                status=PARTIAL,
+                reason_ja=(
+                    "v2 の SR 判定は evidence_axes を経由して判断に影響します。"
+                ),
+                what_to_check_ja=(
+                    "緑/赤の SR 帯が現在価格と整合しているか確認してください。"
+                ),
+            ))
+
+    # ── AUDIT_ONLY ─────────────────────────────────────────────
+    audit_only: list[dict] = []
+
+    masterclass_dict = payload.get("masterclass_panels") or {}
+    panels = masterclass_dict.get("panels") or {}
+
+    if is_integrated:
+        # Integrated profile: raw panel display itself is human-only.
+        # The DECISION uses evidence axes derived from these panels
+        # (already listed in `used` above). What sits here are the
+        # raw human-readable summaries / supplementary panels that
+        # don't translate into single-axis status.
+        if payload.get("wave_shape_review"):
+            audit_only.append(_entry(
+                category="wave_shape_review_raw",
+                label_ja="波形認識 raw 表示 (人間用)",
+                status=AUDIT_ONLY,
+                reason_ja=(
+                    "波形 raw パネルは人間が確認するための表示です。"
+                    "判断には wave_pattern axis (上の USED 一覧) が"
+                    "使われています — raw panel そのものではありません。"
+                ),
+            ))
+        if payload.get("wave_derived_lines"):
+            audit_only.append(_entry(
+                category="wave_derived_lines_raw",
+                label_ja="W ライン raw 描画 (人間用)",
+                status=AUDIT_ONLY,
+                reason_ja=(
+                    "W ライン (WNL/WSL/WTP) のチャート描画は人間用の"
+                    "視覚化です。判断には wave_lines axis (P0 必須軸) が"
+                    "使われています。"
+                ),
+            ))
+        if masterclass_dict.get("available"):
+            # Grand Confluence summary
+            if panels.get("grand_confluence_v2"):
+                audit_only.append(_entry(
+                    category="grand_confluence_summary",
+                    label_ja="Grand Confluence v2 summary (人間用)",
+                    status=AUDIT_ONLY,
+                    reason_ja=(
+                        "13 軸の集約 summary は人間の確認用です。"
+                        "判断は個別 axis (dow / candlestick / levels / "
+                        "ma_context / fibonacci / rsi / bb / macd / "
+                        "divergence / invalidation_rr) を直接読みます。"
+                    ),
+                ))
+            # Pre-trade checklist summary
+            if panels.get("pre_trade_diagnostic_checklist_v1"):
+                audit_only.append(_entry(
+                    category="pre_trade_checklist_summary",
+                    label_ja="Pre-trade checklist summary (人間用)",
+                    status=AUDIT_ONLY,
+                    reason_ja=(
+                        "Pre-trade checklist は人間が手元で確認するための"
+                        "チェックリスト表示。判断には axes が使われています。"
+                    ),
+                ))
+            # Generic "raw 19-panel" reference
+            audit_only.append(_entry(
+                category="masterclass_panels_raw",
+                label_ja="Masterclass 19 パネル raw 表示 (人間用)",
+                status=AUDIT_ONLY,
+                reason_ja=(
+                    "raw Masterclass パネルは人間用の監査表示です。"
+                    "判断にはここから抽出した evidence axes (上の USED / "
+                    "PARTIAL 一覧) が使われています。"
+                ),
+                what_to_check_ja=(
+                    "raw パネルと axis の status が一致しているか確認して"
+                    "ください。例: dow_structure_review.trend が UP なら "
+                    "dow_structure axis も BUY 側 PASS。"
+                ),
+            ))
+    else:
+        # Legacy v2 (audit-only) — existing behaviour preserved
+        if payload.get("wave_shape_review"):
             audit_only.append(_entry(
                 category="wave_shape_review",
                 label_ja="波形認識 (waveform shape review)",
@@ -232,24 +403,7 @@ def build_decision_bridge(payload: dict | None) -> dict:
                     "いるか確認してください。"
                 ),
             ))
-    if payload.get("wave_derived_lines"):
-        if is_integrated:
-            wlines_status = _integrated_status("wave_derived_lines", USED)
-            audit_only.append(_entry(
-                category="wave_derived_lines",
-                label_ja="波形由来ライン (WSL/WTP/WNL/WUP/WLOW/WBR)",
-                status=wlines_status,
-                reason_ja=(
-                    "integrated profile: WNL / WSL / WTP は必須軸として"
-                    "判断に使用されています (WNL 未突破 / WSL なし / "
-                    "RR<2 のいずれかで HOLD)。"
-                ),
-                what_to_check_ja=(
-                    "WNL / WSL / WTP / WUP / WLOW / WBR の位置が"
-                    "integrated_decision の axes と整合しているか確認。"
-                ),
-            ))
-        else:
+        if payload.get("wave_derived_lines"):
             audit_only.append(_entry(
                 category="wave_derived_lines",
                 label_ja="波形由来ライン (WSL/WTP/WNL/WUP/WLOW/WBR)",
@@ -263,27 +417,7 @@ def build_decision_bridge(payload: dict | None) -> dict:
                     "サポレジと重なっているか確認してください。"
                 ),
             ))
-
-    masterclass_dict = payload.get("masterclass_panels") or {}
-    panels = masterclass_dict.get("panels") or {}
-    if masterclass_dict.get("available"):
-        if is_integrated:
-            audit_only.append(_entry(
-                category="masterclass_panels",
-                label_ja="Masterclass 監査パネル (19機能)",
-                status=PARTIAL,
-                reason_ja=(
-                    "integrated profile: dow / candlestick / levels / "
-                    "ma_context / rsi_regime / bollinger / macd / divergence / "
-                    "invalidation_rr が判断軸として使用されています。"
-                ),
-                what_to_check_ja=(
-                    "下の integrated_decision.axes の status 列で、"
-                    "どの Masterclass 軸が PASS / WARN / BLOCK に貢献したか"
-                    "を確認できます。"
-                ),
-            ))
-        else:
+        if masterclass_dict.get("available"):
             audit_only.append(_entry(
                 category="masterclass_panels",
                 label_ja="Masterclass 監査パネル (19機能)",
@@ -297,28 +431,12 @@ def build_decision_bridge(payload: dict | None) -> dict:
                     "PASS / WARN / BLOCK を確認してください。"
                 ),
             ))
-        # Pull out Fibonacci specifically — most user-visible
-        fib = panels.get("fibonacci_context_review") or {}
-        if fib.get("available"):
-            if is_integrated:
-                fib_status = _integrated_status(
-                    "source_pack_fibonacci", PARTIAL,
-                )
-                audit_only.append(_entry(
-                    category="fibonacci_context_review",
-                    label_ja="フィボナッチ (fibonacci_context_review)",
-                    status=fib_status,
-                    reason_ja=(
-                        "integrated profile: フィボ位置は fibonacci 軸として"
-                        "判断に使用されています (50.0–61.8 で PASS、"
-                        "extension で WARN、波形無効化で BLOCK)。"
-                    ),
-                    what_to_check_ja=(
-                        "現在価格が 38.2 / 50 / 61.8% 付近で反応しているか、"
-                        "サポート / ローソク足反発と合流しているか確認してください。"
-                    ),
-                ))
-            else:
+        # Legacy v2 only: fib + daily_roadmap appear here as AUDIT_ONLY.
+        # Integrated profile already shows them via axis entries
+        # (fibonacci_axis / daily_roadmap_axis) in the USED list.
+        if not is_integrated:
+            fib = panels.get("fibonacci_context_review") or {}
+            if fib.get("available"):
                 audit_only.append(_entry(
                     category="fibonacci_context_review",
                     label_ja="フィボナッチ (fibonacci_context_review)",
@@ -332,27 +450,8 @@ def build_decision_bridge(payload: dict | None) -> dict:
                         "サポート / ローソク足反発と合流しているか確認してください。"
                     ),
                 ))
-        # Pull out Daily Roadmap separately
-        roadmap = panels.get("daily_roadmap_review") or {}
-        if roadmap.get("available"):
-            if is_integrated:
-                rm_status = _integrated_status(
-                    "source_pack_daily_roadmap", PARTIAL,
-                )
-                audit_only.append(_entry(
-                    category="daily_roadmap_review",
-                    label_ja="Daily 10k FX Roadmap",
-                    status=rm_status,
-                    reason_ja=(
-                        f"integrated profile ({integrated_mode}): "
-                        "Daily Roadmap は判断軸。strict では未接続が HOLD、"
-                        "balanced では WARN として扱います。"
-                    ),
-                    what_to_check_ja=(
-                        "axes の daily_roadmap 行で PASS/WARN/BLOCK を確認。"
-                    ),
-                ))
-            else:
+            roadmap = panels.get("daily_roadmap_review") or {}
+            if roadmap.get("available"):
                 audit_only.append(_entry(
                     category="daily_roadmap_review",
                     label_ja="Daily 10k FX Roadmap",
