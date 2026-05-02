@@ -1155,6 +1155,19 @@ def build_visual_audit_payload(
         symbol=trace_symbol,
     )
 
+    # Build the decision bridge from the (almost-complete) payload so
+    # it can classify every block into USED / PARTIAL / AUDIT_ONLY /
+    # NOT_CONNECTED / UNKNOWN. observation-only.
+    from .decision_bridge import build_decision_bridge
+    bridge_inputs = {
+        "royal_road_decision_v2": v2,
+        "wave_shape_review": wave_shape_review_dict,
+        "wave_derived_lines": wave_derived_lines,
+        "masterclass_panels": masterclass_panels,
+        "entry_summary": entry_summary,
+    }
+    decision_bridge = build_decision_bridge(bridge_inputs)
+
     return {
         "schema_version": SCHEMA_VERSION,
         "parent_bar_ts": parent_iso,
@@ -1177,9 +1190,14 @@ def build_visual_audit_payload(
         # Wave-derived lines (WNL / WB1 / WB2 / WSL / WTP / ...).
         # Each line carries used_in_decision=False; observation-only.
         "wave_derived_lines": wave_derived_lines,
-        # Masterclass observation-only audit panels (16 features).
+        # Masterclass observation-only audit panels (19 features).
         # NOT consumed by royal_road_decision_v2; for human audit only.
         "masterclass_panels": masterclass_panels,
+        # Decision bridge: classifies everything into USED / PARTIAL /
+        # AUDIT_ONLY / NOT_CONNECTED / UNKNOWN so the reader can tell
+        # at a glance what actually drove the final action vs what is
+        # purely observation. Observation-only.
+        "decision_bridge": decision_bridge,
         # Full v2 payload preserved so the audit is self-contained
         # (no need to read the JSONL trace separately).
         "royal_road_decision_v2": v2,
@@ -2891,6 +2909,50 @@ img.thumb { width: 220px; height: auto; border: 1px solid #ddd; }
 .masterclass-tier2 .tier2-table td.status-BLOCK { background: #f8d7da; font-weight: bold; }
 .masterclass-tier1 .tier1-table td.status-UNKNOWN,
 .masterclass-tier2 .tier2-table td.status-UNKNOWN { background: #e0e0e0; }
+.masterclass-tier1 .tier1-table td.status-USED { background: #d9f7d9; font-weight: bold; }
+.masterclass-tier1 .tier1-table td.status-AUDIT_ONLY { background: #fff3cd; font-weight: bold; }
+.masterclass-tier1 .tier1-table td.status-NOT_CONNECTED { background: #f8d7da; font-weight: bold; }
+/* Decision bridge — top of every case section */
+.decision-bridge { background: #fff8e1; border: 3px solid #d84315;
+  border-radius: 6px; padding: 10px 14px; margin: 10px 0;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.08); }
+.decision-bridge h3 { color: #bf360c; margin: 0 0 8px; font-size: 16px; }
+.decision-bridge h4 { color: #5d4037; margin: 6px 0 4px; font-size: 13px; }
+.decision-bridge .bridge-section { background: white; padding: 8px 10px;
+  margin: 6px 0; border-radius: 4px; }
+.decision-bridge .bridge-final-line { font-size: 18px; font-weight: bold;
+  margin: 4px 0; }
+.decision-bridge .bridge-action-BUY { color: #2e7d32; font-size: 1.4em; }
+.decision-bridge .bridge-action-SELL { color: #c62828; font-size: 1.4em; }
+.decision-bridge .bridge-action-HOLD { color: #5d4037; font-size: 1.4em; }
+.decision-bridge .bridge-action-unknown { color: #888; font-size: 1.4em; }
+.decision-bridge .bridge-action-message { white-space: pre-line;
+  background: #fffbf0; padding: 6px 8px; border-left: 3px solid #f9a825;
+  margin: 4px 0; font-size: 12px; }
+.decision-bridge .bridge-entry-brief { font-size: 12px; max-width: 320px;
+  margin-top: 6px; }
+.decision-bridge .bridge-entry-brief th { background: #fff3cd; }
+.decision-bridge .bridge-list { padding-left: 18px; margin: 4px 0;
+  font-size: 12px; }
+.decision-bridge .bridge-list li { margin: 4px 0; padding: 4px 6px;
+  background: white; border-radius: 4px; }
+.decision-bridge .bridge-used { border-left: 4px solid #2e7d32; }
+.decision-bridge .bridge-partial { border-left: 4px solid #1565c0; }
+.decision-bridge .bridge-audit-only { border-left: 4px solid #f9a825; }
+.decision-bridge .bridge-not-connected { border-left: 4px solid #c62828; }
+.decision-bridge .bridge-unknown { border-left: 4px solid #888; }
+.decision-bridge .bridge-tag { font-size: 11px; padding: 1px 6px;
+  border-radius: 3px; color: white; font-weight: bold; }
+.decision-bridge .bridge-tag-used { background: #2e7d32; }
+.decision-bridge .bridge-tag-partial { background: #1565c0; }
+.decision-bridge .bridge-tag-audit-only { background: #f9a825; }
+.decision-bridge .bridge-tag-not-connected { background: #c62828; }
+.decision-bridge .bridge-tag-unknown { background: #888; }
+.decision-bridge .bridge-reason { color: #333; }
+.decision-bridge .bridge-check { color: #5d4037; margin: 2px 0 0; }
+.decision-bridge .bridge-plain { font-style: italic; color: #555;
+  background: #fffbf0; border: 1px dashed #d84315; padding: 6px 8px;
+  margin-top: 8px; font-size: 12px; }
 /* wave overlay (drawn on top of candle chart) */
 .wave-skeleton-line { pointer-events: none; }
 .wave-pivot-dot { pointer-events: none; }
@@ -3927,6 +3989,129 @@ def _render_wave_line_legend_html(
     )
 
 
+def _render_decision_bridge_html(
+    bridge: dict | None,
+    *,
+    entry_summary: dict | None = None,
+) -> str:
+    """Render the decision_bridge_v1 block at the TOP of each case
+    so the reader can immediately tell what actually drove the final
+    action vs what is purely audit-only.
+    """
+    from .decision_bridge import STATUS_LABEL_JA
+
+    if not bridge or not bridge.get("available"):
+        return (
+            "<div class='decision-bridge'>"
+            "<p class='placeholder'>decision_bridge unavailable.</p>"
+            "</div>"
+        )
+
+    action = bridge.get("final_action") or "?"
+    src = bridge.get("final_action_source") or ""
+    msg = bridge.get("action_message_ja") or ""
+    plain = bridge.get("plain_answer_ja") or ""
+
+    def _entries_html(entries: list[dict]) -> str:
+        if not entries:
+            return "<p class='placeholder'>(該当なし)</p>"
+        rows = []
+        for e in entries:
+            cls = "bridge-" + str(e.get("status", "UNKNOWN")).lower().replace(
+                "_", "-"
+            )
+            label_ja = e.get("label_ja", "")
+            status = e.get("status", "")
+            status_label = STATUS_LABEL_JA.get(status, status)
+            reason = e.get("reason_ja", "")
+            check_ja = e.get("what_to_check_ja") or ""
+            check_html = (
+                f"<p class='bridge-check small'>確認: "
+                f"{_html_escape(check_ja)}</p>"
+                if check_ja else ""
+            )
+            rows.append(
+                f"<li class='{cls}'>"
+                f"<b>{_html_escape(label_ja)}</b> "
+                f"<span class='bridge-tag bridge-tag-{cls.split('-', 1)[1]}'>"
+                f"({_html_escape(status_label)})</span><br>"
+                f"<span class='bridge-reason'>{_html_escape(reason)}</span>"
+                f"{check_html}"
+                "</li>"
+            )
+        return "<ul class='bridge-list'>" + "".join(rows) + "</ul>"
+
+    used_html = _entries_html(bridge.get("used_for_final_decision") or [])
+    audit_html = _entries_html(bridge.get("audit_only_references") or [])
+    nc_html = _entries_html(bridge.get("unconnected_or_missing") or [])
+
+    es = entry_summary or {}
+    entry_brief_html = ""
+    if es:
+        rows = []
+        for k, label in [
+            ("entry_price", "エントリー候補"),
+            ("stop_price", "損切り"),
+            ("take_profit_price", "利確"),
+            ("rr", "RR"),
+        ]:
+            v = es.get(k)
+            if v is None:
+                disp = "—"
+            else:
+                try:
+                    disp = f"{float(v):.5f}" if k != "rr" else f"{float(v):.2f}"
+                except Exception:  # noqa: BLE001
+                    disp = str(v)
+            rows.append(
+                f"<tr><th>{_html_escape(label)}</th>"
+                f"<td>{_html_escape(disp)}</td></tr>"
+            )
+        entry_brief_html = (
+            "<table class='bridge-entry-brief'>"
+            + "".join(rows) + "</table>"
+        )
+
+    action_class = (
+        "bridge-action-" + action
+        if action in ("BUY", "SELL", "HOLD") else "bridge-action-unknown"
+    )
+
+    return (
+        "<div class='decision-bridge'>"
+        "<h3>★ この判断の読み方 (decision bridge)</h3>"
+
+        "<div class='bridge-section bridge-final-section'>"
+        "<h4>1. 最終判断</h4>"
+        f"<p class='bridge-final-line'>"
+        f"<span class='{action_class}'>{_html_escape(action)}</span>"
+        f" <span class='small'>({_html_escape(src)})</span></p>"
+        f"<p class='bridge-action-message'>"
+        f"{_html_escape(msg).replace(chr(10), '<br>')}</p>"
+        + entry_brief_html
+        + "</div>"
+
+        "<div class='bridge-section'>"
+        "<h4>2. 最終判断に使ったもの (USED / PARTIAL)</h4>"
+        + used_html
+        + "</div>"
+
+        "<div class='bridge-section'>"
+        "<h4>3. 表示されているが、まだ判断には使っていないもの "
+        "(AUDIT_ONLY)</h4>"
+        + audit_html
+        + "</div>"
+
+        "<div class='bridge-section'>"
+        "<h4>4. 実データ未接続のもの (NOT_CONNECTED)</h4>"
+        + nc_html
+        + "</div>"
+
+        f"<p class='bridge-plain'>{_html_escape(plain)}</p>"
+        "</div>"
+    )
+
+
 def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
     """Render the 16 Masterclass observation-only panels.
 
@@ -3944,34 +4129,55 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
     panels = panels_dict.get("panels") or {}
     parts: list[str] = ["<div class='masterclass-panels'>"]
 
+    def _safe_str(v) -> str:
+        if v is None:
+            return "—"
+        if isinstance(v, bool):
+            return "✓" if v else "✗"
+        if isinstance(v, float):
+            return f"{v:.4f}"
+        return str(v)
+
     # ── Tier 1: 重要サマリ (今日このケースで見るべきこと) ──
+    # Slimmed to 8 rows per the user's spec:
+    #   1. 最終判断
+    #   2. エントリー候補
+    #   3. 損切り
+    #   4. 利確
+    #   5. RR
+    #   6. 判断に使った根拠トップ3
+    #   7. 表示のみの参考情報トップ3
+    #   8. 未接続・不足トップ3
+    inv = panels.get("invalidation_engine_v2", {})
+    bridge_dict = panels_dict.get("decision_bridge")
+    # Read the bridge from the parent payload if present alongside
+    # masterclass_panels — visual_audit puts it as a sibling key, so
+    # this branch falls through to the renderer's caller for it.
+    # The render call wires it via _render_decision_bridge_html, so
+    # here we only need a compact summary.
+    final_action = (
+        (panels_dict.get("final_action_hint") if isinstance(panels_dict, dict) else None)
+        or "—"
+    )
     summary_rows: list[tuple[str, str, str]] = [
-        ("ダウ構造",     panels.get("dow_structure_review", {}).get("status", "—"),
-         panels.get("dow_structure_review", {}).get("status_ja", "")),
-        ("波形パターン", panels.get("chart_pattern_anatomy_v2", {}).get("status", "—"),
-         panels.get("chart_pattern_anatomy_v2", {}).get("summary_ja", "")),
-        ("水平線心理",   panels.get("level_psychology_review", {}).get("status", "—"),
-         f"レベル {panels.get('level_psychology_review', {}).get('n_levels', 0)} 個"),
-        ("ローソク足",   panels.get("candlestick_anatomy_review", {}).get("status", "—"),
-         panels.get("candlestick_anatomy_review", {}).get("meaning_ja", "")[:80]),
-        ("MA / グランビル", panels.get("ma_context_review", {}).get("status", "—"),
-         panels.get("ma_context_review", {}).get("summary_ja", "")[:80]),
-        ("RSI / MACD", panels.get("macd_architecture_review", {}).get("status", "—"),
-         f"RSI {panels.get('rsi_regime_filter', {}).get('rsi_value', '—')} / MACD bias {panels.get('macd_architecture_review', {}).get('bias', '—')}"),
-        ("Bollinger",  panels.get("bollinger_lifecycle_review", {}).get("status", "—"),
-         panels.get("bollinger_lifecycle_review", {}).get("stage", "")),
-        ("Fibonacci",  panels.get("fibonacci_context_review", {}).get("status", "—"),
-         panels.get("fibonacci_context_review", {}).get("retracement_zone", "—") or "—"),
-        ("MTF整合",    panels.get("multi_timeframe_story", {}).get("status", "—"),
-         "整合" if panels.get("multi_timeframe_story", {}).get("tf_aligned") else "不整合"),
-        ("損切り",     panels.get("invalidation_engine_v2", {}).get("status", "—"),
-         "構造アンカー" if panels.get("invalidation_engine_v2", {}).get("is_structure_anchored") else "ATR/その他"),
-        ("RR",         "PASS" if panels.get("invalidation_engine_v2", {}).get("rr_pass") else "WARN" if panels.get("invalidation_engine_v2", {}).get("rr") else "—",
-         f"RR {panels.get('invalidation_engine_v2', {}).get('rr', '—')}"),
-        ("Daily Roadmap", panels.get("daily_roadmap_review", {}).get("status", "—"),
-         panels.get("daily_roadmap_review", {}).get("verdict_ja", "")[:80]),
-        ("ファンダ (Symbol)", panels.get("symbol_macro_briefing_review", {}).get("status", "—"),
-         "未接続" if panels.get("symbol_macro_briefing_review", {}).get("unavailable_reason") == "macro_briefing_data_missing" else "—"),
+        ("最終判断", "—", final_action),
+        ("エントリー候補",   "—", _safe_str(inv.get("entry_price"))),
+        ("損切り",           "—", _safe_str(inv.get("stop_price"))),
+        ("利確",             "—", _safe_str(inv.get("take_profit_price"))),
+        ("RR",
+         "PASS" if inv.get("rr_pass")
+         else "WARN" if inv.get("rr") is not None
+         else "—",
+         _safe_str(inv.get("rr"))),
+        ("判断に使った根拠トップ3", "USED",
+         "royal_road_v2 本体 / stop_plan / block_reasons "
+         "(decision_bridge を参照)"),
+        ("表示のみの参考情報トップ3", "AUDIT_ONLY",
+         "波形認識 / Wライン / Masterclass 19パネル "
+         "(decision_bridge を参照)"),
+        ("未接続・不足トップ3", "NOT_CONNECTED",
+         "ファンダ実データ / position sizing / 経済指標カレンダー "
+         "(decision_bridge を参照)"),
     ]
     summary_rows_html = "".join(
         f"<tr><td>{_html_escape(label)}</td>"
@@ -3981,10 +4187,14 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
     )
     parts.append(
         "<div class='masterclass-tier1'>"
-        "<h4>★ 今日このケースで見るべきこと (重要サマリ)</h4>"
+        "<h4>★ 今日このケースで見るべきこと (重要サマリ — 8 行)</h4>"
         "<table class='kv tier1-table'>"
-        "<tr><th>項目</th><th>状態</th><th>要約</th></tr>"
-        + summary_rows_html + "</table></div>"
+        "<tr><th>項目</th><th>状態</th><th>値 / 要約</th></tr>"
+        + summary_rows_html + "</table>"
+        "<p class='small'>"
+        "詳細は上の「★ この判断の読み方 (decision bridge)」と、"
+        "下の「王道チェック (13軸)」「詳細パネル (19機能)」を参照してください。"
+        "</p></div>"
     )
 
     # ── Tier 2: 王道チェック (13軸 confluence) ──
@@ -4028,15 +4238,6 @@ def _render_masterclass_panels_html(panels_dict: dict | None) -> str:
             for k, v in rows
         )
         return f"<table class='kv'>{body}</table>"
-
-    def _safe_str(v) -> str:
-        if v is None:
-            return "—"
-        if isinstance(v, bool):
-            return "✓" if v else "✗"
-        if isinstance(v, float):
-            return f"{v:.4f}"
-        return str(v)
 
     # 1. ローソク足の解剖
     cs = panels.get("candlestick_anatomy_review") or {}
@@ -4728,13 +4929,26 @@ def _mobile_case_section_html(
     legend_html = _render_wave_line_legend_html(wave_derived)
     wave_only_kind = (wave_overlay or {}).get("kind", "") if wave_overlay else ""
     wave_only_heading = _wave_only_chart_heading(wave_only_kind)
+    # Inject final_action_hint so Tier 1 can show the action without
+    # requiring a parent payload reference inside the renderer.
+    mc_for_render = dict(payload.get("masterclass_panels") or {})
+    mc_for_render["final_action_hint"] = (
+        (payload.get("decision_bridge") or {}).get("final_action")
+        or v2.get("action") or "—"
+    )
     masterclass_panels_html = _render_masterclass_panels_html(
-        payload.get("masterclass_panels"),
+        mc_for_render,
+    )
+    decision_bridge_html = _render_decision_bridge_html(
+        payload.get("decision_bridge"),
+        entry_summary=entry_summary,
     )
 
     return (
         f"<section class='case-section' id='{_html_escape(section_id)}'>"
         f"<h2>{title}</h2>"
+        # Decision bridge first — answers "what drove this action?"
+        + decision_bridge_html
         + (legend_html if legend_html else "")
         + "<h3>chart</h3>"
         + chart_html

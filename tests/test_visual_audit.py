@@ -64,6 +64,8 @@ def test_payload_emits_required_top_level_keys():
         "wave_derived_lines",
         # Masterclass observation-only audit panels (16 features)
         "masterclass_panels",
+        # Decision bridge (USED / PARTIAL / AUDIT_ONLY / NOT_CONNECTED)
+        "decision_bridge",
     }
     assert set(p.keys()) == expected
     assert p["schema_version"] == SCHEMA_VERSION
