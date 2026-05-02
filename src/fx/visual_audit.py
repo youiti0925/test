@@ -1388,6 +1388,7 @@ def _build_candle_svg_xml(
     n_bars: int,
     overlays: dict | None,
     title: str,
+    wave_overlay: dict | None = None,
 ) -> str | None:
     """Build the SVG candle-chart as an XML string.
 
@@ -1398,6 +1399,18 @@ def _build_candle_svg_xml(
     All overlay rendering is included (selected/rejected SR zones,
     selected/rejected trendlines, pattern lines, lower_tf trigger,
     stop / take_profit / structure_stop / atr_stop, parent_bar marker).
+
+    `wave_overlay` (optional, observation-only): when provided,
+    overlays the wave skeleton polyline + pivot dots + matched-part
+    labels + neckline. Expected shape:
+        {
+            "skeleton": {pivots: [...], scale: str, ...},
+            "matched_parts": {part_name: source_df_index},
+            "kind": str,            # double_bottom / head_and_shoulders / ...
+            "side_bias": str,       # BUY / SELL / NEUTRAL
+            "human_label": str,
+        }
+    Pivots whose ts falls outside the visible window are skipped.
     """
     if df is None or len(df) == 0 or n_bars <= 0:
         return None
@@ -1688,8 +1701,469 @@ def _build_candle_svg_xml(
         f"<text x='{margin_l + plot_w}' y='{margin_t + plot_h + 16}' "
         f"text-anchor='end' fill='#444'>{visible.index[-1].isoformat()}</text>"
     )
+
+    # ---- wave skeleton overlay (observation-only) ---------------
+    if wave_overlay:
+        parts.append(
+            _wave_overlay_svg_fragment(
+                wave_overlay=wave_overlay,
+                visible_index=list(visible.index),
+                x_of=x_of, y_of=y_of,
+                price_lo=price_lo, price_hi=price_hi,
+                margin_l=margin_l, margin_t=margin_t,
+                plot_w=plot_w, plot_h=plot_h,
+            )
+        )
+
     parts.append("</svg>\n")
     return "".join(parts)
+
+
+_PATTERN_PART_LABELS: Final[dict] = {
+    # Double-bottom / double-top pieces
+    "first_bottom": "B1",
+    "second_bottom": "B2",
+    "first_top": "P1",
+    "second_top": "P2",
+    "neckline_peak": "NL",
+    "neckline_trough": "NL",
+    # Head & shoulders pieces
+    "neckline_left_peak": "NL-L",
+    "neckline_right_peak": "NL-R",
+    "neckline_left_trough": "NL-L",
+    "neckline_right_trough": "NL-R",
+    "left_shoulder": "LS",
+    "right_shoulder": "RS",
+    "head": "H",
+    # Continuation patterns / wedges / triangles
+    "breakout": "BR",
+    "apex": "AP",
+    "lower_anchor_1": "A1",
+    "upper_anchor_1": "A1",
+    "lower_anchor_2": "A2",
+    "upper_anchor_2": "A2",
+    "lower_anchor_3": "A3",
+    "upper_anchor_3": "A3",
+    "impulse_start": "I0",
+    "impulse_end": "I1",
+    "consolidation_high": "C-H",
+    "consolidation_low": "C-L",
+    "consolidation_mid": "",
+    "prior_high": "",
+    "prior_low": "",
+}
+
+
+_PATTERN_FAMILY_MARKER: Final[dict] = {
+    "double_bottom": "DB1",
+    "double_top": "DT1",
+    "head_and_shoulders": "HS1",
+    "inverse_head_and_shoulders": "IHS1",
+    "bullish_flag": "FL1",
+    "bearish_flag": "FL1",
+    "rising_wedge": "WG1",
+    "falling_wedge": "WG1",
+    "ascending_triangle": "TR1",
+    "descending_triangle": "TR1",
+    "symmetric_triangle": "TR1",
+}
+
+
+def _build_wave_only_svg(
+    *,
+    skeleton: dict | None,
+    matched_parts: dict | None,
+    kind: str | None,
+    human_label: str | None,
+    status: str | None,
+    side_bias: str | None,
+    entry_summary: dict | None,
+) -> str | None:
+    """Build a self-contained "波形だけ" SVG.
+
+    Returns None when no skeleton / no pivots are available.
+
+    The diagram:
+      - polyline through pivots (no candles)
+      - pivot dots
+      - DB1/DT1/HS1/IHS1 + B1/B2/NL/BR... boxed labels
+      - neckline horizontal line (when matched)
+      - entry / stop / take_profit horizontal lines (when entry_summary
+        has those values)
+      - bottom-of-chart status banner (e.g. 「未ブレイク」「形成中」)
+    """
+    skel = skeleton or {}
+    pivots = skel.get("pivots") or []
+    if len(pivots) < 2:
+        return None
+
+    W, H = 800, 320
+    margin_l, margin_r, margin_t, margin_b = 50, 16, 24, 36
+    plot_w = W - margin_l - margin_r
+    plot_h = H - margin_t - margin_b
+
+    prices = [float(p.get("price", 0.0)) for p in pivots]
+    p_lo, p_hi = min(prices), max(prices)
+    es = entry_summary or {}
+    extra_prices: list[float] = []
+    for k in ("entry_price", "stop_price", "structure_stop_price",
+              "atr_stop_price", "take_profit_price"):
+        v = es.get(k)
+        if v is None:
+            continue
+        try:
+            extra_prices.append(float(v))
+        except (TypeError, ValueError):
+            continue
+    if extra_prices:
+        p_lo = min(p_lo, min(extra_prices))
+        p_hi = max(p_hi, max(extra_prices))
+    if p_hi <= p_lo:
+        p_hi = p_lo + 1e-9
+    pad = (p_hi - p_lo) * 0.10
+    p_lo -= pad
+    p_hi += pad
+    p_range = p_hi - p_lo
+
+    indices = [int(p.get("index", 0)) for p in pivots]
+    i_min, i_max = min(indices), max(indices)
+    if i_min == i_max:
+        i_max = i_min + 1
+    i_span = i_max - i_min
+
+    def x_of(idx: int) -> float:
+        return margin_l + (idx - i_min) / i_span * plot_w
+
+    def y_of(price: float) -> float:
+        return margin_t + (1.0 - (price - p_lo) / p_range) * plot_h
+
+    parts: list[str] = []
+    parts.append(
+        f"<svg xmlns='http://www.w3.org/2000/svg' class='wave-only-chart' "
+        f"viewBox='0 0 {W} {H}' width='{W}' height='{H}' "
+        f"font-family='-apple-system, sans-serif' font-size='11'>"
+    )
+    parts.append(
+        f"<rect x='0' y='0' width='{W}' height='{H}' fill='#fbfcff'/>"
+    )
+    parts.append(
+        f"<rect x='{margin_l}' y='{margin_t}' width='{plot_w}' "
+        f"height='{plot_h}' fill='white' stroke='#bbb' stroke-width='0.5'/>"
+    )
+
+    # entry/stop/tp horizontal lines (only when present)
+    line_specs = (
+        ("entry_price", "#1565c0", "entry"),
+        ("structure_stop_price", "#c62828", "structure_stop"),
+        ("atr_stop_price", "#ef6c00", "atr_stop"),
+        ("take_profit_price", "#2e7d32", "take_profit"),
+    )
+    for k, color, label in line_specs:
+        v = es.get(k)
+        if v is None:
+            continue
+        try:
+            yv = y_of(float(v))
+        except (TypeError, ValueError):
+            continue
+        if not (margin_t <= yv <= margin_t + plot_h):
+            continue
+        parts.append(
+            f"<line x1='{margin_l}' y1='{yv:.1f}' "
+            f"x2='{margin_l + plot_w}' y2='{yv:.1f}' "
+            f"stroke='{color}' stroke-width='1.4' stroke-dasharray='4,4' "
+            f"opacity='0.85'/>"
+        )
+        parts.append(
+            f"<text x='{margin_l + plot_w - 4}' y='{yv - 3:.1f}' "
+            f"text-anchor='end' fill='{color}'>"
+            f"{_html_escape(label)}={float(v):.5f}</text>"
+        )
+
+    # 1. Skeleton polyline
+    poly_pts = " ".join(
+        f"{x_of(int(p.get('index', 0))):.1f},{y_of(float(p.get('price', 0))):.1f}"
+        for p in pivots
+    )
+    parts.append(
+        f"<polyline class='wave-skeleton-line' points='{poly_pts}' "
+        f"fill='none' stroke='#0d47a1' stroke-width='3.2' "
+        f"stroke-linecap='round' stroke-linejoin='round'/>"
+    )
+
+    # 2. Pivot dots
+    for p in pivots:
+        x = x_of(int(p.get("index", 0)))
+        y = y_of(float(p.get("price", 0.0)))
+        parts.append(
+            f"<circle class='wave-pivot-dot' cx='{x:.1f}' cy='{y:.1f}' "
+            f"r='5' fill='#0d47a1' stroke='white' stroke-width='1.4'/>"
+        )
+
+    # 3. Matched part labels
+    label_map = _PATTERN_PART_LABELS
+    pivot_by_idx: dict[int, dict] = {}
+    for p in pivots:
+        try:
+            pivot_by_idx[int(p.get("index"))] = p
+        except (TypeError, ValueError):
+            continue
+    neckline_price: float | None = None
+    neckline_label = "NL"
+    parts_dict = matched_parts or {}
+    for part_name, src_idx in parts_dict.items():
+        if src_idx is None:
+            continue
+        try:
+            piv = pivot_by_idx.get(int(src_idx))
+        except (TypeError, ValueError):
+            continue
+        if piv is None:
+            continue
+        short = label_map.get(part_name)
+        if not short:
+            # Skip unmapped (or intentionally blank) parts.
+            continue
+        x = x_of(int(piv.get("index")))
+        y = y_of(float(piv.get("price")))
+        is_high = piv.get("kind") == "H"
+        ty = (y - 22) if is_high else (y + 6)
+        text_w = max(22, 10 * len(short) + 8)
+        parts.append(
+            f"<rect class='wave-part-label-bg' x='{x - text_w / 2:.1f}' "
+            f"y='{ty:.1f}' width='{text_w}' height='18' fill='white' "
+            f"stroke='#0d47a1' stroke-width='1.2' rx='3'/>"
+        )
+        parts.append(
+            f"<text class='wave-part-label' x='{x:.1f}' "
+            f"y='{ty + 13:.1f}' text-anchor='middle' fill='#0d47a1' "
+            f"font-weight='bold' font-size='11'>{_html_escape(short)}</text>"
+        )
+        if "neckline" in part_name and neckline_price is None:
+            try:
+                neckline_price = float(piv.get("price"))
+                neckline_label = short
+            except (TypeError, ValueError):
+                pass
+
+    if neckline_price is not None:
+        ny = y_of(neckline_price)
+        parts.append(
+            f"<line class='wave-neckline' x1='{margin_l}' "
+            f"y1='{ny:.1f}' x2='{margin_l + plot_w}' y2='{ny:.1f}' "
+            f"stroke='#7b1fa2' stroke-width='2.0' stroke-dasharray='6,4' "
+            f"opacity='0.85'/>"
+        )
+        parts.append(
+            f"<text x='{margin_l + 6}' y='{ny - 4:.1f}' fill='#7b1fa2' "
+            f"font-weight='bold' font-size='11'>"
+            f"{_html_escape(neckline_label)} ネックライン</text>"
+        )
+
+    # 4. Family marker (DB1 / DT1 / HS1 / IHS1 / ...)
+    family = _PATTERN_FAMILY_MARKER.get(kind or "", "")
+    title_str = f"{family} {human_label}".strip() if family else (
+        human_label or "波形だけ表示"
+    )
+    parts.append(
+        f"<text x='{margin_l}' y='16' fill='#0d47a1' font-weight='bold' "
+        f"font-size='13'>{_html_escape(title_str)}</text>"
+    )
+
+    # 5. Status banner at bottom (e.g. 「未ブレイク (forming)」)
+    status_label_ja = {
+        "forming": "形成中 (未ブレイク)",
+        "neckline_broken": "ネックラインブレイク済み",
+        "retested": "リターンムーブ確認済み",
+        "invalidated": "形が崩れた",
+        "not_matched": "形として弱い",
+    }.get(status or "", status or "")
+    if status_label_ja:
+        parts.append(
+            f"<rect x='{margin_l}' y='{margin_t + plot_h + 6}' "
+            f"width='{plot_w}' height='22' fill='#fff8e1' "
+            f"stroke='#f9a825' stroke-width='1'/>"
+        )
+        parts.append(
+            f"<text x='{margin_l + plot_w / 2}' "
+            f"y='{margin_t + plot_h + 21}' text-anchor='middle' "
+            f"fill='#5d4037' font-weight='bold' font-size='12'>"
+            f"{_html_escape(status_label_ja)} "
+            f"({_html_escape(side_bias or '')})</text>"
+        )
+
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _wave_overlay_svg_fragment(
+    *,
+    wave_overlay: dict,
+    visible_index,
+    x_of,
+    y_of,
+    price_lo: float, price_hi: float,
+    margin_l: float, margin_t: float,
+    plot_w: float, plot_h: float,
+) -> str:
+    """Build the SVG <g> overlay for the wave skeleton.
+
+    All pivots whose ts is outside the visible window are skipped.
+    No price / index outside the supplied chart bounds is referenced.
+    """
+    skel = wave_overlay.get("skeleton") or {}
+    pivots = skel.get("pivots") or []
+    matched_parts = wave_overlay.get("matched_parts") or {}
+    kind = wave_overlay.get("kind") or ""
+    human_label = wave_overlay.get("human_label") or kind
+    if not pivots:
+        return ""
+    # Build a ts-key → bar index map (UTC ns) for fast lookup.
+    ts_to_bar: dict[int, int] = {}
+    for i, ts in enumerate(visible_index):
+        try:
+            ts_to_bar[int(pd.Timestamp(ts).value)] = i
+        except Exception:  # noqa: BLE001
+            continue
+
+    points_xy: list[tuple[float, float, dict]] = []
+    for p in pivots:
+        ts_str = p.get("ts")
+        if ts_str is None:
+            continue
+        try:
+            key = int(pd.Timestamp(ts_str).value)
+        except Exception:  # noqa: BLE001
+            continue
+        bar_i = ts_to_bar.get(key)
+        if bar_i is None:
+            continue
+        try:
+            price = float(p.get("price"))
+        except (TypeError, ValueError):
+            continue
+        if price < price_lo or price > price_hi:
+            # outside chart vertical extent — clamp at edge so dot is visible
+            price = max(price_lo, min(price_hi, price))
+        points_xy.append((x_of(bar_i), y_of(price), p))
+
+    if len(points_xy) < 2:
+        return ""
+
+    out: list[str] = ["<g class='wave-skeleton-overlay'>"]
+    # 1. Polyline through pivots (drawn first → rendered behind dots/labels)
+    poly_pts = " ".join(f"{x:.1f},{y:.1f}" for x, y, _ in points_xy)
+    out.append(
+        f"<polyline class='wave-skeleton-line' points='{poly_pts}' "
+        f"fill='none' stroke='#0d47a1' stroke-width='3.0' "
+        f"stroke-linecap='round' stroke-linejoin='round' opacity='0.85'/>"
+    )
+
+    # 2. Pivot dots
+    for x, y, p in points_xy:
+        kind_marker = p.get("kind", "")
+        out.append(
+            f"<circle class='wave-pivot-dot' cx='{x:.1f}' cy='{y:.1f}' "
+            f"r='4' fill='#0d47a1' stroke='white' stroke-width='1.2'/>"
+        )
+        if kind_marker:
+            out.append(
+                f"<text class='wave-pivot-kind' x='{x + 6:.1f}' "
+                f"y='{y - 6:.1f}' fill='#0d47a1' font-size='10' "
+                f"font-weight='bold'>{_html_escape(kind_marker)}</text>"
+            )
+
+    # 3. Pattern part labels — map matched_parts to pivots and emit
+    #    "B1 (1回目の底)" style boxed labels.
+    family_marker_map = _PATTERN_FAMILY_MARKER
+    label_map = _PATTERN_PART_LABELS
+
+    # Build {source_df_index → pivot_dict_with_position} so a matched
+    # part can be located on the chart.
+    by_index: dict[int, tuple[float, float, dict]] = {}
+    for x, y, p in points_xy:
+        try:
+            by_index[int(p.get("index"))] = (x, y, p)
+        except (TypeError, ValueError):
+            continue
+
+    neckline_price: float | None = None
+    neckline_label = "NL"
+    for part_name, src_idx in matched_parts.items():
+        if src_idx is None:
+            continue
+        try:
+            src_idx = int(src_idx)
+        except (TypeError, ValueError):
+            continue
+        loc = by_index.get(src_idx)
+        if loc is None:
+            continue
+        x, y, p = loc
+        short_label = label_map.get(part_name)
+        if not short_label:
+            # Skip unmapped parts (do not emit ugly fallbacks like "lowe").
+            continue
+        # Background rect + text so labels stay readable over candles.
+        text_w = max(20, 10 * len(short_label) + 8)
+        text_h = 18
+        # Place above the pivot for high pivots, below for lows.
+        is_high = p.get("kind") == "H"
+        ty = (y - 18) if is_high else (y + 6)
+        out.append(
+            f"<rect class='wave-part-label-bg' x='{x - text_w / 2:.1f}' "
+            f"y='{ty:.1f}' width='{text_w}' height='{text_h}' "
+            f"fill='white' stroke='#0d47a1' stroke-width='1.2' "
+            f"rx='3' ry='3'/>"
+        )
+        out.append(
+            f"<text class='wave-part-label' x='{x:.1f}' "
+            f"y='{ty + text_h - 5:.1f}' text-anchor='middle' "
+            f"fill='#0d47a1' font-weight='bold' font-size='11'>"
+            f"{_html_escape(short_label)}</text>"
+        )
+        if "neckline" in part_name and neckline_price is None:
+            try:
+                neckline_price = float(p.get("price"))
+                neckline_label = short_label
+            except (TypeError, ValueError):
+                pass
+
+    # 4. Neckline horizontal line (if a neckline part was matched)
+    if neckline_price is not None and price_lo <= neckline_price <= price_hi:
+        ny = y_of(neckline_price)
+        out.append(
+            f"<line class='wave-neckline' x1='{margin_l:.1f}' "
+            f"y1='{ny:.1f}' x2='{margin_l + plot_w:.1f}' y2='{ny:.1f}' "
+            f"stroke='#7b1fa2' stroke-width='2.0' stroke-dasharray='6,4' "
+            f"opacity='0.85'/>"
+        )
+        out.append(
+            f"<text class='wave-neckline-label' x='{margin_l + 6:.1f}' "
+            f"y='{ny - 4:.1f}' fill='#7b1fa2' font-weight='bold' "
+            f"font-size='11'>"
+            f"{_html_escape(neckline_label)} ネックライン</text>"
+        )
+
+    # 5. Family marker (DB1 / DT1 / HS1 / ...) at the upper-left of the
+    #    overlay. Skipped for non-pattern overlays.
+    family = family_marker_map.get(kind)
+    if family:
+        out.append(
+            f"<rect class='wave-family-marker-bg' "
+            f"x='{margin_l + 8:.1f}' y='{margin_t + 6:.1f}' "
+            f"width='{18 + 8 * len(human_label)}' height='22' "
+            f"fill='#0d47a1' opacity='0.9' rx='3'/>"
+        )
+        out.append(
+            f"<text class='wave-family-marker' "
+            f"x='{margin_l + 16:.1f}' y='{margin_t + 22:.1f}' "
+            f"fill='white' font-weight='bold' font-size='11'>"
+            f"{_html_escape(family)} {_html_escape(human_label)}</text>"
+        )
+
+    out.append("</g>")
+    return "".join(out)
 
 
 def _render_candle_svg(
@@ -2134,6 +2608,16 @@ img.thumb { width: 220px; height: auto; border: 1px solid #ddd; }
 .hold-waveform-note { background: #fff5e6; border: 1px solid #d8a662;
   border-radius: 4px; padding: 8px 12px; margin: 8px 0; }
 .hold-waveform-note h3 { margin-top: 6px; font-size: 13px; }
+.hold-waveform-note .small { color: #555; font-size: 11px; }
+/* wave overlay (drawn on top of candle chart) */
+.wave-skeleton-line { pointer-events: none; }
+.wave-pivot-dot { pointer-events: none; }
+.wave-part-label-bg, .wave-part-label { pointer-events: none; }
+.wave-neckline { pointer-events: none; }
+/* standalone wave-only chart */
+.wave-only-wrap { margin: 8px 0; max-width: 100%; overflow-x: auto; }
+.wave-only-chart { display: block; max-width: 100%; height: auto;
+  border: 1px solid #c5d2eb; border-radius: 4px; background: #fbfcff; }
 """
 
 
@@ -2968,6 +3452,12 @@ def _hold_waveform_extra_html(
 ) -> str:
     """When action is HOLD, surface what shape-only readings would
     have suggested vs what royal v2 actually requires.
+
+    When a best_pattern exists with a neckline part, an explicit
+    sentence is added that connects the chart labels (B1/B2/NL) to
+    the HOLD reason ("形は候補として見えていますが、NL を未ブレイク
+    のため王道v2は見送りです。"). Without a candidate pattern, a
+    "明確な波形候補が出ていません" note is emitted.
     """
     if action != "HOLD" or not review:
         return ""
@@ -2975,19 +3465,89 @@ def _hold_waveform_extra_html(
     if not best:
         return (
             "<div class='hold-waveform-note'>"
-            "<p>波形情報不足 (waveform data unavailable)</p>"
+            "<h3>波形上の評価</h3>"
+            "<p>明確な波形候補が出ていないため、波形根拠としては弱いです。</p>"
             "</div>"
         )
+    matched_parts = best.get("matched_parts") or {}
+    has_neckline = any("neckline" in name for name in matched_parts.keys())
+    has_first_low = "first_bottom" in matched_parts
+    has_first_high = "first_top" in matched_parts
+    chart_pointer_lines: list[str] = []
+    if has_first_low and has_neckline:
+        chart_pointer_lines.append(
+            "<li>チャート上の <b>B1 / B2 / NL</b> を確認してください。</li>"
+        )
+    elif has_first_high and has_neckline:
+        chart_pointer_lines.append(
+            "<li>チャート上の <b>P1 / P2 / NL</b> を確認してください。</li>"
+        )
+    elif "head" in matched_parts:
+        chart_pointer_lines.append(
+            "<li>チャート上の <b>LS / H / RS / NL</b> を確認してください。</li>"
+        )
+    status = best.get("status") or ""
+    closing_lines: list[str] = []
+    if status == "forming":
+        closing_lines.append(
+            "<p>形は候補として見えていますが、NL を未ブレイクのため王道v2は見送りです。</p>"
+        )
+    elif status == "neckline_broken":
+        closing_lines.append(
+            "<p>NL は形上ブレイク済みですが、リターンムーブ未確認のため王道v2は見送りです。</p>"
+        )
+    closing_lines.append(
+        f"<p class='small'>(波形上の根拠は observation-only であり、"
+        f"royal_road_decision_v2 の最終判断には影響しません。)</p>"
+    )
     return (
         "<div class='hold-waveform-note'>"
         "<h3>波形上は入れそうに見える点</h3>"
-        f"<ul><li>{_html_escape(best.get('human_label') or '')} "
+        f"<ul>"
+        f"<li>{_html_escape(best.get('human_label') or '')} "
         f"({_html_escape(best.get('status') or '')})</li>"
-        f"<li>{_html_escape(best.get('human_explanation') or '')}</li></ul>"
+        f"<li>{_html_escape(best.get('human_explanation') or '')}</li>"
+        + "".join(chart_pointer_lines)
+        + "</ul>"
         "<h3>それでも王道v2が見送った理由</h3>"
-        f"<p>{_html_escape(review.get('risk_note_ja') or '')}</p>"
-        "</div>"
+        + "".join(closing_lines)
+        + f"<p>{_html_escape(review.get('risk_note_ja') or '')}</p>"
+        + "</div>"
     )
+
+
+def _select_wave_overlay(payload: dict) -> dict | None:
+    """Pick the best per-scale skeleton + matched parts for chart
+    overlay. Returns None when no candidate is available.
+
+    Selection rule:
+      1. Prefer wave_shape_review.best_pattern (which already has a
+         shape_score >= CANDIDATE threshold).
+      2. Use that match's `scale` to look up the scale's wave_skeleton
+         in royal_road_decision_v2.multi_scale_chart.
+      3. Use best_pattern.matched_parts as the part-name → pivot.index
+         mapping for label rendering.
+    """
+    review = payload.get("wave_shape_review") or {}
+    best = review.get("best_pattern") or {}
+    if not best:
+        return None
+    scale = best.get("scale")
+    v2 = payload.get("royal_road_decision_v2") or {}
+    multi = v2.get("multi_scale_chart") or {}
+    scales = multi.get("scales") or {}
+    skel = (scales.get(scale) or {}).get("wave_skeleton") or {}
+    if not skel.get("pivots"):
+        return None
+    return {
+        "skeleton": skel,
+        "matched_parts": best.get("matched_parts") or {},
+        "kind": best.get("kind") or "",
+        "human_label": best.get("human_label") or "",
+        "status": best.get("status") or "",
+        "side_bias": best.get("side_bias") or "",
+        "shape_score": best.get("shape_score"),
+    }
 
 
 def _mobile_case_section_html(
@@ -2997,6 +3557,8 @@ def _mobile_case_section_html(
     payload: dict,
     svg_xml: str | None,
     df_was_present: bool,
+    wave_only_svg: str | None = None,
+    wave_overlay: dict | None = None,
 ) -> str:
     """Render one case as a self-contained <section> block."""
     v2 = payload.get("royal_road_decision_v2") or {}
@@ -3085,12 +3647,21 @@ def _mobile_case_section_html(
     hold_waveform_html = _hold_waveform_extra_html(
         action=v2.get("action"), review=wave_review,
     )
+    wave_only_html = (
+        f"<div class='wave-only-wrap'>{wave_only_svg}</div>"
+        if wave_only_svg else ""
+    )
 
     return (
         f"<section class='case-section' id='{_html_escape(section_id)}'>"
         f"<h2>{title}</h2>"
         "<h3>chart</h3>"
         + chart_html
+        + (
+            "<h3>波形だけ表示 (wave-only chart)</h3>"
+            + wave_only_html
+            if wave_only_html else ""
+        )
         + "<h3>結論カード (entry / stop / RR)</h3>"
         + entry_summary_html
         + "<h3>波形レビュー (waveform shape review — observation only)</h3>"
@@ -3167,6 +3738,8 @@ def render_visual_audit_mobile_single_file(
         action = v2.get("action") or "?"
         ts = case.get("ts", "")
         case_label = f"{sym} @ {ts} ({action})"
+        # Pick the wave overlay (best_pattern's scale) for chart drawing.
+        wave_overlay = _select_wave_overlay(payload)
         # Build the inline SVG chart string (or None on failure).
         svg_xml: str | None = None
         if df is not None and len(df) > 0:
@@ -3177,18 +3750,34 @@ def render_visual_audit_mobile_single_file(
                     n_bars=int(payload.get("bars_used_in_render") or 0),
                     overlays=payload.get("overlays") or {},
                     title=payload.get("title", ""),
+                    wave_overlay=wave_overlay,
                 )
             except Exception:  # noqa: BLE001
                 svg_xml = None
         # Inject the case_id / symbol fields the section template uses.
         payload["case_id"] = f"{sym}_{_safe_ts_for_path(ts)}"
         payload["symbol"] = sym
+        # Build the standalone "波形だけ" SVG (when a skeleton exists).
+        wave_only_svg = (
+            _build_wave_only_svg(
+                skeleton=wave_overlay.get("skeleton"),
+                matched_parts=wave_overlay.get("matched_parts"),
+                kind=wave_overlay.get("kind"),
+                human_label=wave_overlay.get("human_label"),
+                status=wave_overlay.get("status"),
+                side_bias=wave_overlay.get("side_bias"),
+                entry_summary=payload.get("entry_summary"),
+            )
+            if wave_overlay else None
+        )
         sections.append(_mobile_case_section_html(
             section_id=section_id,
             case_label=case_label,
             payload=payload,
             svg_xml=svg_xml,
             df_was_present=df is not None and len(df) > 0,
+            wave_only_svg=wave_only_svg,
+            wave_overlay=wave_overlay,
         ))
         list_items.append(
             f"<li><a href='#{section_id}'>"
