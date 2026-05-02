@@ -224,10 +224,11 @@ def test_v2_active_writes_json_sidecar(tmp_path: Path):
     assert json_path.exists()
     body = json.loads(json_path.read_text())
     assert body["schema_version"] == SCHEMA_VERSION
-    # Either a real PNG or an .image_unavailable marker exists.
+    # PNG, SVG fallback, or .image_unavailable marker — always one.
     png_path = tmp_path / "t.png"
+    svg_path = tmp_path / "t.svg"
     marker_path = tmp_path / "t.image_unavailable"
-    assert png_path.exists() or marker_path.exists()
+    assert png_path.exists() or svg_path.exists() or marker_path.exists()
 
 
 def test_matplotlib_missing_emits_marker_file(tmp_path: Path):
@@ -242,13 +243,17 @@ def test_matplotlib_missing_emits_marker_file(tmp_path: Path):
     out = render_visual_audit(trace=tr, df=df, out_dir=tmp_path, name_prefix="m")
     json_path = tmp_path / "m.json"
     assert json_path.exists()
-    if out.get("image_status") == "matplotlib_missing":
-        marker = tmp_path / "m.image_unavailable"
-        assert marker.exists()
-        assert "matplotlib" in marker.read_text().lower()
-    else:
-        # If matplotlib happens to be available, the PNG is written.
+    # Three-tier fallback: matplotlib_png OR svg_fallback OR image_unavailable
+    renderer = out.get("renderer")
+    assert renderer in (
+        "matplotlib_png", "svg_fallback", "image_unavailable",
+    )
+    if renderer == "matplotlib_png":
         assert (tmp_path / "m.png").exists()
+    elif renderer == "svg_fallback":
+        assert (tmp_path / "m.svg").exists()
+    else:
+        assert (tmp_path / "m.image_unavailable").exists()
 
 
 def test_payload_title_carries_quality_and_action():
@@ -318,13 +323,14 @@ def test_report_per_case_files_present(tmp_path: Path):
         assert (cd / "audit.json").exists()
         assert (cd / "detail.html").exists()
         assert (cd / "feedback_template.json").exists()
-        # Either rendered .png or .image_unavailable marker per chart slot.
+        # Three-tier fallback per chart slot: PNG, SVG, or marker.
         for stem in ("chart_main", "chart_micro", "chart_short",
                      "chart_medium", "chart_long", "chart_lower_tf"):
             png = cd / f"{stem}.png"
+            svg = cd / f"{stem}.svg"
             marker = cd / f"{stem}.image_unavailable"
-            assert png.exists() or marker.exists(), (
-                f"{cd.name}/{stem}: neither png nor marker"
+            assert png.exists() or svg.exists() or marker.exists(), (
+                f"{cd.name}/{stem}: neither png/svg/marker"
             )
 
 
@@ -466,18 +472,30 @@ def test_detail_html_contains_step_trace_and_compare_section(tmp_path: Path):
 
 
 def test_candlestick_helper_has_body_and_wick_logic_in_source():
-    """Structural pin: the candle render helper must contain BOTH
+    """Structural pin: the candle render helpers must contain BOTH
     body and wick drawing primitives. matplotlib is not installed in
-    CI, so we verify by source inspection rather than by image."""
+    CI, so we verify by source inspection rather than by image.
+
+    Inspects both the matplotlib path (`_try_matplotlib_render`) and
+    the dependency-free SVG fallback (`_render_candle_svg`).
+    """
     import inspect
     from src.fx import visual_audit
-    src = inspect.getsource(visual_audit._render_candle_image)
-    assert "vlines" in src, "candle helper should use vlines for wick + body"
-    assert "low" in src and "high" in src
-    # Bullish / bearish branching present (color split):
-    assert "bullish" in src or "bull_x" in src
-    # Rejected trendlines must NOT be skipped (must appear in render path).
-    assert "trendlines_rejected" in src
+    mpl_src = inspect.getsource(visual_audit._try_matplotlib_render)
+    svg_src = inspect.getsource(visual_audit._render_candle_svg)
+    # matplotlib path
+    assert "vlines" in mpl_src, "matplotlib path should use vlines"
+    assert "bullish" in mpl_src or "bull_x" in mpl_src
+    assert "trendlines_rejected" in mpl_src
+    # SVG path (rect + line for wick / body)
+    assert "<svg" in svg_src
+    assert "<line" in svg_src and "<rect" in svg_src
+    assert "trendlines_rejected" in svg_src
+    assert "level_zones_selected" in svg_src
+    assert "level_zones_rejected" in svg_src
+    # Future-leak guarantee in both paths
+    assert "df.index <= end_ts" in mpl_src
+    assert "df.index <= end_ts" in svg_src
 
 
 def test_rejected_trendlines_overlay_present_when_v2_active(tmp_path: Path):
@@ -519,10 +537,12 @@ def test_multi_scale_unavailable_recorded_in_audit(tmp_path: Path):
     )
     cd = next(p for p in (tmp_path / "EURUSD=X").iterdir() if p.is_dir())
     audit = json.loads((cd / "audit.json").read_text())
-    ms = audit["chart_status"]["multi_scale"]
+    # chart_status flat keys per per-scale renderer taxonomy.
+    long_status = audit["chart_status"]["long"]
     # long bar count = 1000 → 200-bar fixture cannot satisfy → False
-    assert ms["long"]["available"] is False
-    assert ms["long"]["unavailable_reason"] is not None
+    assert long_status["available"] is False
+    assert long_status["unavailable_reason"] is not None
+    assert long_status["renderer"] in ("short_history", "image_unavailable")
 
 
 def test_lower_tf_unavailable_recorded(tmp_path: Path):
@@ -847,3 +867,271 @@ def test_audit_json_contains_checklist_panels(tmp_path: Path):
         "current_runtime_indicator_votes",
     ):
         assert key in cp
+
+
+# ─────── SVG fallback renderer ──────────────────────────────────────
+
+
+def _disable_matplotlib(monkeypatch) -> None:
+    """Force `_try_matplotlib_render` to return None so the chain falls
+    through to the SVG fallback. Works whether matplotlib is installed
+    or not."""
+    from src.fx import visual_audit
+    monkeypatch.setattr(
+        visual_audit, "_try_matplotlib_render",
+        lambda **kwargs: None,
+    )
+
+
+def test_svg_fallback_writes_chart_main_svg(monkeypatch, tmp_path: Path):
+    """With matplotlib disabled, chart_main.svg must be generated and
+    chart_main.png must NOT exist (so the fallback chain actually
+    falls through to SVG, not just produces matplotlib output)."""
+    from src.fx.visual_audit import render_visual_audit_report
+    _disable_matplotlib(monkeypatch)
+    df, res = _v2_run()
+    render_visual_audit_report(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df},
+        out_dir=tmp_path, max_cases=3,
+    )
+    cd = next(p for p in (tmp_path / "EURUSD=X").iterdir() if p.is_dir())
+    assert (cd / "chart_main.svg").exists()
+    assert not (cd / "chart_main.png").exists()
+
+
+def test_svg_fallback_contains_candle_body_and_wick(monkeypatch, tmp_path: Path):
+    from src.fx.visual_audit import render_visual_audit_report
+    _disable_matplotlib(monkeypatch)
+    df, res = _v2_run()
+    render_visual_audit_report(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df},
+        out_dir=tmp_path, max_cases=3,
+    )
+    cd = next(p for p in (tmp_path / "EURUSD=X").iterdir() if p.is_dir())
+    svg = (cd / "chart_main.svg").read_text()
+    assert svg.startswith("<?xml") and "<svg" in svg
+    # Candle wick (line) and body (rect) primitives.
+    assert "<line" in svg
+    assert "<rect" in svg
+    # Candle classes for downstream styling / inspection.
+    assert "class='wick'" in svg
+    assert "candle-bull" in svg or "candle-bear" in svg
+
+
+def test_svg_fallback_includes_selected_sr_zone(monkeypatch, tmp_path: Path):
+    """At least one case should have `level_zones_selected`; that
+    zone must show up in the SVG (sr-selected class on a <rect>)."""
+    from src.fx.visual_audit import render_visual_audit_report
+    _disable_matplotlib(monkeypatch)
+    df, res = _v2_run()
+    render_visual_audit_report(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df},
+        out_dir=tmp_path, max_cases=10,
+    )
+    found = False
+    for cd in (tmp_path / "EURUSD=X").iterdir():
+        if not cd.is_dir():
+            continue
+        audit = json.loads((cd / "audit.json").read_text())
+        if (audit.get("overlays") or {}).get("level_zones_selected"):
+            svg = (cd / "chart_main.svg").read_text()
+            assert "sr-selected" in svg
+            found = True
+            break
+    assert found, "no case with selected SR zone found in 10-case sample"
+
+
+def test_svg_fallback_draws_rejected_trendline_overlay(tmp_path: Path):
+    """Pin: when an overlay carries a rejected trendline with concrete
+    slope/intercept/anchor_indices, the SVG renderer draws it as a
+    dotted line with the `trendline-rejected` class. Synthetic backtest
+    data often only produces `trendline=None` reject markers (e.g.
+    `outside_top3`), so we drive the renderer directly with a handcrafted
+    overlay to pin the rendering capability deterministically."""
+    from src.fx.visual_audit import _render_candle_svg
+    idx = pd.date_range("2025-01-01", periods=20, freq="1h", tz="UTC")
+    df = pd.DataFrame({
+        "open": np.linspace(100.0, 102.0, 20),
+        "high": np.linspace(100.5, 102.5, 20),
+        "low": np.linspace(99.5, 101.5, 20),
+        "close": np.linspace(100.2, 102.2, 20),
+        "volume": [1000] * 20,
+    }, index=idx)
+    overlays = {
+        "level_zones_selected": [],
+        "level_zones_rejected": [],
+        "trendlines_selected": [],
+        "trendlines_rejected": [
+            {
+                "trendline": {
+                    "slope": 0.05, "intercept": 100.0,
+                    "anchor_indices": [2, 18], "kind": "ascending",
+                },
+                "reject_reason": "weak_confidence",
+            },
+        ],
+        "patterns_selected": [],
+        "patterns_rejected": [],
+        "lower_tf_trigger": None,
+        "structure_stop_plan": None,
+    }
+    out_path = tmp_path / "rejtl.svg"
+    res = _render_candle_svg(
+        df=df, end_ts=idx[-1], n_bars=20,
+        overlays=overlays, title="rejected-tl-test",
+        out_path=out_path,
+    )
+    assert res["image_status"] == "rendered"
+    svg = out_path.read_text()
+    assert "trendline-rejected" in svg
+    # Selected SR / pattern classes should NOT appear (none provided).
+    assert "sr-selected" not in svg
+    assert "pattern-neckline" not in svg
+
+
+def test_chart_status_main_renderer_is_svg_fallback(monkeypatch, tmp_path: Path):
+    from src.fx.visual_audit import render_visual_audit_report
+    _disable_matplotlib(monkeypatch)
+    df, res = _v2_run()
+    render_visual_audit_report(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df},
+        out_dir=tmp_path, max_cases=3,
+    )
+    cd = next(p for p in (tmp_path / "EURUSD=X").iterdir() if p.is_dir())
+    audit = json.loads((cd / "audit.json").read_text())
+    assert audit["chart_status"]["main"]["renderer"] == "svg_fallback"
+    assert audit["chart_status"]["main"]["available"] is True
+    assert audit["chart_status"]["main"]["path"] == "chart_main.svg"
+    # `charts.main` exposes the resolved filename for HTML consumption.
+    assert audit["charts"]["main"] == "chart_main.svg"
+
+
+def test_detail_html_references_svg_when_only_svg_exists(monkeypatch, tmp_path: Path):
+    from src.fx.visual_audit import render_visual_audit_report
+    _disable_matplotlib(monkeypatch)
+    df, res = _v2_run()
+    render_visual_audit_report(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df},
+        out_dir=tmp_path, max_cases=3,
+    )
+    cd = next(p for p in (tmp_path / "EURUSD=X").iterdir() if p.is_dir())
+    html = (cd / "detail.html").read_text()
+    assert "chart_main.svg" in html
+    # Should NOT reference chart_main.png since none was rendered.
+    assert "chart_main.png" not in html
+    # Renderer tag visible to humans.
+    assert "svg_fallback" in html
+
+
+def test_index_html_thumbnail_falls_back_to_svg(monkeypatch, tmp_path: Path):
+    from src.fx.visual_audit import render_visual_audit_report
+    _disable_matplotlib(monkeypatch)
+    df, res = _v2_run()
+    render_visual_audit_report(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df},
+        out_dir=tmp_path, max_cases=5,
+    )
+    html = (tmp_path / "index.html").read_text()
+    assert "chart_main.svg" in html
+    # PNG fallback path should not appear (no PNG written).
+    assert "chart_main.png" not in html
+
+
+def test_svg_fallback_no_future_leak(monkeypatch, tmp_path: Path):
+    """Pin: even when df has future bars beyond parent_bar_ts, the
+    SVG renderer must only draw bars with index <= parent_bar_ts.
+    Verified by checking the count of bars whose timestamp appears in
+    the SVG never exceeds the visible window."""
+    from src.fx.visual_audit import render_visual_audit_report
+    _disable_matplotlib(monkeypatch)
+    df = _ohlcv(400)
+    res = run_engine_backtest(
+        df.iloc[:200], "EURUSD=X", interval="1h", warmup=60,
+        decision_profile="royal_road_decision_v2",
+    )
+    # Render with the FULL df (200 future bars present beyond parent).
+    render_visual_audit_report(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df},
+        out_dir=tmp_path, max_cases=3,
+    )
+    cd = next(p for p in (tmp_path / "EURUSD=X").iterdir() if p.is_dir())
+    audit = json.loads((cd / "audit.json").read_text())
+    parent_ts = pd.Timestamp(audit["parent_bar_ts"])
+    # The SVG advertises its parent_bar_ts in plain text. Ensure it
+    # equals the trace's parent (no silent extension into future bars).
+    svg = (cd / "chart_main.svg").read_text()
+    assert f"parent_bar_ts={parent_ts.isoformat()}" in svg
+    # End-of-window timestamp in SVG (last visible bar) must be <=
+    # parent. We can extract it from the bottom-right text label.
+    # Lightweight check: any timestamp in the SVG > parent_ts is a leak.
+    import re
+    iso_ts = re.findall(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:\d{2}|Z)",
+        svg,
+    )
+    for ts in iso_ts:
+        assert pd.Timestamp(ts) <= parent_ts, (
+            f"SVG references {ts} which is past parent_bar_ts {parent_ts}"
+        )
+
+
+def test_svg_fallback_includes_stop_target_lines(monkeypatch, tmp_path: Path):
+    """Pin: stop / take_profit / atr_stop lines appear in SVG when the
+    structure_stop_plan exposes those prices."""
+    from src.fx.visual_audit import render_visual_audit_report
+    _disable_matplotlib(monkeypatch)
+    df, res = _v2_run()
+    render_visual_audit_report(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df},
+        out_dir=tmp_path, max_cases=10,
+    )
+    found = False
+    for cd in (tmp_path / "EURUSD=X").iterdir():
+        if not cd.is_dir():
+            continue
+        audit = json.loads((cd / "audit.json").read_text())
+        sp = (audit.get("overlays") or {}).get("structure_stop_plan") or {}
+        if sp.get("stop_price") is not None or sp.get("take_profit_price") is not None:
+            svg = (cd / "chart_main.svg").read_text()
+            # Either a stop or tp line class exists.
+            assert "stop-line" in svg or "tp-line" in svg or "atr-stop-line" in svg
+            found = True
+            break
+    assert found, "no case with stop / tp lines found"
+
+
+def test_chart_status_taxonomy_pinned_in_audit(tmp_path: Path):
+    """audit.json chart_status keys (flat: main / micro / short / medium
+    / long / lower_tf) and renderer values must be from the documented
+    closed taxonomy."""
+    from src.fx.visual_audit import render_visual_audit_report
+    df, res = _v2_run()
+    render_visual_audit_report(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df},
+        out_dir=tmp_path, max_cases=3,
+    )
+    cd = next(p for p in (tmp_path / "EURUSD=X").iterdir() if p.is_dir())
+    audit = json.loads((cd / "audit.json").read_text())
+    cs = audit["chart_status"]
+    expected_keys = {"main", "micro", "short", "medium", "long", "lower_tf"}
+    assert set(cs.keys()) == expected_keys
+    allowed_renderers = {
+        "matplotlib_png", "svg_fallback", "image_unavailable",
+        "short_history", "lower_tf_unavailable",
+    }
+    for k, entry in cs.items():
+        assert "available" in entry
+        assert "renderer" in entry
+        assert "path" in entry
+        assert entry["renderer"] in allowed_renderers, (
+            f"chart_status[{k}].renderer={entry['renderer']} not in taxonomy"
+        )
