@@ -98,28 +98,118 @@
     </p>
   </div>
 
-  <h2>サンプル (3 種)</h2>
+  <h2>パターン部位チャートデモ (4 種)</h2>
+
+  <p style="font-size:13px;color:#444;margin-top:0;">
+    波形認識からの線 (WNL/WB1/WB2/WP1/WP2/WLS/WH/WRS/WSL/WTP) が
+    チャート上に出るかを 4 つの典型パターンで確認できます。
+    どれも合成 OHLC を使った決定論的デモ (バックテスト結果ではありません)。
+  </p>
+
+  <div class="demo-card demo-fixture">
+    <a href="./double_bottom_shape_demo_mobile.html">
+      ① ダブルボトムデモ (double_bottom)
+    </a>
+    <span class="label-fixture">合成パターン</span>
+    <p style="margin:6px 0 4px;font-size:13px;">
+      <strong>見る目的:</strong>
+      <code>DB1 / B1 / B2 / NL / BR / WSL / WTP</code> の線・ラベルが出るか。
+    </p>
+    <ul class="check-points">
+      <li>チャート上に紫の <code>WNL1 ネックライン</code> が水平に引かれている</li>
+      <li>赤の <code>WSL1</code> (波形損切り候補) と緑の <code>WTP1</code> (利確候補) が出る</li>
+      <li>「波形だけチャート」に <code>DB1</code> 家族マーカー + <code>B1/B2/NL</code> ラベル</li>
+      <li>タイトルが「判断: HOLD / 波形候補: ダブルボトム候補 / 参考線: ...」</li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-fixture">
+    <a href="./double_top_shape_demo_mobile.html">
+      ② ダブルトップデモ (double_top)
+    </a>
+    <span class="label-fixture">合成パターン</span>
+    <p style="margin:6px 0 4px;font-size:13px;">
+      <strong>見る目的:</strong>
+      <code>DT1 / P1 / P2 / NL / BR / WSL / WTP</code> の線・ラベルが出るか。
+    </p>
+    <ul class="check-points">
+      <li>P1 / P2 の白枠ラベル + WNL1 ネックライン (紫横線) が出る</li>
+      <li><code>WSL1</code> = P2 の上、<code>WTP1</code> = NL から下方向に投影</li>
+      <li>波形候補欄に <code>ダブルトップ候補</code></li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-fixture">
+    <a href="./head_and_shoulders_shape_demo_mobile.html">
+      ③ 三尊デモ (head_and_shoulders)
+    </a>
+    <span class="label-fixture">合成パターン</span>
+    <p style="margin:6px 0 4px;font-size:13px;">
+      <strong>見る目的:</strong>
+      <code>HS1 / LS / H / RS / NL / BR / WSL / WTP</code> の線・ラベルが出るか。
+    </p>
+    <ul class="check-points">
+      <li>左肩 (LS) / 頭 (H) / 右肩 (RS) のラベルが pivot 位置に出る</li>
+      <li>WNL1 ネックライン (左右の谷を結んだ位置)</li>
+      <li><code>WSL1</code> は右肩の上、<code>WTP1</code> は NL - (頭 - NL)</li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-fixture">
+    <a href="./inverse_head_and_shoulders_shape_demo_mobile.html">
+      ④ 逆三尊デモ (inverse_head_and_shoulders)
+    </a>
+    <span class="label-fixture">合成パターン</span>
+    <p style="margin:6px 0 4px;font-size:13px;">
+      <strong>見る目的:</strong>
+      <code>IHS1 / LS / H / RS / NL / BR / WSL / WTP</code> の線・ラベルが出るか。
+    </p>
+    <ul class="check-points">
+      <li>左肩 (LS) / 頭 (H、最も深い底) / 右肩 (RS) ラベル</li>
+      <li>WNL1 ネックライン (左右のピークを結んだ位置)</li>
+      <li><code>WSL1</code> は右肩の下、<code>WTP1</code> は NL + (NL - 頭)</li>
+    </ul>
+  </div>
+
+  <h2>その他のサンプル (3 種)</h2>
+
+  <div class="demo-card">
+    <a href="./normal_v2_report_mobile.html">
+      ⑤ 通常 v2 レポートサンプル (normal v2 report)
+    </a>
+    <p style="margin:6px 0 4px;font-size:13px;">
+      <strong>見る目的:</strong>
+      ランダムウォーク合成データで、波形認識が triangle/wedge/flag を拾えるか。
+    </p>
+    <ul class="check-points">
+      <li>サポレジ帯 (緑/赤) + 波形由来ライン (WUP/WLOW/WBR/WSL/WTP) が混在</li>
+      <li>線カウントサマリ表で「採用 / 不採用 / 波形由来」 の合計が見える</li>
+      <li>HOLD ケースでは「未ブレイク」を示す注意表示</li>
+    </ul>
+    <p style="margin:6px 0 0;font-size:12px;color:#555;">
+      ※ 合成 OHLC を用いたサンプル (live データではありません)。
+    </p>
+  </div>
 
   <div class="demo-card demo-fixture">
     <a href="./structure_stop_anchor_demo_mobile.html">
-      ① 損切りデモ (structure stop anchor demo)
+      ⑥ 損切りデモ (structure stop anchor demo)
     </a>
     <span class="label-fixture">手作りフィクスチャ</span>
     <p style="margin:6px 0 4px;font-size:13px;">
       <strong>見る目的:</strong>
-      サポート帯と損切り線が合っているかを見る。
+      サポート帯と損切り線が合っているかを見る (波形認識を使わない既存系のデモ)。
     </p>
     <ul class="check-points">
       <li>緑の帯がサポート帯</li>
       <li><code>stop</code> / <code>structure_stop</code> の線が、その帯の下または近くにあるか</li>
-      <li>「その帯を割ったら買いシナリオが崩れる」と人間の目で見て納得できるか</li>
-      <li>損切り根拠の説明 (Invalidation Explanation) に <code>sr_zone:support</code> と書かれているか</li>
+      <li>損切り根拠の説明に <code>sr_zone:support</code> と書かれているか</li>
     </ul>
   </div>
 
   <div class="demo-card demo-fixture">
     <a href="./current_vs_royal_diff_demo_mobile.html">
-      ② 現行 vs 王道 差分デモ (current vs royal diff demo)
+      ⑦ 現行 vs 王道 差分デモ (current vs royal diff demo)
     </a>
     <span class="label-fixture">手作りフィクスチャ</span>
     <p style="margin:6px 0 4px;font-size:13px;">
@@ -127,37 +217,18 @@
       現行ロジックがBUYした場面を、王道v2がHOLDで止めた理由を見る。
     </p>
     <ul class="check-points">
-      <li>比較表で <code>現行ロジック (current_runtime) = BUY</code></li>
-      <li>比較表で <code>王道v2 (royal_road_v2) = HOLD</code></li>
-      <li>差分タイプが <code>current_buy_royal_hold</code> (現行=BUY、王道v2=HOLD) と表示されているか</li>
+      <li>比較表で <code>現行ロジック = BUY</code> / <code>王道v2 = HOLD</code></li>
+      <li>差分タイプが <code>current_buy_royal_hold</code></li>
       <li>ブロック理由 (block_reasons) が並んでいて、王道v2が止めた理由が納得できるか</li>
     </ul>
-  </div>
-
-  <div class="demo-card">
-    <a href="./normal_v2_report_mobile.html">
-      ③ 通常 v2 レポートサンプル (normal v2 report)
-    </a>
-    <p style="margin:6px 0 4px;font-size:13px;">
-      <strong>見る目的:</strong>
-      複数ケースで、王道v2が引いた線・帯・判断理由が自然かを見る。
-    </p>
-    <ul class="check-points">
-      <li>サポレジ帯 (緑/赤) が自然な位置にあるか</li>
-      <li>トレンドライン (青い線) が自然か (無理やり引かれていないか)</li>
-      <li>ローソク足の解釈 / RSI / MA / BB の説明が読めるか</li>
-      <li><code>OK (PASS)</code> / <code>注意 (WARN)</code> / <code>見送り (BLOCK)</code> の意味が分かるか</li>
-    </ul>
-    <p style="margin:6px 0 0;font-size:12px;color:#555;">
-      ※ 合成 OHLC を用いたサンプル (live データではありません)。
-    </p>
   </div>
 
   <div class="footer">
     <p>
       schema: <code>visual_audit_mobile_v1</code><br>
       売買ロジック本体は無変更です。これは表示・監査情報のみの追加成果物です。<br>
-      手作りフィクスチャ (① と ②) は <code>demo_fixture_not_backtest_result</code> 扱いで、
+      合成パターンデモ (① 〜 ④) と手作りフィクスチャ (⑥ ⑦) は
+      <code>demo_fixture_not_backtest_result</code> 扱いで、
       実際のバックテスト結果ではありません。
     </p>
   </div>
