@@ -1255,6 +1255,24 @@ def decide_royal_road_v2_integrated(
         explanation_ja=explanation_ja,
     )
 
+    # Structure_stop_plan compatible with the v2 trace slice, so
+    # visual_audit can render the entry/stop/TP/RR card without the
+    # integrated profile needing to populate every v2 advisory field.
+    es = panels.get("entry_summary") or {}
+    structure_stop_plan = (
+        {
+            "chosen_mode": "structure" if es.get("structure_stop_price") else "atr",
+            "outcome": "ok" if es.get("rr") and es["rr"] >= min_risk_reward else "needs_review",
+            "stop_price": es.get("stop_price"),
+            "take_profit_price": es.get("take_profit"),
+            "rr_realized": es.get("rr"),
+            "structure_stop_price": es.get("structure_stop_price"),
+            "atr_stop_price": es.get("atr_stop_price"),
+        }
+        if es.get("entry_price") is not None
+        else None
+    )
+
     advisory = {
         "profile": PROFILE_NAME_V2_INTEGRATED,
         "mode": canonical_mode,
@@ -1262,6 +1280,23 @@ def decide_royal_road_v2_integrated(
         "side_bias": side_bias,
         "block_reasons": list(block_reasons),
         "cautions": list(cautions),
+        # v2 trace compatibility — visual_audit reads these.
+        "structure_stop_plan": structure_stop_plan,
+        "evidence_axes": {
+            ax.axis: ax.to_dict() for ax in axes
+        },
+        "support_resistance_v2": {},
+        "trendline_context": {},
+        "chart_pattern_v2": panels.get("chart_pattern_review") or {},
+        "lower_tf_trigger": {},
+        "macro_alignment": {
+            "macro_score": panels.get("_macro_score") or 0.0,
+            "macro_strong_against": panels.get("_macro_strong_against") or "UNKNOWN",
+        },
+        "setup_candidates": [],
+        "best_setup": None,
+        "reconstruction_quality": {"total_reconstruction_score": float(integrated.confidence)},
+        "multi_scale_chart": {},
     }
 
     chain.extend([f"side_bias:{side_bias}", f"action:{action}"])

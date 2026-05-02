@@ -380,6 +380,11 @@ def main() -> int:
                  "double_top_shape_demo",
                  "head_and_shoulders_shape_demo",
                  "inverse_head_and_shoulders_shape_demo",
+                 "normal_integrated_balanced_report",
+                 "normal_integrated_strict_report",
+                 "double_bottom_integrated_buy_demo",
+                 "double_top_integrated_sell_demo",
+                 "forming_pattern_integrated_hold_demo",
                  "all"),
         default="all",
         help="Which sample mode to generate. 'all' runs every demo "
@@ -454,6 +459,14 @@ def main() -> int:
         # Pattern-shape deterministic demos (DB / DT / HS / IHS).
         # These are mobile-only — no per-mode multi-file directory.
         for demo_mode, builder in _PATTERN_SHAPE_DEMO_BUILDERS.items():
+            if args.mode in (demo_mode, "all"):
+                fname = f"{demo_mode}_mobile.html"
+                mobile_runs.append((
+                    fname,
+                    builder(out_path=mobile_dir / fname),
+                ))
+        # Integrated profile demos (Phase E).
+        for demo_mode, builder in _INTEGRATED_DEMO_BUILDERS.items():
             if args.mode in (demo_mode, "all"):
                 fname = f"{demo_mode}_mobile.html"
                 mobile_runs.append((
@@ -873,6 +886,133 @@ _PATTERN_SHAPE_DEMO_BUILDERS = {
         _build_head_and_shoulders_shape_demo_mobile,
     "inverse_head_and_shoulders_shape_demo":
         _build_inverse_head_and_shoulders_shape_demo_mobile,
+}
+
+
+# ---------------------------------------------------------------------------
+# Integrated profile (Phase E.4) demos
+# ---------------------------------------------------------------------------
+
+
+def _build_normal_integrated_mobile(
+    *, out_path: Path, mode: str, max_cases: int = 5,
+) -> dict:
+    """Mobile single-file HTML driven by run_engine_backtest with the
+    integrated profile. Covers the realistic case mix (mostly HOLD on
+    a synthetic random walk) so the user can see how integrated
+    decisions render through the full visual_audit pipeline."""
+    df = _synthetic_ohlcv()
+    res = run_engine_backtest(
+        df, "EURUSD=X", interval="1h", warmup=60,
+        decision_profile="royal_road_decision_v2_integrated",
+        integrated_mode=mode,
+    )
+    return render_visual_audit_mobile_single_file(
+        traces=res.decision_traces,
+        df_by_symbol={"EURUSD=X": df},
+        out_path=out_path,
+        max_cases=max_cases,
+        title=f"visual_audit_mobile_v1 — integrated ({mode})",
+        demo_fixture_banner=(
+            "★ この判断は王道統合ロジックで出ています。\n"
+            "波形 / Wライン / フィボ / ダウ / ローソク足 / MA / 損切り / RR を"
+            "実際に判断へ使用しています。\n"
+            f"mode = {mode}"
+        ),
+    )
+
+
+def _build_double_bottom_integrated_buy_demo_mobile(*, out_path: Path) -> dict:
+    """Hand-crafted double-bottom OHLCV driven through the integrated
+    profile so the resulting BUY action surfaces in the audit HTML.
+    """
+    df = _double_bottom_ohlcv()
+    sym = "EURUSD=X"
+    res = run_engine_backtest(
+        df, sym, interval="1h", warmup=30,
+        decision_profile="royal_road_decision_v2_integrated",
+        integrated_mode="integrated_balanced",
+    )
+    return render_visual_audit_mobile_single_file(
+        traces=res.decision_traces,
+        df_by_symbol={sym: df},
+        out_path=out_path,
+        max_cases=3,
+        title="visual_audit_mobile_v1 — double_bottom integrated BUY demo",
+        demo_fixture_banner=(
+            "double_bottom デモ。波形 / WNL 突破 / WSL / WTP / ダウ反転 / "
+            "ローソク足 (at_support) を統合して判断します。"
+        ),
+    )
+
+
+def _build_double_top_integrated_sell_demo_mobile(*, out_path: Path) -> dict:
+    df = _double_top_ohlcv()
+    sym = "EURUSD=X"
+    res = run_engine_backtest(
+        df, sym, interval="1h", warmup=30,
+        decision_profile="royal_road_decision_v2_integrated",
+        integrated_mode="integrated_balanced",
+    )
+    return render_visual_audit_mobile_single_file(
+        traces=res.decision_traces,
+        df_by_symbol={sym: df},
+        out_path=out_path,
+        max_cases=3,
+        title="visual_audit_mobile_v1 — double_top integrated SELL demo",
+        demo_fixture_banner=(
+            "double_top デモ。波形 / WNL 割れ / WSL / WTP / ダウ転換 / "
+            "ローソク足 (into_resistance) を統合して判断します。"
+        ),
+    )
+
+
+def _build_forming_pattern_integrated_hold_demo_mobile(*, out_path: Path) -> dict:
+    """A pattern that hasn't completed yet → wave_lines axis BLOCK →
+    HOLD. The HTML shows how integrated reports the HOLD reason."""
+    n = 200
+    rng = np.random.default_rng(7)
+    idx = pd.date_range("2025-01-01", periods=n, freq="1h", tz="UTC")
+    # Choppy / range-bound — no clear pattern formation
+    close = 1.0 + np.cumsum(rng.standard_normal(n) * 0.0005)
+    df = pd.DataFrame({
+        "open": close, "high": close + 0.0007, "low": close - 0.0007,
+        "close": close, "volume": [1000] * n,
+    }, index=idx)
+    sym = "EURUSD=X"
+    res = run_engine_backtest(
+        df, sym, interval="1h", warmup=30,
+        decision_profile="royal_road_decision_v2_integrated",
+        integrated_mode="integrated_strict",
+    )
+    return render_visual_audit_mobile_single_file(
+        traces=res.decision_traces,
+        df_by_symbol={sym: df},
+        out_path=out_path,
+        max_cases=3,
+        title="visual_audit_mobile_v1 — forming pattern integrated HOLD demo",
+        demo_fixture_banner=(
+            "形成中・条件不足のため HOLD になるケースのデモ。\n"
+            "未接続データが必須条件のため HOLD (strict)。"
+        ),
+    )
+
+
+_INTEGRATED_DEMO_BUILDERS = {
+    "normal_integrated_balanced_report":
+        lambda out_path: _build_normal_integrated_mobile(
+            out_path=out_path, mode="integrated_balanced",
+        ),
+    "normal_integrated_strict_report":
+        lambda out_path: _build_normal_integrated_mobile(
+            out_path=out_path, mode="integrated_strict",
+        ),
+    "double_bottom_integrated_buy_demo":
+        _build_double_bottom_integrated_buy_demo_mobile,
+    "double_top_integrated_sell_demo":
+        _build_double_top_integrated_sell_demo_mobile,
+    "forming_pattern_integrated_hold_demo":
+        _build_forming_pattern_integrated_hold_demo_mobile,
 }
 
 

@@ -1133,6 +1133,13 @@ def run_engine_backtest(
                 v2_stop_plan = (decision_integrated.advisory or {}).get(
                     "structure_stop_plan"
                 )
+                # Reuse compare_v2_vs_current so the trace builder can
+                # construct the v2 slice (it requires both decision and
+                # comparison to be non-None).
+                v2_compare_vs_current = compare_v2_vs_current(
+                    decision_current=decision_current,
+                    decision_v2=decision_integrated,
+                )
                 decision = decision_integrated
         else:
             decision = decision_current
@@ -1255,7 +1262,12 @@ def run_engine_backtest(
                 runtime_overrides=_runtime_overrides_for_trace,
                 royal_road_decision=decision_royal,
                 royal_road_compare=royal_compare,
-                royal_road_decision_v2=decision_v2,
+                # Route the integrated decision through the same v2
+                # trace slot so visual_audit / decision_bridge can read
+                # it via existing extractors. The slice's `profile`
+                # field disambiguates ("royal_road_decision_v2" vs
+                # "royal_road_decision_v2_integrated").
+                royal_road_decision_v2=decision_v2 or decision_integrated,
                 royal_road_v2_compare_vs_current=v2_compare_vs_current,
                 royal_road_v2_compare_vs_v1=v2_compare_vs_v1,
             )
