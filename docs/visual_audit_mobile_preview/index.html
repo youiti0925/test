@@ -11,77 +11,154 @@
       color: #222;
       line-height: 1.6;
     }
-    h1 { font-size: 20px; }
-    .note {
-      background: #fff8e1;
-      border: 1px solid #f9a825;
-      padding: 8px 12px;
-      border-radius: 4px;
-      font-size: 14px;
-      margin: 8px 0 16px;
-    }
-    ul { padding-left: 20px; }
-    li { margin: 12px 0; font-size: 16px; }
-    a { color: #1565c0; text-decoration: none; }
+    h1 { font-size: 20px; margin-bottom: 4px; }
+    h2 { font-size: 16px; margin-top: 20px; }
+    h3 { font-size: 14px; margin-top: 16px; }
+    ul { padding-left: 22px; }
+    ol { padding-left: 22px; }
+    li { margin: 6px 0; }
+    a { color: #1565c0; text-decoration: none; font-weight: 600; }
     a:hover, a:active { text-decoration: underline; }
-    .desc { color: #555; font-size: 13px; margin-top: 4px; }
-    .footer { color: #888; font-size: 12px; margin-top: 24px; }
+    .what-to-check {
+      background: #e8f4ff;
+      border: 2px solid #1565c0;
+      padding: 10px 14px;
+      border-radius: 6px;
+      margin: 12px 0 16px;
+    }
+    .what-to-check h2 { margin-top: 0; color: #0d47a1; }
+    .demo-card {
+      border: 1px solid #ccc;
+      padding: 10px 14px;
+      border-radius: 6px;
+      margin: 10px 0;
+      background: #fafafa;
+    }
+    .demo-card.demo-fixture {
+      background: #fff8e1;
+      border-color: #f9a825;
+    }
+    .demo-card .label-fixture {
+      display: inline-block;
+      background: #f9a825;
+      color: white;
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 11px;
+      margin-left: 6px;
+      vertical-align: middle;
+    }
+    .check-points {
+      margin: 6px 0 0;
+      padding-left: 18px;
+      font-size: 13px;
+      color: #444;
+    }
+    .check-points li { margin: 2px 0; }
+    .footer {
+      color: #888;
+      font-size: 12px;
+      margin-top: 24px;
+      border-top: 1px solid #eee;
+      padding-top: 12px;
+    }
+    code { background: #eee; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
     @media (max-width: 800px) {
       body { margin: 8px; }
       h1 { font-size: 18px; }
-      li { font-size: 15px; }
+      h2 { font-size: 15px; }
+      h3 { font-size: 13px; }
     }
   </style>
 </head>
 <body>
   <h1>王道 visual audit モバイルプレビュー</h1>
-
-  <p class="note">
-    UI 確認用です。下のうち <strong>「損切りデモ」</strong>と
-    <strong>「現行 vs 王道 差分デモ」</strong>は
-    <code>demo_fixture_not_backtest_result</code> の
-    手作りフィクスチャで、<strong>実際のバックテスト結果ではありません</strong>。
-    <br>
-    「通常 v2 レポート」は決定論的な合成 OHLC を用いたサンプル
-    (live データではありません) です。
+  <p style="color:#666;font-size:13px;margin-top:0;">
+    ブランチ: <code>artifact/visual-audit-mobile-preview</code> / 生成元 commit: <code>b3d36af</code>
   </p>
 
-  <ul>
-    <li>
-      <a href="./structure_stop_anchor_demo_mobile.html">
-        ① 損切りデモ (structure stop anchor demo)
-      </a>
-      <div class="desc">
-        BUY ケースで、損切り価格が選定された support ゾーンに紐づいている例。
-        Invalidation Explanation パネルが具体的な構造文 (sr_zone:support) を出します。
-      </div>
-    </li>
-    <li>
-      <a href="./current_vs_royal_diff_demo_mobile.html">
-        ② 現行 vs 王道 差分デモ (current vs royal diff demo)
-      </a>
-      <div class="desc">
-        現行ロジック=BUY、王道v2=HOLD で判断が割れたケース
-        (difference_type=current_buy_royal_hold)。比較表のみ確認できます。
-      </div>
-    </li>
-    <li>
-      <a href="./normal_v2_report_mobile.html">
-        ③ 通常 v2 レポートサンプル (normal v2 report)
-      </a>
-      <div class="desc">
-        合成 OHLC で royal_road_decision_v2 を実行した代表 5 件。
-        各ケースに inline SVG チャート + 王道チェックパネル一式が付きます。
-      </div>
-    </li>
-  </ul>
+  <div class="what-to-check">
+    <h2>この画面で確認すること</h2>
+    <p>
+      この画面は <strong>売買成績</strong> を見るものではありません。<br>
+      <strong>王道判断をシステムがどう再現しているか</strong> を、
+      人間の目で確認するための画面です。
+    </p>
+    <p><strong>確認すること:</strong></p>
+    <ol>
+      <li>サポート / レジスタンス帯 (緑/赤の帯) が、自然な位置にあるか</li>
+      <li>トレンドライン (青い線) が無理やり引かれていないか</li>
+      <li>損切り線 (stop / structure_stop) が「ここを割ったらシナリオ崩壊」と思える位置か</li>
+      <li>王道チェックの <strong>OK (PASS) / 注意 (WARN) / 見送り (BLOCK)</strong> の理由が納得できるか</li>
+      <li>現行ロジック (current_runtime) と王道v2 (royal_road_v2) の差分が分かるか</li>
+    </ol>
+    <p style="font-size:12px;color:#555;margin-bottom:0;">
+      おかしい線・無理やりな根拠・納得できない判断があれば「修正対象」です。
+      気づいた点は <code>feedback_template.json</code> に記入する想定です。
+    </p>
+  </div>
+
+  <h2>サンプル (3 種)</h2>
+
+  <div class="demo-card demo-fixture">
+    <a href="./structure_stop_anchor_demo_mobile.html">
+      ① 損切りデモ (structure stop anchor demo)
+    </a>
+    <span class="label-fixture">手作りフィクスチャ</span>
+    <p style="margin:6px 0 4px;font-size:13px;">
+      <strong>見る目的:</strong>
+      サポート帯と損切り線が合っているかを見る。
+    </p>
+    <ul class="check-points">
+      <li>緑の帯がサポート帯</li>
+      <li><code>stop</code> / <code>structure_stop</code> の線が、その帯の下または近くにあるか</li>
+      <li>「その帯を割ったら買いシナリオが崩れる」と人間の目で見て納得できるか</li>
+      <li>損切り根拠の説明 (Invalidation Explanation) に <code>sr_zone:support</code> と書かれているか</li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-fixture">
+    <a href="./current_vs_royal_diff_demo_mobile.html">
+      ② 現行 vs 王道 差分デモ (current vs royal diff demo)
+    </a>
+    <span class="label-fixture">手作りフィクスチャ</span>
+    <p style="margin:6px 0 4px;font-size:13px;">
+      <strong>見る目的:</strong>
+      現行ロジックがBUYした場面を、王道v2がHOLDで止めた理由を見る。
+    </p>
+    <ul class="check-points">
+      <li>比較表で <code>現行ロジック (current_runtime) = BUY</code></li>
+      <li>比較表で <code>王道v2 (royal_road_v2) = HOLD</code></li>
+      <li>差分タイプが <code>current_buy_royal_hold</code> (現行=BUY、王道v2=HOLD) と表示されているか</li>
+      <li>ブロック理由 (block_reasons) が並んでいて、王道v2が止めた理由が納得できるか</li>
+    </ul>
+  </div>
+
+  <div class="demo-card">
+    <a href="./normal_v2_report_mobile.html">
+      ③ 通常 v2 レポートサンプル (normal v2 report)
+    </a>
+    <p style="margin:6px 0 4px;font-size:13px;">
+      <strong>見る目的:</strong>
+      複数ケースで、王道v2が引いた線・帯・判断理由が自然かを見る。
+    </p>
+    <ul class="check-points">
+      <li>サポレジ帯 (緑/赤) が自然な位置にあるか</li>
+      <li>トレンドライン (青い線) が自然か (無理やり引かれていないか)</li>
+      <li>ローソク足の解釈 / RSI / MA / BB の説明が読めるか</li>
+      <li><code>OK (PASS)</code> / <code>注意 (WARN)</code> / <code>見送り (BLOCK)</code> の意味が分かるか</li>
+    </ul>
+    <p style="margin:6px 0 0;font-size:12px;color:#555;">
+      ※ 合成 OHLC を用いたサンプル (live データではありません)。
+    </p>
+  </div>
 
   <div class="footer">
     <p>
-      ブランチ: <code>artifact/visual-audit-mobile-preview</code><br>
-      生成元 commit: <code>b3d36af</code> (feat/royal-road-complete-v2)<br>
       schema: <code>visual_audit_mobile_v1</code><br>
-      売買ロジック本体は無変更です。これは表示・監査情報のみの追加成果物です。
+      売買ロジック本体は無変更です。これは表示・監査情報のみの追加成果物です。<br>
+      手作りフィクスチャ (① と ②) は <code>demo_fixture_not_backtest_result</code> 扱いで、
+      実際のバックテスト結果ではありません。
     </p>
   </div>
 </body>
