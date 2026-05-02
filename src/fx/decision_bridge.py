@@ -68,6 +68,13 @@ def build_decision_bridge(payload: dict | None) -> dict:
 
     Returns `available=False` when payload is None or has no
     `royal_road_decision_v2` slice.
+
+    When the v2 slice represents the integrated profile (i.e.
+    `profile == "royal_road_decision_v2_integrated"` OR
+    `integrated_decision` is present), wave / W-lines / fib /
+    Masterclass / candlestick / dow are reclassified from AUDIT_ONLY
+    to USED or PARTIAL based on the integrated_decision axis
+    statuses. Otherwise the legacy v2 classification is used.
     """
     if not payload:
         return _empty_panel("missing_payload")
@@ -82,21 +89,45 @@ def build_decision_bridge(payload: dict | None) -> dict:
     macro_align = v2.get("macro_alignment") or {}
     macro_score = macro_align.get("macro_score")
 
+    # Integrated profile detection
+    integrated = v2.get("integrated_decision") or {}
+    is_integrated = bool(
+        profile == "royal_road_decision_v2_integrated"
+        or integrated.get("schema_version") == "royal_road_integrated_decision_v1"
+    )
+    integrated_mode = integrated.get("mode") if is_integrated else None
+
     # ── USED / PARTIAL ─────────────────────────────────────────
     used: list[dict] = []
-    used.append(_entry(
-        category="royal_road_v2_core",
-        label_ja="王道v2本体の判断",
-        status=USED,
-        reason_ja=(
-            f"最終 action ({action}) は {profile} の既存ロジックから"
-            "出ています。"
-        ),
-        what_to_check_ja=(
-            "現行の royal_road_decision_v2 の判定基準を変えていません。"
-            "audit 表示は判断に影響しません。"
-        ),
-    ))
+    if is_integrated:
+        used.append(_entry(
+            category="royal_road_integrated_core",
+            label_ja=f"王道統合判断 (integrated profile, mode={integrated_mode})",
+            status=USED,
+            reason_ja=(
+                f"最終 action ({action}) は integrated decision エンジンが、"
+                "波形 / Wライン / フィボ / ローソク足 / ダウ / MA / RSI / "
+                "BB / MACD / 損切り / RR / マクロ を統合して出しています。"
+            ),
+            what_to_check_ja=(
+                "下の audit_only_references で、各監査モジュールが integrated "
+                "axes でどの status (PASS/WARN/BLOCK) になったかを確認してください。"
+            ),
+        ))
+    else:
+        used.append(_entry(
+            category="royal_road_v2_core",
+            label_ja="王道v2本体の判断",
+            status=USED,
+            reason_ja=(
+                f"最終 action ({action}) は {profile} の既存ロジックから"
+                "出ています。"
+            ),
+            what_to_check_ja=(
+                "現行の royal_road_decision_v2 の判定基準を変えていません。"
+                "audit 表示は判断に影響しません。"
+            ),
+        ))
     if stop_plan.get("stop_price") is not None:
         used.append(_entry(
             category="stop_plan",
@@ -146,84 +177,194 @@ def build_decision_bridge(payload: dict | None) -> dict:
             ),
         ))
 
-    # ── AUDIT_ONLY ─────────────────────────────────────────────
+    # ── AUDIT_ONLY (or USED/PARTIAL when integrated profile is active)
     audit_only: list[dict] = []
+
+    # Pre-extract integrated axis statuses if available — these tell us
+    # exactly which audit module actually drove the action.
+    axis_status_by_source: dict[str, str] = {}
+    if is_integrated:
+        for ax in integrated.get("axes") or []:
+            src = ax.get("source") or ""
+            stat = ax.get("status") or ""
+            if src and stat:
+                axis_status_by_source[src] = stat
+
+        def _integrated_status(source_name: str, fallback: str = AUDIT_ONLY) -> str:
+            """Map integrated-axis status (PASS/WARN/BLOCK) → bridge
+            status (USED/PARTIAL/AUDIT_ONLY)."""
+            ax_status = axis_status_by_source.get(source_name)
+            if ax_status == "PASS":
+                return USED
+            if ax_status == "WARN":
+                return PARTIAL
+            if ax_status == "BLOCK":
+                return USED  # the BLOCK actively forced HOLD
+            return fallback
+
     if payload.get("wave_shape_review"):
-        audit_only.append(_entry(
-            category="wave_shape_review",
-            label_ja="波形認識 (waveform shape review)",
-            status=AUDIT_ONLY,
-            reason_ja=(
-                "波形候補は表示されていますが、まだ BUY / SELL / HOLD の"
-                "最終判断には使っていません。"
-            ),
-            what_to_check_ja=(
-                "チャート上の波形候補や W ラインが、人間の見方と合って"
-                "いるか確認してください。"
-            ),
-        ))
+        if is_integrated:
+            wave_status = _integrated_status("chart_patterns", USED)
+            audit_only.append(_entry(
+                category="wave_shape_review",
+                label_ja="波形認識 (waveform shape review)",
+                status=wave_status,
+                reason_ja=(
+                    "integrated profile: 波形は wave_pattern 軸として"
+                    "判断に使用されています。"
+                ),
+                what_to_check_ja=(
+                    "チャート上の波形候補と integrated_decision の axes 表示が"
+                    "一致しているか確認してください。"
+                ),
+            ))
+        else:
+            audit_only.append(_entry(
+                category="wave_shape_review",
+                label_ja="波形認識 (waveform shape review)",
+                status=AUDIT_ONLY,
+                reason_ja=(
+                    "波形候補は表示されていますが、まだ BUY / SELL / HOLD の"
+                    "最終判断には使っていません。"
+                ),
+                what_to_check_ja=(
+                    "チャート上の波形候補や W ラインが、人間の見方と合って"
+                    "いるか確認してください。"
+                ),
+            ))
     if payload.get("wave_derived_lines"):
-        audit_only.append(_entry(
-            category="wave_derived_lines",
-            label_ja="波形由来ライン (WSL/WTP/WNL/WUP/WLOW/WBR)",
-            status=AUDIT_ONLY,
-            reason_ja=(
-                "波形由来の参考線は描画されていますが、"
-                "最終判断には未使用です。"
-            ),
-            what_to_check_ja=(
-                "WNL / WSL / WTP / WUP / WLOW / WBR の位置が自然か、"
-                "サポレジと重なっているか確認してください。"
-            ),
-        ))
+        if is_integrated:
+            wlines_status = _integrated_status("wave_derived_lines", USED)
+            audit_only.append(_entry(
+                category="wave_derived_lines",
+                label_ja="波形由来ライン (WSL/WTP/WNL/WUP/WLOW/WBR)",
+                status=wlines_status,
+                reason_ja=(
+                    "integrated profile: WNL / WSL / WTP は必須軸として"
+                    "判断に使用されています (WNL 未突破 / WSL なし / "
+                    "RR<2 のいずれかで HOLD)。"
+                ),
+                what_to_check_ja=(
+                    "WNL / WSL / WTP / WUP / WLOW / WBR の位置が"
+                    "integrated_decision の axes と整合しているか確認。"
+                ),
+            ))
+        else:
+            audit_only.append(_entry(
+                category="wave_derived_lines",
+                label_ja="波形由来ライン (WSL/WTP/WNL/WUP/WLOW/WBR)",
+                status=AUDIT_ONLY,
+                reason_ja=(
+                    "波形由来の参考線は描画されていますが、"
+                    "最終判断には未使用です。"
+                ),
+                what_to_check_ja=(
+                    "WNL / WSL / WTP / WUP / WLOW / WBR の位置が自然か、"
+                    "サポレジと重なっているか確認してください。"
+                ),
+            ))
 
     masterclass_dict = payload.get("masterclass_panels") or {}
     panels = masterclass_dict.get("panels") or {}
     if masterclass_dict.get("available"):
-        audit_only.append(_entry(
-            category="masterclass_panels",
-            label_ja="Masterclass 監査パネル (19機能)",
-            status=AUDIT_ONLY,
-            reason_ja=(
-                "資料由来のチェックは表示のみです。"
-                "現時点では最終 action には未接続です。"
-            ),
-            what_to_check_ja=(
-                "Tier 1 重要サマリ / Tier 2 王道チェック (13軸) で "
-                "PASS / WARN / BLOCK を確認してください。"
-            ),
-        ))
+        if is_integrated:
+            audit_only.append(_entry(
+                category="masterclass_panels",
+                label_ja="Masterclass 監査パネル (19機能)",
+                status=PARTIAL,
+                reason_ja=(
+                    "integrated profile: dow / candlestick / levels / "
+                    "ma_context / rsi_regime / bollinger / macd / divergence / "
+                    "invalidation_rr が判断軸として使用されています。"
+                ),
+                what_to_check_ja=(
+                    "下の integrated_decision.axes の status 列で、"
+                    "どの Masterclass 軸が PASS / WARN / BLOCK に貢献したか"
+                    "を確認できます。"
+                ),
+            ))
+        else:
+            audit_only.append(_entry(
+                category="masterclass_panels",
+                label_ja="Masterclass 監査パネル (19機能)",
+                status=AUDIT_ONLY,
+                reason_ja=(
+                    "資料由来のチェックは表示のみです。"
+                    "現時点では最終 action には未接続です。"
+                ),
+                what_to_check_ja=(
+                    "Tier 1 重要サマリ / Tier 2 王道チェック (13軸) で "
+                    "PASS / WARN / BLOCK を確認してください。"
+                ),
+            ))
         # Pull out Fibonacci specifically — most user-visible
         fib = panels.get("fibonacci_context_review") or {}
         if fib.get("available"):
-            audit_only.append(_entry(
-                category="fibonacci_context_review",
-                label_ja="フィボナッチ (fibonacci_context_review)",
-                status=AUDIT_ONLY,
-                reason_ja=(
-                    "フィボ線 (WFIB382 / 500 / 618 / 1272 / 1618) は"
-                    "表示されていますが、まだ最終判断には使っていません。"
-                ),
-                what_to_check_ja=(
-                    "現在価格が 38.2 / 50 / 61.8% 付近で反応しているか、"
-                    "サポート / ローソク足反発と合流しているか確認してください。"
-                ),
-            ))
+            if is_integrated:
+                fib_status = _integrated_status(
+                    "source_pack_fibonacci", PARTIAL,
+                )
+                audit_only.append(_entry(
+                    category="fibonacci_context_review",
+                    label_ja="フィボナッチ (fibonacci_context_review)",
+                    status=fib_status,
+                    reason_ja=(
+                        "integrated profile: フィボ位置は fibonacci 軸として"
+                        "判断に使用されています (50.0–61.8 で PASS、"
+                        "extension で WARN、波形無効化で BLOCK)。"
+                    ),
+                    what_to_check_ja=(
+                        "現在価格が 38.2 / 50 / 61.8% 付近で反応しているか、"
+                        "サポート / ローソク足反発と合流しているか確認してください。"
+                    ),
+                ))
+            else:
+                audit_only.append(_entry(
+                    category="fibonacci_context_review",
+                    label_ja="フィボナッチ (fibonacci_context_review)",
+                    status=AUDIT_ONLY,
+                    reason_ja=(
+                        "フィボ線 (WFIB382 / 500 / 618 / 1272 / 1618) は"
+                        "表示されていますが、まだ最終判断には使っていません。"
+                    ),
+                    what_to_check_ja=(
+                        "現在価格が 38.2 / 50 / 61.8% 付近で反応しているか、"
+                        "サポート / ローソク足反発と合流しているか確認してください。"
+                    ),
+                ))
         # Pull out Daily Roadmap separately
         roadmap = panels.get("daily_roadmap_review") or {}
         if roadmap.get("available"):
-            audit_only.append(_entry(
-                category="daily_roadmap_review",
-                label_ja="Daily 10k FX Roadmap",
-                status=AUDIT_ONLY,
-                reason_ja=(
-                    "運用チェックリストは表示中です。最終 action には未接続。"
-                ),
-                what_to_check_ja=(
-                    "未接続 (UNKNOWN) 項目はポジションサイジング / "
-                    "経済指標カレンダー / ジャーナル。手動で確認してください。"
-                ),
-            ))
+            if is_integrated:
+                rm_status = _integrated_status(
+                    "source_pack_daily_roadmap", PARTIAL,
+                )
+                audit_only.append(_entry(
+                    category="daily_roadmap_review",
+                    label_ja="Daily 10k FX Roadmap",
+                    status=rm_status,
+                    reason_ja=(
+                        f"integrated profile ({integrated_mode}): "
+                        "Daily Roadmap は判断軸。strict では未接続が HOLD、"
+                        "balanced では WARN として扱います。"
+                    ),
+                    what_to_check_ja=(
+                        "axes の daily_roadmap 行で PASS/WARN/BLOCK を確認。"
+                    ),
+                ))
+            else:
+                audit_only.append(_entry(
+                    category="daily_roadmap_review",
+                    label_ja="Daily 10k FX Roadmap",
+                    status=AUDIT_ONLY,
+                    reason_ja=(
+                        "運用チェックリストは表示中です。最終 action には未接続。"
+                    ),
+                    what_to_check_ja=(
+                        "未接続 (UNKNOWN) 項目はポジションサイジング / "
+                        "経済指標カレンダー / ジャーナル。手動で確認してください。"
+                    ),
+                ))
 
     # ── NOT_CONNECTED ──────────────────────────────────────────
     not_connected: list[dict] = []
@@ -287,36 +428,80 @@ def build_decision_bridge(payload: dict | None) -> dict:
             ))
 
     # ── Action-specific message ─────────────────────────────────
-    if action == "HOLD":
-        action_message_ja = (
-            "このチャートは入れそうに見えるかもしれません。"
-            "ただし最終判断は HOLD です。\n\n"
-            "理由:\n"
-            "- 王道v2本体で必要条件が不足\n"
-            "- W ライン / フィボ / Masterclass パネルは表示のみで、"
-            "まだ最終判断には使っていない\n"
-            "- ファンダ / position sizing / news は未接続"
+    if is_integrated:
+        # Integrated profile: messages reflect that wave / fib /
+        # Masterclass actually drove the action.
+        if action == "HOLD":
+            integrated_block_reasons = integrated.get("block_reasons") or []
+            block_summary = (
+                ", ".join(integrated_block_reasons[:3])
+                if integrated_block_reasons else "条件不足"
+            )
+            mode_ja = (
+                "strict (必須データ未接続なら HOLD)"
+                if integrated_mode == "integrated_strict"
+                else "balanced (未接続は WARN として扱う)"
+            )
+            action_message_ja = (
+                "この判断は王道統合ロジック (integrated profile) で出ています。"
+                "波形 / Wライン / フィボ / ローソク足 / ダウ / MA / RSI / "
+                "BB / MACD / 損切り / RR / マクロ を統合して判定し、"
+                f"HOLD になりました。\n\nmode: {mode_ja}\nブロック理由: "
+                f"{block_summary}"
+            )
+        elif action in ("BUY", "SELL"):
+            mode_ja = (
+                "strict" if integrated_mode == "integrated_strict" else "balanced"
+            )
+            action_message_ja = (
+                f"この判断は王道統合ロジック (integrated profile, mode={mode_ja}) "
+                f"で出ています。\n波形 / Wライン / フィボ / ローソク足 / ダウ / "
+                f"MA / RSI / BB / MACD / 損切り / RR を統合して {action} を決定。\n"
+                "axes 表示で各軸の PASS / WARN / BLOCK と判断への寄与を確認できます。"
+            )
+        else:
+            action_message_ja = f"integrated profile: 最終判断 {action}"
+        summary_ja = (
+            f"最終判断は {action} (integrated profile, mode={integrated_mode})。"
+            "波形 / Wライン / フィボ / Masterclass パネルは判断に直接使用されています。"
         )
-    elif action in ("BUY", "SELL"):
-        action_message_ja = (
-            f"最終判断は {action} です。\n\n"
-            "ただし、波形・フィボ・Masterclass パネルは現時点では補助監査"
-            "であり、最終判断に直接使っていません。\n"
-            "チャート上でそれらが最終判断と同方向か、矛盾していないかを"
-            "確認してください。"
+        plain_answer_ja = (
+            "この画面は『判断に使った根拠』そのものです。"
+            "axes の status (PASS/WARN/BLOCK) を見れば、どの根拠が"
+            "action に寄与したかが分かります。"
         )
     else:
-        action_message_ja = f"最終判断: {action}"
+        # Legacy v2 messaging (audit-only)
+        if action == "HOLD":
+            action_message_ja = (
+                "このチャートは入れそうに見えるかもしれません。"
+                "ただし最終判断は HOLD です。\n\n"
+                "理由:\n"
+                "- 王道v2本体で必要条件が不足\n"
+                "- W ライン / フィボ / Masterclass パネルは表示のみで、"
+                "まだ最終判断には使っていない\n"
+                "- ファンダ / position sizing / news は未接続"
+            )
+        elif action in ("BUY", "SELL"):
+            action_message_ja = (
+                f"最終判断は {action} です。\n\n"
+                "ただし、波形・フィボ・Masterclass パネルは現時点では補助監査"
+                "であり、最終判断に直接使っていません。\n"
+                "チャート上でそれらが最終判断と同方向か、矛盾していないかを"
+                "確認してください。"
+            )
+        else:
+            action_message_ja = f"最終判断: {action}"
 
-    summary_ja = (
-        f"最終判断は {action} です。"
-        "ただし波形・フィボ・Masterclass パネルは現時点では監査表示のみで、"
-        "直接の売買判断には使っていません。"
-    )
-    plain_answer_ja = (
-        "この画面の多くは『判断に使った根拠』ではなく『人間が確認するための"
-        "監査情報』です。最終結果と完全にはまだ結びついていません。"
-    )
+        summary_ja = (
+            f"最終判断は {action} です。"
+            "ただし波形・フィボ・Masterclass パネルは現時点では監査表示のみで、"
+            "直接の売買判断には使っていません。"
+        )
+        plain_answer_ja = (
+            "この画面の多くは『判断に使った根拠』ではなく『人間が確認するための"
+            "監査情報』です。最終結果と完全にはまだ結びついていません。"
+        )
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -325,6 +510,8 @@ def build_decision_bridge(payload: dict | None) -> dict:
         "used_in_decision": False,
         "final_action": action,
         "final_action_source": profile,
+        "integrated_profile_active": bool(is_integrated),
+        "integrated_mode": integrated_mode,
         "summary_ja": summary_ja,
         "action_message_ja": action_message_ja,
         "plain_answer_ja": plain_answer_ja,

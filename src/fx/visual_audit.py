@@ -2946,6 +2946,10 @@ img.thumb { width: 220px; height: auto; border: 1px solid #ddd; }
 .decision-bridge .bridge-tag-used { background: #2e7d32; }
 .decision-bridge .bridge-tag-partial { background: #1565c0; }
 .decision-bridge .bridge-tag-audit-only { background: #f9a825; }
+.decision-bridge .integrated-banner { background: #e3f2fd;
+  border: 2px solid #1565c0; border-radius: 4px; padding: 6px 10px;
+  margin: 4px 0 10px; font-size: 12px; }
+.decision-bridge .integrated-banner p { margin: 2px 0; }
 .decision-bridge .bridge-tag-not-connected { background: #c62828; }
 .decision-bridge .bridge-tag-unknown { background: #888; }
 .decision-bridge .bridge-reason { color: #333; }
@@ -4077,11 +4081,30 @@ def _render_decision_bridge_html(
         if action in ("BUY", "SELL", "HOLD") else "bridge-action-unknown"
     )
 
+    integrated_active = bool(bridge.get("integrated_profile_active"))
+    integrated_mode = bridge.get("integrated_mode") or ""
+    integrated_banner_html = ""
+    if integrated_active:
+        mode_ja = (
+            "strict (必須データ未接続なら HOLD)"
+            if integrated_mode == "integrated_strict"
+            else "balanced (未接続は WARN)"
+        )
+        integrated_banner_html = (
+            "<div class='integrated-banner'>"
+            "<p><b>★ この判断は王道統合ロジックで出ています。</b></p>"
+            "<p>波形 / Wライン / フィボ / ローソク足 / ダウ / MA / RSI / "
+            "BB / MACD / 損切り / RR を統合して判定しています。"
+            f"mode = <b>{_html_escape(mode_ja)}</b>。</p>"
+            "</div>"
+        )
+
     return (
         "<div class='decision-bridge'>"
         "<h3>★ この判断の読み方 (decision bridge)</h3>"
+        + integrated_banner_html
 
-        "<div class='bridge-section bridge-final-section'>"
+        + "<div class='bridge-section bridge-final-section'>"
         "<h4>1. 最終判断</h4>"
         f"<p class='bridge-final-line'>"
         f"<span class='{action_class}'>{_html_escape(action)}</span>"
