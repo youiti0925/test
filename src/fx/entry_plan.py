@@ -51,6 +51,74 @@ import pandas as pd
 SCHEMA_VERSION: Final[str] = "entry_plan_v1"
 
 
+# Entry-state tokens. WAIT_EVENT_CLEAR is added in Phase G — it sits
+# ABOVE the wave-first gate: a plan can be perfectly READY by the
+# wave / RR / candle criteria, but if a high-impact event falls
+# inside its HOLD window the plan is downgraded to
+# WAIT_EVENT_CLEAR and the integrated action becomes HOLD.
+STATUS_READY: Final[str] = "READY"
+STATUS_WAIT_BREAKOUT: Final[str] = "WAIT_BREAKOUT"
+STATUS_WAIT_RETEST: Final[str] = "WAIT_RETEST"
+STATUS_WAIT_EVENT_CLEAR: Final[str] = "WAIT_EVENT_CLEAR"
+STATUS_HOLD: Final[str] = "HOLD"
+
+
+def downgrade_for_event_risk(
+    entry_plan: dict | None,
+    *,
+    event_risk_status: str | None,
+    blocking_event_title: str | None = None,
+    blocking_event_window_h: float | None = None,
+    blocking_event_minutes_until: int | None = None,
+) -> dict | None:
+    """Phase G: post-process an existing entry_plan dict to demote
+    READY → WAIT_EVENT_CLEAR when fundamental_sidebar reports a
+    BLOCK-window event.
+
+    Returns a NEW dict (does not mutate input). Pass-through when
+    the plan is None / non-READY / event_risk_status is not BLOCK.
+    The integrated decision treats WAIT_EVENT_CLEAR identically to
+    WAIT_BREAKOUT / WAIT_RETEST for action gating: action == HOLD.
+    """
+    if not entry_plan:
+        return entry_plan
+    if (entry_plan.get("entry_status") or "") != STATUS_READY:
+        return entry_plan
+    if (event_risk_status or "").upper() != "BLOCK":
+        return entry_plan
+
+    out = dict(entry_plan)
+    out["entry_status"] = STATUS_WAIT_EVENT_CLEAR
+    out["entry_price"] = None  # not actionable while event window is open
+    timing_ja = ""
+    if blocking_event_minutes_until is not None:
+        m = int(blocking_event_minutes_until)
+        if m >= 0:
+            timing_ja = f"{m // 60} 時間 {m % 60} 分後"
+        else:
+            am = abs(m)
+            timing_ja = f"{am // 60} 時間 {am % 60} 分前"
+    win_ja = (
+        f"±{blocking_event_window_h:.0f}h"
+        if blocking_event_window_h is not None else ""
+    )
+    title_ja = blocking_event_title or "高インパクト経済イベント"
+    out["reason_ja"] = (
+        f"テクニカル・波形・RR は ENTRY_READY ですが、{title_ja}"
+        f"{('（' + timing_ja + '、' + win_ja + ' window' + '）') if timing_ja else ''}"
+        "により新規エントリー禁止です。イベント通過まで待機します。"
+    )
+    out["what_to_wait_for_ja"] = (
+        f"{title_ja} の通過と HOLD ウィンドウ終了を待ってから、"
+        "再度 entry_plan を確認してください。"
+    )
+    extras = list(out.get("block_reasons") or [])
+    extras.append("event_risk_block_window")
+    out["block_reasons"] = extras
+    out["downgraded_from_ready_by_event_risk"] = True
+    return out
+
+
 _BULLISH_BARS: Final[frozenset] = frozenset({
     "bullish_pinbar", "bullish_engulfing", "bullish_harami",
     "large_bull",

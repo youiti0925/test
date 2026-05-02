@@ -50,7 +50,8 @@ from .macro_alignment import compute_macro_alignment
 from .masterclass_candlestick import build_candlestick_anatomy_review
 from .masterclass_dow import build_dow_structure_review
 from .breakout_quality_gate import build_breakout_quality_gate
-from .entry_plan import build_entry_plan
+from .entry_plan import build_entry_plan, downgrade_for_event_risk
+from .fundamental_sidebar import build_fundamental_sidebar
 from .pattern_level_derivation import derive_pattern_levels
 from .pattern_shape_review import build_pattern_shape_review
 from .patterns import PatternResult
@@ -977,6 +978,7 @@ def _build_panels_from_df(
     stop_atr_mult: float,
     tp_atr_mult: float,
     pre_supplied: dict | None = None,
+    now: "pd.Timestamp | None" = None,
 ) -> dict:
     """Build the minimum panel set used by the integrated decision."""
     pre = pre_supplied or {}
@@ -1277,6 +1279,54 @@ def _build_panels_from_df(
             atr_value=atr_value,
         )
 
+    # ── Phase G: fundamental_sidebar + WAIT_EVENT_CLEAR downgrade ─
+    # Build the right-sidebar panel from the existing event feed +
+    # macro_alignment, then post-process entry_plan: a READY plan
+    # downgraded to WAIT_EVENT_CLEAR when a high-impact event sits
+    # inside its HOLD window. The integrated decision treats
+    # WAIT_EVENT_CLEAR identically to WAIT_BREAKOUT (action=HOLD).
+    fundamental_sidebar = pre.get("fundamental_sidebar")
+    if fundamental_sidebar is None:
+        events_for_sidebar = pre.get("events_for_sidebar")
+        macro_align_dict = {
+            "macro_score": float(macro_snap.macro_score),
+            "macro_strong_against": macro_snap.macro_strong_against,
+            "dxy_alignment": macro_snap.dxy_alignment,
+            "yield_alignment": macro_snap.yield_alignment,
+            "vix_regime": macro_snap.vix_regime,
+            "currency_bias": macro_snap.currency_bias,
+            "event_tone": getattr(macro_snap, "event_tone", None),
+        }
+        # `now` is the parent bar timestamp when called from the
+        # integrated decision (point-in-time). When auto-built by
+        # callers without `now`, fall back to the latest bar's index.
+        sidebar_now = now
+        if sidebar_now is None and df_window is not None and len(df_window) > 0:
+            try:
+                sidebar_now = df_window.index[-1].to_pydatetime()
+            except Exception:  # noqa: BLE001
+                sidebar_now = None
+        fundamental_sidebar = build_fundamental_sidebar(
+            symbol=symbol,
+            now=sidebar_now,
+            events=events_for_sidebar,  # None when caller didn't pass any
+            macro_alignment=macro_align_dict,
+            macro_context=macro_context,
+            final_action=None,
+            entry_status=(entry_plan or {}).get("entry_status"),
+        )
+
+    # Apply event-risk downgrade to entry_plan
+    if fundamental_sidebar.get("event_risk_status") == "BLOCK":
+        first = (fundamental_sidebar.get("blocking_events") or [{}])[0]
+        entry_plan = downgrade_for_event_risk(
+            entry_plan,
+            event_risk_status="BLOCK",
+            blocking_event_title=first.get("title"),
+            blocking_event_window_h=first.get("window_hours"),
+            blocking_event_minutes_until=first.get("minutes_until"),
+        )
+
     return {
         "chart_pattern_review": chart_pattern,
         "wave_shape_review": wave_shape_review,
@@ -1284,6 +1334,7 @@ def _build_panels_from_df(
         "pattern_levels": pattern_levels,
         "entry_plan": entry_plan,
         "breakout_quality_gate": breakout_quality_gate,
+        "fundamental_sidebar": fundamental_sidebar,
         "fibonacci_context_review": fib,
         "candlestick_anatomy_review": candle,
         "dow_structure_review": dow,
@@ -1379,6 +1430,7 @@ def decide_royal_road_v2_integrated(
         stop_atr_mult=stop_atr_mult,
         tp_atr_mult=tp_atr_mult,
         pre_supplied=audit_panels,
+        now=base_bar_close_ts,
     )
 
     # 3. Build axes
@@ -1568,6 +1620,7 @@ def decide_royal_road_v2_integrated(
         "pattern_levels": panels.get("pattern_levels"),
         "entry_plan": panels.get("entry_plan"),
         "breakout_quality_gate": panels.get("breakout_quality_gate"),
+        "fundamental_sidebar": panels.get("fundamental_sidebar"),
         "wave_shape_review": panels.get("wave_shape_review"),
         "wave_derived_lines": panels.get("wave_derived_lines") or [],
         # v2 trace compatibility — visual_audit reads these.
