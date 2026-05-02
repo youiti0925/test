@@ -83,6 +83,30 @@ def _empty_plan(reason: str) -> dict:
     }
 
 
+def _find_first_breakout_bar(
+    *, side: str, df_window: pd.DataFrame, trigger_price: float,
+    start_index: int = 0,
+) -> int | None:
+    """Locate the FIRST bar (by close) that crosses the trigger in
+    the breakout direction. Different from skeleton's BR pivot
+    (which is the last extreme). Used to define the post-breakout
+    retest window."""
+    if df_window is None or len(df_window) == 0:
+        return None
+    closes = df_window["close"].to_numpy()
+    n = len(closes)
+    start = max(0, int(start_index))
+    if side == "BUY":
+        for i in range(start, n):
+            if closes[i] > trigger_price:
+                return i
+    elif side == "SELL":
+        for i in range(start, n):
+            if closes[i] < trigger_price:
+                return i
+    return None
+
+
 def _detect_retest_and_confirm(
     *,
     side: str,
@@ -94,22 +118,33 @@ def _detect_retest_and_confirm(
 ) -> tuple[bool, str]:
     """Heuristic retest detection.
 
-    A retest is considered confirmed when, AFTER the breakout bar:
-      - For BUY: at least one bar's low touches the trigger line within
-        ATR×0.5, AND the most recent classified bar is bullish.
-      - For SELL: at least one bar's high touches the trigger line, AND
-        the most recent classified bar is bearish.
+    A retest is considered confirmed when, AFTER the FIRST breakout
+    bar (close crosses trigger), at some later bar the price comes
+    back to the trigger line within ATR×0.5, AND the most recent
+    classified bar is bullish (BUY) / bearish (SELL).
+
+    The "FIRST breakout bar" is recomputed from df even if
+    `breakout_bar_index` (from skeleton) points to a later peak —
+    this is the only way to surface retests on synthetic curves
+    where the skeleton anchors BR to the end of the post-breakout
+    move.
 
     Returns (retest_confirmed, confirmation_candle_label).
     """
     if df_window is None or len(df_window) == 0:
         return False, ""
-    if breakout_bar_index is None or breakout_bar_index < 0:
+
+    # Locate true first breakout bar. start_index = the pre-breakout
+    # anchor (B2/P2/RS) so we don't pick a much-earlier crossover.
+    first_break = _find_first_breakout_bar(
+        side=side, df_window=df_window, trigger_price=trigger_price,
+        start_index=int(breakout_bar_index) if breakout_bar_index is not None else 0,
+    )
+    if first_break is None:
         return False, ""
-    if breakout_bar_index >= len(df_window) - 1:
-        # Breakout is the latest bar; no opportunity for retest yet.
+    if first_break >= len(df_window) - 1:
         return False, ""
-    after = df_window.iloc[breakout_bar_index + 1:]
+    after = df_window.iloc[first_break + 1:]
     if len(after) == 0:
         return False, ""
     a = float(atr) if atr is not None and atr > 0 else max(
@@ -117,9 +152,11 @@ def _detect_retest_and_confirm(
     )
     band = a * 0.5
     if side == "BUY":
+        # Retest: post-breakout, price came back DOWN to within band of trigger
         touched = bool(((after["low"] <= trigger_price + band)
                         & (after["low"] >= trigger_price - 2 * band)).any())
     elif side == "SELL":
+        # Retest: post-breakout, price came back UP to within band of trigger
         touched = bool(((after["high"] >= trigger_price - band)
                         & (after["high"] <= trigger_price + 2 * band)).any())
     else:
@@ -168,7 +205,19 @@ def build_entry_plan(
     target_ext = pattern_levels.get("target_extended_price")
     rr_extended = pattern_levels.get("rr_at_extended_target")
     breakout_confirmed = bool(pattern_levels.get("breakout_confirmed"))
-    breakout_bar_index = (pattern_levels.get("parts") or {}).get("BR", {}).get("index")
+    parts = pattern_levels.get("parts") or {}
+    breakout_bar_index = (parts.get("BR") or {}).get("index")
+    # Anchor the post-breakout retest search to the LAST pattern
+    # constituent BEFORE the breakout (B2 / P2 / RS). The skeleton's
+    # BR pivot can be the last-extreme of the post-breakout move
+    # which leaves no bars after it; using the pre-BR anchor lets
+    # us find the FIRST close that crosses the trigger.
+    pre_break_anchor = None
+    for key in ("B2", "P2", "RS"):
+        v = parts.get(key)
+        if v and v.get("index") is not None:
+            pre_break_anchor = int(v["index"])
+            break
 
     block_reasons: list[str] = []
 
@@ -244,7 +293,7 @@ def build_entry_plan(
     retest_ok, conf_candle = _detect_retest_and_confirm(
         side=side,
         df_window=df_window,
-        breakout_bar_index=breakout_bar_index,
+        breakout_bar_index=pre_break_anchor or breakout_bar_index,
         trigger_price=float(trigger_price),
         candle_review=candle_review,
         atr=atr_value,

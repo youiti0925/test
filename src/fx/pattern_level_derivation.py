@@ -357,27 +357,34 @@ def derive_pattern_levels(
         kind=kind, skeleton=skeleton,
     )
 
-    # Trigger line: prefer entry_confirmation_line (WNL), fall back
-    # to pattern_breakout (WBR) when neckline is missing (e.g. flag).
-    nl_line = _line_by_role(wave_derived_lines, "entry_confirmation_line")
-    br_line = _line_by_role(wave_derived_lines, "breakout_line")
-    if br_line is None:
-        # Some patterns expose breakout via "pattern_breakout" role
-        for ln in (wave_derived_lines or []):
-            if ln.get("kind") == "pattern_breakout":
-                br_line = ln
-                break
-
-    trigger_line = nl_line or br_line
-    trigger_id = trigger_line.get("id") if trigger_line else None
-    trigger_price = _safe_float(
-        trigger_line.get("price") if trigger_line else None,
-    )
-    # When NL line is missing or wrong, fall back to the kind-derived
-    # NL part price (more reliable when matched_parts is degenerate).
-    if trigger_price is None and parts.get("NL", {}).get("price") is not None:
+    # Trigger line. Priority order:
+    # 1. parts.NL (from skeleton L/H sequence — authoritative)
+    # 2. wave_derived_lines.role == "entry_confirmation_line" (legacy WNL)
+    # 3. wave_derived_lines.role == "breakout_line" (flag/wedge)
+    #
+    # The skeleton-derived NL is preferred because matched_parts can be
+    # degenerate when pivot count < template parts (NL was being mapped
+    # to a Low pivot in the original implementation).
+    trigger_id: str | None = None
+    trigger_price: float | None = None
+    if parts.get("NL", {}).get("price") is not None:
         trigger_price = float(parts["NL"]["price"])
-        trigger_id = trigger_id or "WNL_derived"
+        trigger_id = "WNL_derived"
+    if trigger_price is None:
+        nl_line = _line_by_role(wave_derived_lines, "entry_confirmation_line")
+        if nl_line is not None:
+            trigger_id = nl_line.get("id")
+            trigger_price = _safe_float(nl_line.get("price"))
+    if trigger_price is None:
+        br_line = _line_by_role(wave_derived_lines, "breakout_line")
+        if br_line is None:
+            for ln in (wave_derived_lines or []):
+                if ln.get("kind") == "pattern_breakout":
+                    br_line = ln
+                    break
+        if br_line is not None:
+            trigger_id = br_line.get("id")
+            trigger_price = _safe_float(br_line.get("price"))
 
     # Stop / target from wave_derived_lines (WSL / WTP).
     stop_line = _line_by_role(wave_derived_lines, "stop_candidate")
