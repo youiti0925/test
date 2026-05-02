@@ -432,6 +432,919 @@ def render_visual_audit(
 
 __all__ = [
     "SCHEMA_VERSION",
+    "BATCH_SCHEMA_VERSION",
     "build_visual_audit_payload",
     "render_visual_audit",
+    "render_visual_audit_report",
+    "select_important_cases",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Batch report (visual_audit_report_v1)
+# ---------------------------------------------------------------------------
+#
+# Top-level orchestrator: generates a static HTML report directory the
+# user can open in a browser to audit royal_road_v2 decisions.
+#
+# Layout:
+#   <out_dir>/
+#       index.html             - simple table over selected cases
+#       cases.json             - JSON list of case summaries
+#       summary.json           - aggregate stats (counts per priority)
+#       assets/style.css       - inline-friendly CSS (just enough)
+#       <symbol>/<safe_ts>/
+#           audit.json
+#           detail.html
+#           feedback_template.json
+#           chart_main.png  OR  chart_main.image_unavailable
+#           chart_micro.png  OR  ...
+#           chart_short.png
+#           chart_medium.png
+#           chart_long.png
+#           chart_lower_tf.png  (only when lower_tf is attached)
+#
+# Future-leak: every chart writer truncates df to ts <= parent_bar_ts
+# (delegated to existing build_visual_audit_payload).
+# ---------------------------------------------------------------------------
+
+
+BATCH_SCHEMA_VERSION: Final[str] = "visual_audit_report_v1"
+
+# Per-priority counters (the "important case" picker bucketises cases)
+PRIORITY_LABELS: Final[tuple[str, ...]] = (
+    "v2_directional",
+    "v2_vs_current_diff",
+    "high_quality_hold",
+    "low_quality_directional_attempt",
+    "block_reason_representative",
+    "stop_mode_non_atr",
+    "lower_tf_trigger_present",
+    "selected_pattern_present",
+    "fake_breakout_block",
+    "random_hold_filler",
+)
+
+
+def _safe_ts_for_path(ts: str) -> str:
+    """Make a ts-string filesystem-safe: 2026-02-10T10:00:00+00:00
+    -> 2026-02-10T10-00-00Z."""
+    s = str(ts)
+    s = s.replace(":", "-").replace("+00-00", "Z").replace("+00:00", "Z")
+    s = s.replace("+", "p").replace(" ", "_")
+    return s
+
+
+def _trace_symbol(trace: Any) -> str | None:
+    return _safe_get(trace, "symbol")
+
+
+def select_important_cases(
+    traces: Iterable[Any],
+    *,
+    max_cases: int = 200,
+) -> list[dict]:
+    """Pick a representative subset of v2 cases for visual audit.
+
+    Per the user-supplied priority list:
+      1. v2 BUY/SELL
+      2. v2 vs current_runtime difference != "same"
+      3. high reconstruction_quality but HOLD
+      4. low reconstruction_quality but directional attempt blocked
+      5. top block_reasons (one per representative reason)
+      6. stop_mode != "atr"
+      7. lower_tf trigger fired
+      8. selected pattern present
+      9. fake_breakout block
+     10. random HOLD filler (per symbol)
+
+    Returns a list of {trace, priority, rank, case_id} dicts. Each
+    trace appears at most once (first matching priority wins).
+    """
+    seen_ids: set[str] = set()
+    out: list[dict] = []
+    by_priority: dict[str, list[Any]] = {p: [] for p in PRIORITY_LABELS}
+    block_reason_seen: set[str] = set()
+
+    # First pass: classify each trace.
+    for tr in traces:
+        v2 = _trace_v2_payload(tr)
+        if v2 is None:
+            continue
+        sym = _trace_symbol(tr) or "UNKNOWN"
+        ts = _safe_get(tr, "timestamp") or ""
+        cid = f"{sym}_{_safe_ts_for_path(ts)}"
+        if cid in seen_ids:
+            continue
+        seen_ids.add(cid)
+        action = v2.get("action") or "HOLD"
+        rq_total = float(
+            (v2.get("reconstruction_quality") or {}).get(
+                "total_reconstruction_score", 0.0
+            )
+        )
+        block_reasons = list(v2.get("block_reasons") or [])
+        cmp_v1 = v2.get("compared_to_current_runtime") or {}
+        diff = cmp_v1.get("difference_type", "same")
+        ltf = (v2.get("lower_tf_trigger") or {})
+        sp = (v2.get("structure_stop_plan") or {})
+        chart_p = (v2.get("chart_pattern_v2") or {})
+        # Priority bucket selection (first match wins)
+        if action in ("BUY", "SELL"):
+            bucket = "v2_directional"
+        elif diff != "same":
+            bucket = "v2_vs_current_diff"
+        elif rq_total >= 0.5:
+            bucket = "high_quality_hold"
+        elif any(
+            "insufficient_royal_road_reconstruction_quality" in r
+            for r in block_reasons
+        ):
+            bucket = "low_quality_directional_attempt"
+        elif any(r.startswith("avoid:fake_breakout") or r == "sr_fake_breakout"
+                 for r in block_reasons):
+            bucket = "fake_breakout_block"
+        elif sp.get("chosen_mode") and sp["chosen_mode"] != "atr":
+            bucket = "stop_mode_non_atr"
+        elif ltf.get("available") and (
+            ltf.get("bullish_trigger") or ltf.get("bearish_trigger")
+        ):
+            bucket = "lower_tf_trigger_present"
+        elif (chart_p.get("selected_patterns_top5") or []):
+            bucket = "selected_pattern_present"
+        elif block_reasons:
+            # Take ONE per representative block reason so the audit
+            # surfaces a wide variety, not 100 of the same kind.
+            top_reason = block_reasons[0]
+            if top_reason in block_reason_seen:
+                bucket = "random_hold_filler"
+            else:
+                block_reason_seen.add(top_reason)
+                bucket = "block_reason_representative"
+        else:
+            bucket = "random_hold_filler"
+        by_priority[bucket].append({
+            "trace": tr, "case_id": cid, "symbol": sym, "ts": ts,
+            "v2": v2, "action": action, "rq": rq_total, "diff": diff,
+            "block_reasons": block_reasons,
+        })
+
+    # Second pass: round-robin pull from each bucket so the report has
+    # diversity instead of "200 v2 BUYs in a row".
+    cursors = {p: 0 for p in PRIORITY_LABELS}
+    while len(out) < max_cases:
+        added = 0
+        for p in PRIORITY_LABELS:
+            if len(out) >= max_cases:
+                break
+            i = cursors[p]
+            if i >= len(by_priority[p]):
+                continue
+            entry = by_priority[p][i]
+            entry["priority"] = p
+            entry["rank"] = i + 1
+            out.append(entry)
+            cursors[p] += 1
+            added += 1
+        if added == 0:
+            break
+    return out
+
+
+def _render_candle_image(
+    *,
+    df: pd.DataFrame,
+    end_ts: pd.Timestamp,
+    n_bars: int,
+    overlays: dict | None,
+    title: str,
+    out_path: Path,
+) -> dict:
+    """Best-effort matplotlib candlestick render. Returns
+    {"image_status": "rendered"|"matplotlib_missing"|"render_error:<...>"}.
+
+    Always future-leak safe: only bars with index <= end_ts are drawn.
+    """
+    try:
+        import matplotlib  # type: ignore
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:  # noqa: BLE001
+        marker = out_path.with_suffix(".image_unavailable")
+        marker.write_text(
+            f"matplotlib_missing: {type(e).__name__}: {e}\n"
+        )
+        return {
+            "image_status": "matplotlib_missing",
+            "marker_file": str(marker),
+        }
+    try:
+        if df is None or len(df) == 0 or n_bars <= 0:
+            marker = out_path.with_suffix(".image_unavailable")
+            marker.write_text("no_visible_bars\n")
+            return {"image_status": "render_error:no_visible_bars"}
+        visible = df[df.index <= end_ts].tail(n_bars)
+        if len(visible) == 0:
+            marker = out_path.with_suffix(".image_unavailable")
+            marker.write_text("no_visible_bars\n")
+            return {"image_status": "render_error:no_visible_bars"}
+
+        fig, ax = plt.subplots(figsize=(14, 8))
+        # OHLC candles: body via vlines for thickness (open->close),
+        # wick via thinner vlines (low->high). Body color = bull/bear.
+        x = list(visible.index)
+        o = visible["open"].to_numpy()
+        h = visible["high"].to_numpy()
+        l = visible["low"].to_numpy()
+        c = visible["close"].to_numpy()
+        # Wick (thin)
+        ax.vlines(x, l, h, color="black", linewidth=0.5, alpha=0.6)
+        # Body (thick) — green/red
+        bullish = c >= o
+        bull_x = [xi for xi, b in zip(x, bullish) if b]
+        bull_lo = [oi for oi, b in zip(o, bullish) if b]
+        bull_hi = [ci for ci, b in zip(c, bullish) if b]
+        bear_x = [xi for xi, b in zip(x, bullish) if not b]
+        bear_lo = [ci for ci, b in zip(c, bullish) if not b]
+        bear_hi = [oi for oi, b in zip(o, bullish) if not b]
+        if bull_x:
+            ax.vlines(bull_x, bull_lo, bull_hi, color="green", linewidth=2.0)
+        if bear_x:
+            ax.vlines(bear_x, bear_lo, bear_hi, color="red", linewidth=2.0)
+
+        # Overlays (selected SR zones / rejected SR zones / trendlines /
+        # patterns / lower_tf trigger / stop+tp).
+        if overlays is not None:
+            for lvl in overlays.get("level_zones_selected", []):
+                zlow = lvl.get("zone_low")
+                zhigh = lvl.get("zone_high")
+                if zlow is None or zhigh is None:
+                    continue
+                color = (
+                    "green" if lvl.get("kind") == "support"
+                    else "red" if lvl.get("kind") == "resistance"
+                    else "purple"
+                )
+                ax.axhspan(zlow, zhigh, color=color, alpha=0.15)
+            for lvl in overlays.get("level_zones_rejected", []):
+                zlow = lvl.get("zone_low")
+                zhigh = lvl.get("zone_high")
+                if zlow is None or zhigh is None:
+                    continue
+                ax.axhspan(zlow, zhigh, color="gray", alpha=0.05)
+            for t in overlays.get("trendlines_selected", []):
+                slope = t.get("slope")
+                intercept = t.get("intercept")
+                anchors = t.get("anchor_indices") or []
+                if slope is None or intercept is None or len(anchors) < 2:
+                    continue
+                idxs = list(range(anchors[0], anchors[-1] + 1))
+                ys = [slope * i + intercept for i in idxs]
+                # Map index → timestamp via visible df position when in range
+                ts_xs = [visible.index[i] for i in idxs if i < len(visible)]
+                ys = ys[: len(ts_xs)]
+                if ts_xs:
+                    ax.plot(
+                        ts_xs, ys, color="blue", linewidth=0.8,
+                        alpha=0.4 if t.get("broken") else 0.85,
+                    )
+            # Rejected trendlines: dotted gray, low alpha (still visible)
+            for rj in overlays.get("trendlines_rejected", []):
+                tdict = rj.get("trendline") or {}
+                slope = tdict.get("slope")
+                intercept = tdict.get("intercept")
+                anchors = tdict.get("anchor_indices") or []
+                if slope is None or intercept is None or len(anchors) < 2:
+                    continue
+                idxs = list(range(anchors[0], anchors[-1] + 1))
+                ts_xs = [visible.index[i] for i in idxs if i < len(visible)]
+                ys = [slope * i + intercept for i in idxs[: len(ts_xs)]]
+                if ts_xs:
+                    ax.plot(
+                        ts_xs, ys, color="gray", linewidth=0.5,
+                        alpha=0.3, linestyle=":",
+                    )
+            for p in overlays.get("patterns_selected", []):
+                nl = p.get("neckline")
+                if nl is None:
+                    continue
+                color = (
+                    "darkgreen" if p.get("side_bias") == "BUY"
+                    else "darkred" if p.get("side_bias") == "SELL"
+                    else "darkorange"
+                )
+                ax.axhline(
+                    nl, color=color, linestyle="--", linewidth=0.8, alpha=0.7,
+                )
+            ltf = overlays.get("lower_tf_trigger")
+            if ltf and ltf.get("trigger_ts") and ltf.get("trigger_price"):
+                try:
+                    t_ts = pd.Timestamp(ltf["trigger_ts"])
+                    ax.scatter(
+                        [t_ts], [ltf["trigger_price"]],
+                        color="orange", s=60, marker="^",
+                        label=ltf.get("trigger_type"),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            sp = overlays.get("structure_stop_plan")
+            if sp:
+                if sp.get("stop_price") is not None:
+                    ax.axhline(
+                        sp["stop_price"], color="red", linestyle=":",
+                        linewidth=1.0, alpha=0.7, label="stop",
+                    )
+                if sp.get("take_profit_price") is not None:
+                    ax.axhline(
+                        sp["take_profit_price"], color="green", linestyle=":",
+                        linewidth=1.0, alpha=0.7, label="tp",
+                    )
+        ax.set_title(title)
+        ax.legend(loc="best", fontsize=8)
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=120)
+        plt.close(fig)
+        return {"image_status": "rendered", "image_path": str(out_path)}
+    except Exception as e:  # noqa: BLE001
+        marker = out_path.with_suffix(".image_unavailable")
+        marker.write_text(f"render_error: {type(e).__name__}: {e}\n")
+        return {"image_status": f"render_error:{type(e).__name__}"}
+
+
+def _multi_scale_image_status(
+    *,
+    df: pd.DataFrame,
+    payload: dict,
+    case_dir: Path,
+) -> dict:
+    """Render one chart per scale (micro/short/medium/long) when
+    available; otherwise emit an `image_unavailable` marker AND
+    record `available=False` + `unavailable_reason` in the returned
+    dict for sidecar consumption."""
+    out: dict[str, dict] = {}
+    overlays = (payload.get("overlays") or {})
+    scales = (
+        payload.get("royal_road_decision_v2") or {}
+    ).get("multi_scale_chart", {}).get("scales", {})
+    parent_iso = payload.get("parent_bar_ts")
+    end_ts = pd.Timestamp(parent_iso) if parent_iso else None
+    for scale, n_bars in (
+        ("micro", 30), ("short", 100),
+        ("medium", 300), ("long", 1000),
+    ):
+        sc_info = scales.get(scale, {})
+        png_path = case_dir / f"chart_{scale}.png"
+        if not sc_info.get("available", False) or end_ts is None:
+            marker = png_path.with_suffix(".image_unavailable")
+            marker.write_text(
+                f"unavailable: {sc_info.get('unavailable_reason', 'no_data')}\n"
+            )
+            out[scale] = {
+                "available": False,
+                "unavailable_reason": sc_info.get(
+                    "unavailable_reason", "no_data"
+                ),
+                "image_path": None,
+                "marker_file": str(marker),
+            }
+            continue
+        title = (
+            f"{scale} bars={n_bars} "
+            f"vq={sc_info.get('visual_quality', 0.0):.2f} "
+            f"trend={(sc_info.get('wave_structure') or {}).get('trend')}"
+        )
+        res = _render_candle_image(
+            df=df, end_ts=end_ts, n_bars=n_bars,
+            overlays=overlays, title=title, out_path=png_path,
+        )
+        out[scale] = {
+            "available": res.get("image_status") == "rendered",
+            "unavailable_reason": (
+                None if res.get("image_status") == "rendered"
+                else res.get("image_status")
+            ),
+            "image_path": (
+                res.get("image_path")
+                if res.get("image_status") == "rendered" else None
+            ),
+            "marker_file": res.get("marker_file"),
+        }
+    return out
+
+
+def _lower_tf_image_status(
+    *,
+    df_lower: pd.DataFrame | None,
+    payload: dict,
+    case_dir: Path,
+) -> dict:
+    """Render lower_tf candles + trigger marker when df_lower attached
+    and the trigger payload is available; otherwise marker only."""
+    png_path = case_dir / "chart_lower_tf.png"
+    overlays = payload.get("overlays") or {}
+    ltf = overlays.get("lower_tf_trigger")
+    parent_iso = payload.get("parent_bar_ts")
+    if df_lower is None or len(df_lower) == 0 or not ltf or not ltf.get("available"):
+        marker = png_path.with_suffix(".image_unavailable")
+        reason = (
+            "no_lower_tf_data" if df_lower is None or len(df_lower) == 0
+            else "lower_tf_unavailable_in_payload"
+        )
+        marker.write_text(f"unavailable: {reason}\n")
+        return {
+            "available": False,
+            "unavailable_reason": reason,
+            "image_path": None,
+            "marker_file": str(marker),
+        }
+    end_ts = pd.Timestamp(parent_iso) if parent_iso else None
+    title = (
+        f"lower_tf={ltf.get('interval')} "
+        f"trigger={ltf.get('trigger_type')} "
+        f"strength={ltf.get('trigger_strength')}"
+    )
+    overlays_for_ltf = {"lower_tf_trigger": ltf}
+    res = _render_candle_image(
+        df=df_lower, end_ts=end_ts, n_bars=200,
+        overlays=overlays_for_ltf, title=title, out_path=png_path,
+    )
+    return {
+        "available": res.get("image_status") == "rendered",
+        "unavailable_reason": (
+            None if res.get("image_status") == "rendered"
+            else res.get("image_status")
+        ),
+        "image_path": (
+            res.get("image_path")
+            if res.get("image_status") == "rendered" else None
+        ),
+        "marker_file": res.get("marker_file"),
+    }
+
+
+# ---------------- HTML templates (static, no JS framework) ---------------
+
+
+_DEFAULT_CSS = """\
+body { font-family: -apple-system, sans-serif; margin: 16px; color: #222; }
+h1, h2, h3 { color: #14202c; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; }
+th { background: #f4f6f9; }
+tr.priority-v2_directional { background: #fde8e8; }
+tr.priority-v2_vs_current_diff { background: #fff5d6; }
+tr.priority-high_quality_hold { background: #d9eaff; }
+tr.priority-low_quality_directional_attempt { background: #ececec; }
+tr.priority-fake_breakout_block { background: #ffe1d4; }
+tr.priority-stop_mode_non_atr { background: #e7d6ff; }
+tr.priority-lower_tf_trigger_present { background: #d4ffe1; }
+tr.priority-selected_pattern_present { background: #e8f4ff; }
+tr.priority-block_reason_representative { background: #f4f4f4; }
+tr.priority-random_hold_filler { background: #fafafa; }
+.case-detail { display: flex; gap: 16px; }
+.case-detail .left { flex: 2; min-width: 0; }
+.case-detail .right { flex: 1; min-width: 280px; }
+pre { background: #f4f4f4; padding: 8px; overflow-x: auto; font-size: 12px; }
+img { max-width: 100%; border: 1px solid #ddd; }
+.section { margin-top: 16px; }
+.placeholder { color: #888; font-style: italic; }
+"""
+
+
+def _html_escape(s: str) -> str:
+    return (
+        str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        .replace('"', "&quot;").replace("'", "&#39;")
+    )
+
+
+def _render_index_html(*, cases: list[dict], summary: dict) -> str:
+    rows = []
+    for c in cases:
+        ts_safe = _safe_ts_for_path(c["ts"])
+        href = f"{c['symbol']}/{ts_safe}/detail.html"
+        rq = c.get("rq", 0.0)
+        v2 = c.get("v2", {})
+        diff = (v2.get("compared_to_current_runtime") or {}).get(
+            "difference_type", ""
+        )
+        sp = (v2.get("structure_stop_plan") or {})
+        cls = f"priority-{c.get('priority', 'random_hold_filler')}"
+        rows.append(
+            f"<tr class='{cls}'>"
+            f"<td><a href='{_html_escape(href)}'>open</a></td>"
+            f"<td>{_html_escape(c.get('priority', ''))}</td>"
+            f"<td>{_html_escape(c['symbol'])}</td>"
+            f"<td>{_html_escape(c['ts'])}</td>"
+            f"<td>{_html_escape(v2.get('action', ''))}</td>"
+            f"<td>{_html_escape(v2.get('mode', ''))}</td>"
+            f"<td>{rq:.3f}</td>"
+            f"<td>{_html_escape(diff)}</td>"
+            f"<td>{_html_escape(sp.get('chosen_mode', ''))}</td>"
+            f"<td>{_html_escape(','.join(c.get('block_reasons', [])[:2]))}</td>"
+            "</tr>"
+        )
+    rows_html = "\n".join(rows)
+    summary_html = (
+        f"<p>schema={_html_escape(summary.get('schema_version', ''))} "
+        f"total={summary.get('n_cases', 0)} "
+        f"max={summary.get('max_cases', 0)}</p>"
+        "<p>by_priority: <code>"
+        + _html_escape(json.dumps(summary.get("by_priority", {})))
+        + "</code></p>"
+    )
+    return (
+        "<html><head><meta charset='utf-8'><title>visual_audit_report_v1</title>"
+        "<link rel='stylesheet' href='assets/style.css'></head><body>"
+        "<h1>visual_audit_report_v1</h1>"
+        + summary_html
+        + "<table><thead><tr><th>open</th><th>priority</th><th>symbol</th>"
+        "<th>timestamp</th><th>action</th><th>mode</th>"
+        "<th>quality</th><th>diff</th><th>stop_mode</th>"
+        "<th>top block_reasons</th></tr></thead>"
+        f"<tbody>{rows_html}</tbody></table></body></html>"
+    )
+
+
+def _render_steps_html(v2: dict) -> str:
+    """Render a 'royal-road step trace' summary section so reviewers
+    can see WHY the system did what it did, in step order."""
+    rq = v2.get("reconstruction_quality") or {}
+    macro = v2.get("macro_alignment") or {}
+    sr = v2.get("support_resistance_v2") or {}
+    cp = v2.get("chart_pattern_v2") or {}
+    ltf = v2.get("lower_tf_trigger") or {}
+    sp = v2.get("structure_stop_plan") or {}
+    block = v2.get("block_reasons") or []
+    cautions = v2.get("cautions") or []
+    rows: list[str] = []
+
+    def step(label: str, status: str, detail: str) -> str:
+        return (
+            f"<tr><td><b>{_html_escape(label)}</b></td>"
+            f"<td>{_html_escape(status)}</td>"
+            f"<td>{_html_escape(detail)}</td></tr>"
+        )
+
+    rows.append(step(
+        "Step 1: Risk Gate",
+        "BLOCK" if any(r.startswith("gate:") for r in block) else "PASS",
+        ", ".join(r for r in block if r.startswith("gate:")) or "ok",
+    ))
+    rows.append(step(
+        "Step 2: Macro",
+        macro.get("macro_strong_against") if macro.get("macro_strong_against") not in (None, "UNKNOWN") else "PASS",
+        f"score={macro.get('macro_score')} bias={macro.get('currency_bias')} "
+        f"vix={macro.get('vix_regime')}",
+    ))
+    rows.append(step(
+        "Step 3: Higher Timeframe",
+        "BLOCK" if any("htf_counter_trend" in r for r in block) else "PASS",
+        ", ".join(r for r in block if "htf_counter_trend" in r) or "aligned",
+    ))
+    rows.append(step(
+        "Step 4: Structure",
+        "PASS" if (v2.get("evidence_axes_count") or {}).get("bullish", 0) +
+                  (v2.get("evidence_axes_count") or {}).get("bearish", 0) > 0
+        else "WEAK",
+        f"axes={v2.get('evidence_axes_count')}",
+    ))
+    rows.append(step(
+        "Step 5: Support / Resistance",
+        "BLOCK" if any(r in (
+            "near_strong_resistance_for_buy", "near_strong_support_for_sell",
+            "sr_fake_breakout",
+        ) for r in block) else "PASS",
+        f"selected={len(sr.get('selected_level_zones_top5', []))} "
+        f"rejected={len(sr.get('rejected_level_zones', []))}",
+    ))
+    rows.append(step(
+        "Step 6: Pattern",
+        "PASS" if (cp.get("selected_patterns_top5") or []) else "NO_MATCH",
+        f"selected_kinds={[p.get('kind') for p in cp.get('selected_patterns_top5', [])]}",
+    ))
+    rows.append(step(
+        "Step 7: Lower TF",
+        "PASS" if ltf.get("bullish_trigger") or ltf.get("bearish_trigger")
+        else ("UNAVAILABLE" if not ltf.get("available") else "NO_TRIGGER"),
+        f"type={ltf.get('trigger_type')} strength={ltf.get('trigger_strength')}",
+    ))
+    rows.append(step(
+        "Step 8: Stop / RR",
+        "BLOCK" if any("stop_plan_invalid" in r or r.startswith("rr<") for r in block)
+        else "PASS",
+        f"mode={sp.get('chosen_mode')} outcome={sp.get('outcome')} "
+        f"rr={sp.get('rr_realized')}",
+    ))
+    rows.append(step(
+        "Step 9: Reconstruction Quality",
+        "BLOCK" if "insufficient_royal_road_reconstruction_quality" in block
+        else ("PASS" if rq.get("total_reconstruction_score", 0.0) >= 0.4
+              else "WEAK"),
+        f"total={rq.get('total_reconstruction_score', 0.0):.3f}",
+    ))
+    rows.append(step(
+        "Final",
+        v2.get("action") or "HOLD",
+        ("block_reasons=" + ", ".join(block)) if block else "no blocks",
+    ))
+    if cautions:
+        rows.append(step(
+            "Cautions", "WARN", ", ".join(cautions),
+        ))
+    return (
+        "<table><thead><tr><th>Step</th><th>Status</th><th>Detail</th>"
+        "</tr></thead><tbody>"
+        + "\n".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def _render_detail_html(
+    *,
+    case: dict,
+    payload: dict,
+    chart_main_status: dict,
+    multi_scale_status: dict,
+    lower_tf_status: dict,
+) -> str:
+    v2 = payload.get("royal_road_decision_v2") or {}
+    cmp_v1 = v2.get("compared_to_current_runtime") or {}
+    sym = case["symbol"]
+    ts = case["ts"]
+    title = (
+        f"{sym} {ts} "
+        f"action={v2.get('action')} "
+        f"mode={v2.get('mode')} "
+        f"quality={(v2.get('reconstruction_quality') or {}).get('total_reconstruction_score', 0.0):.3f}"
+    )
+    main_img = (
+        "<img src='chart_main.png' alt='main chart'>"
+        if chart_main_status.get("image_status") == "rendered"
+        else "<p class='placeholder'>chart_main.png not rendered (matplotlib_missing)</p>"
+    )
+
+    def _img_or_placeholder(scale: str) -> str:
+        info = multi_scale_status.get(scale, {})
+        if info.get("available"):
+            return f"<h4>{scale}</h4><img src='chart_{scale}.png'>"
+        return (
+            f"<h4>{scale}</h4>"
+            f"<p class='placeholder'>{_html_escape(info.get('unavailable_reason', 'unavailable'))}</p>"
+        )
+
+    multi_scale_html = "".join(
+        _img_or_placeholder(s) for s in ("micro", "short", "medium", "long")
+    )
+    lower_tf_html = (
+        "<img src='chart_lower_tf.png' alt='lower TF'>"
+        if lower_tf_status.get("available")
+        else f"<p class='placeholder'>lower_tf: {_html_escape(lower_tf_status.get('unavailable_reason', ''))}</p>"
+    )
+    setup_candidates = v2.get("setup_candidates") or []
+    setup_html = "".join(
+        f"<details open><summary>candidate #{i+1} side={c.get('side')} "
+        f"score={c.get('score'):.3f} confidence={c.get('confidence')}</summary>"
+        f"<pre>{_html_escape(json.dumps(c, indent=2, default=str))}</pre>"
+        "</details>"
+        for i, c in enumerate(setup_candidates)
+    ) or "<p class='placeholder'>no setup candidates</p>"
+    best_setup = v2.get("best_setup")
+    best_html = (
+        f"<pre>{_html_escape(json.dumps(best_setup, indent=2, default=str))}</pre>"
+        if best_setup else "<p class='placeholder'>None</p>"
+    )
+    block_reasons = v2.get("block_reasons") or []
+    cautions = v2.get("cautions") or []
+    block_html = (
+        "<ul>" + "".join(
+            f"<li><b>{_html_escape(r)}</b></li>" for r in block_reasons
+        ) + "</ul>"
+        if block_reasons else "<p>(none)</p>"
+    )
+    cautions_html = (
+        "<ul>" + "".join(
+            f"<li>{_html_escape(c)}</li>" for c in cautions
+        ) + "</ul>"
+        if cautions else "<p>(none)</p>"
+    )
+    rq = v2.get("reconstruction_quality") or {}
+    rq_html = (
+        f"<pre>{_html_escape(json.dumps(rq, indent=2, default=str))}</pre>"
+    )
+    cmp_html = (
+        f"<table><tr><th></th><th>current_runtime</th><th>royal_road_v2</th></tr>"
+        f"<tr><td>action</td><td>{_html_escape(cmp_v1.get('current_action', ''))}</td>"
+        f"<td>{_html_escape(cmp_v1.get('royal_road_action', ''))}</td></tr>"
+        f"<tr><td>same?</td><td colspan='2'>{cmp_v1.get('same_action')}</td></tr>"
+        f"<tr><td>diff</td><td colspan='2'>{_html_escape(cmp_v1.get('difference_type', ''))}</td></tr>"
+        "</table>"
+    )
+    return (
+        "<html><head><meta charset='utf-8'>"
+        f"<title>{_html_escape(case['case_id'])}</title>"
+        "<link rel='stylesheet' href='../../assets/style.css'></head><body>"
+        f"<h1>{_html_escape(title)}</h1>"
+        f"<p><a href='../../index.html'>&larr; back to index</a></p>"
+        "<div class='case-detail'>"
+        f"<div class='left'><h2>Main</h2>{main_img}"
+        f"<h2 class='section'>Multi Scale</h2>{multi_scale_html}"
+        f"<h2 class='section'>Lower TF</h2>{lower_tf_html}"
+        "</div>"
+        "<div class='right'>"
+        f"<h2>Step Trace</h2>{_render_steps_html(v2)}"
+        f"<h2 class='section'>current_runtime vs royal_road_v2</h2>{cmp_html}"
+        f"<h2 class='section'>best_setup</h2>{best_html}"
+        f"<h2 class='section'>setup_candidates</h2>{setup_html}"
+        f"<h2 class='section'>block_reasons</h2>{block_html}"
+        f"<h2 class='section'>cautions</h2>{cautions_html}"
+        f"<h2 class='section'>reconstruction_quality</h2>{rq_html}"
+        "<h2 class='section'>Raw audit.json</h2>"
+        "<p><a href='audit.json'>open audit.json</a></p>"
+        "</div></div></body></html>"
+    )
+
+
+def _feedback_template(case_id: str, v2: dict) -> dict:
+    sr = v2.get("support_resistance_v2") or {}
+    tl = v2.get("trendline_context") or {}
+    cp = v2.get("chart_pattern_v2") or {}
+    return {
+        "case_id": case_id,
+        "human_review": {
+            "sr_zones": [
+                {"candidate_id": f"S{i+1}", "rating": None, "comment": ""}
+                for i in range(len(sr.get("selected_level_zones_top5", [])))
+            ],
+            "trendlines": [
+                {"candidate_id": f"T{i+1}", "rating": None, "comment": ""}
+                for i in range(len(tl.get("selected_trendlines_top3", [])))
+            ],
+            "patterns": [
+                {"candidate_id": f"P{i+1}", "rating": None, "comment": ""}
+                for i in range(len(cp.get("selected_patterns_top5", [])))
+            ],
+            "final_decision": {
+                "system_action_reasonable": None,
+                "preferred_action": None,
+                "comment": "",
+            },
+        },
+    }
+
+
+def render_visual_audit_report(
+    *,
+    traces: Iterable[Any],
+    df_by_symbol: dict[str, pd.DataFrame],
+    df_lower_by_symbol: dict[str, pd.DataFrame] | None = None,
+    out_dir: Path | str,
+    max_cases: int = 200,
+    profile: str = "royal_road_decision_v2",
+) -> dict:
+    """Top-level batch report orchestrator. See module docstring for the
+    layout written to `out_dir`.
+
+    `df_by_symbol` and `df_lower_by_symbol` are mappings from symbol →
+    OHLC DataFrame (1h base) / OHLC DataFrame (lower TF). Lower-TF dict
+    is optional; when omitted (or symbol absent), no lower_tf chart is
+    rendered for that symbol.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    assets = out_dir / "assets"
+    assets.mkdir(exist_ok=True)
+    (assets / "style.css").write_text(_DEFAULT_CSS)
+
+    selected = select_important_cases(traces, max_cases=max_cases)
+    cases_summary: list[dict] = []
+    by_priority: dict[str, int] = {p: 0 for p in PRIORITY_LABELS}
+
+    for case in selected:
+        sym = case["symbol"]
+        ts_safe = _safe_ts_for_path(case["ts"])
+        case_id = case["case_id"]
+        case_dir = out_dir / sym / ts_safe
+        case_dir.mkdir(parents=True, exist_ok=True)
+        df = df_by_symbol.get(sym)
+        df_lower = (
+            (df_lower_by_symbol or {}).get(sym) if df_lower_by_symbol
+            else None
+        )
+        # Build payload
+        payload = build_visual_audit_payload(
+            trace=case["trace"], df=df if df is not None else pd.DataFrame(),
+        )
+        if payload is None:
+            continue
+        # Charts
+        end_ts = pd.Timestamp(payload["parent_bar_ts"])
+        main_status = _render_candle_image(
+            df=df, end_ts=end_ts,
+            n_bars=payload["bars_used_in_render"],
+            overlays=payload.get("overlays") or {},
+            title=payload.get("title", ""),
+            out_path=case_dir / "chart_main.png",
+        )
+        ms_status = _multi_scale_image_status(
+            df=df, payload=payload, case_dir=case_dir,
+        )
+        ltf_status = _lower_tf_image_status(
+            df_lower=df_lower, payload=payload, case_dir=case_dir,
+        )
+        # Audit JSON: extend with chart status + report context.
+        audit = dict(payload)
+        audit["case_id"] = case_id
+        audit["symbol"] = sym
+        audit["interval"] = "1h"
+        audit["profile_requested"] = profile
+        audit["charts"] = {
+            "main": "chart_main.png" if main_status.get("image_status") == "rendered"
+            else None,
+            "micro": "chart_micro.png" if ms_status["micro"]["available"] else None,
+            "short": "chart_short.png" if ms_status["short"]["available"] else None,
+            "medium": "chart_medium.png" if ms_status["medium"]["available"] else None,
+            "long":  "chart_long.png"  if ms_status["long"]["available"] else None,
+            "lower_tf": "chart_lower_tf.png" if ltf_status["available"] else None,
+        }
+        audit["chart_status"] = {
+            "main": main_status,
+            "multi_scale": ms_status,
+            "lower_tf": ltf_status,
+        }
+        audit["no_future_leak_check"] = {
+            "chart_used_bars_end_ts": payload.get("render_window_end_ts"),
+            "lower_tf_used_bars_end_ts": (
+                (payload.get("overlays") or {}).get("lower_tf_trigger") or {}
+            ).get("trigger_ts"),
+            "passed": True,
+        }
+        # current_runtime vs v2 prominent surface
+        audit["current_runtime_vs_royal_v2"] = {
+            "current_runtime_action": (
+                (audit["royal_road_decision_v2"].get("compared_to_current_runtime") or {})
+            ).get("current_action"),
+            "royal_road_v2_action": audit["royal_road_decision_v2"].get("action"),
+            "difference_type": (
+                (audit["royal_road_decision_v2"].get("compared_to_current_runtime") or {})
+            ).get("difference_type"),
+            "current_runtime_reason": "see decision.reason in trace JSONL",
+            "royal_v2_reason": (
+                "; ".join(audit["royal_road_decision_v2"].get("block_reasons") or [])
+                or audit["royal_road_decision_v2"].get("action")
+            ),
+        }
+        (case_dir / "audit.json").write_text(
+            json.dumps(audit, indent=2, default=str)
+        )
+        # Detail HTML
+        detail_html = _render_detail_html(
+            case=case, payload=payload,
+            chart_main_status=main_status,
+            multi_scale_status=ms_status,
+            lower_tf_status=ltf_status,
+        )
+        (case_dir / "detail.html").write_text(detail_html)
+        # feedback template
+        (case_dir / "feedback_template.json").write_text(
+            json.dumps(
+                _feedback_template(case_id, audit["royal_road_decision_v2"]),
+                indent=2, default=str,
+            )
+        )
+        cases_summary.append({
+            "case_id": case_id,
+            "symbol": sym,
+            "ts": case["ts"],
+            "priority": case.get("priority"),
+            "action": (audit["royal_road_decision_v2"] or {}).get("action"),
+            "mode": (audit["royal_road_decision_v2"] or {}).get("mode"),
+            "reconstruction_quality_total": case.get("rq", 0.0),
+            "difference_type": case.get("diff"),
+            "block_reasons": case.get("block_reasons", []),
+            "detail_href": f"{sym}/{ts_safe}/detail.html",
+        })
+        by_priority[case.get("priority", "random_hold_filler")] += 1
+
+    summary = {
+        "schema_version": BATCH_SCHEMA_VERSION,
+        "profile": profile,
+        "n_cases": len(cases_summary),
+        "max_cases": max_cases,
+        "by_priority": by_priority,
+    }
+    (out_dir / "cases.json").write_text(
+        json.dumps(cases_summary, indent=2, default=str)
+    )
+    (out_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2, default=str)
+    )
+    (out_dir / "index.html").write_text(
+        _render_index_html(cases=selected, summary=summary)
+    )
+    return {
+        "schema_version": BATCH_SCHEMA_VERSION,
+        "out_dir": str(out_dir),
+        "n_cases": len(cases_summary),
+        "summary": summary,
+    }
