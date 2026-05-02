@@ -987,6 +987,28 @@ def build_visual_audit_payload(
         last_close=last_close,
         stop_plan=stop_plan,
     )
+    # Build the wave-derived lines (observation-only). These are the
+    # lines a human would draw given the matched pattern; they live
+    # alongside the existing SR / trendline overlays so the audit
+    # reviewer can compare 既存サポレジ vs 波形由来の線.
+    from .wave_derived_lines import build_wave_derived_lines
+    best_pattern_dict = (wave_shape_review_dict or {}).get("best_pattern") or {}
+    best_skel: dict = {}
+    if best_pattern_dict:
+        best_scale = best_pattern_dict.get("scale")
+        scales_dict = (multi_scale.get("scales") or {})
+        best_skel = (scales_dict.get(best_scale) or {}).get("wave_skeleton") or {}
+    atr_for_lines: float | None = None
+    technical_dict = _trace_technical(trace)
+    if technical_dict is not None:
+        atr_for_lines = technical_dict.get("atr_14")
+    if (atr_for_lines is None or atr_for_lines <= 0) and best_skel:
+        atr_for_lines = best_skel.get("atr_value")
+    wave_derived_lines = build_wave_derived_lines(
+        best_pattern=best_pattern_dict,
+        skeleton=best_skel,
+        atr_value=atr_for_lines,
+    )
 
     # Per-overlay drawing coordinates that downstream renderers can
     # consume directly. All times are ISO strings; all prices are
@@ -1121,6 +1143,9 @@ def build_visual_audit_payload(
         # NOT consumed by royal_road_decision_v2; for human audit only.
         "wave_shape_review": wave_shape_review_dict,
         "entry_summary": entry_summary,
+        # Wave-derived lines (WNL / WB1 / WB2 / WSL / WTP / ...).
+        # Each line carries used_in_decision=False; observation-only.
+        "wave_derived_lines": wave_derived_lines,
         # Full v2 payload preserved so the audit is self-contained
         # (no need to read the JSONL trace separately).
         "royal_road_decision_v2": v2,
@@ -1389,6 +1414,7 @@ def _build_candle_svg_xml(
     overlays: dict | None,
     title: str,
     wave_overlay: dict | None = None,
+    wave_derived_lines: list[dict] | None = None,
 ) -> str | None:
     """Build the SVG candle-chart as an XML string.
 
@@ -1459,6 +1485,16 @@ def _build_candle_svg_xml(
     ltf = ov.get("lower_tf_trigger")
     if ltf and ltf.get("trigger_price") is not None:
         ovl_prices.append(float(ltf["trigger_price"]))
+    # Extend chart price range with wave-derived line prices so the
+    # lines are visible (not clipped by the price_lo/price_hi clamp).
+    for line in (wave_derived_lines or []):
+        v = line.get("price")
+        if v is None:
+            continue
+        try:
+            ovl_prices.append(float(v))
+        except (TypeError, ValueError):
+            continue
     if ovl_prices:
         price_lo = min(price_lo, min(ovl_prices))
         price_hi = max(price_hi, max(ovl_prices))
@@ -1702,6 +1738,18 @@ def _build_candle_svg_xml(
         f"text-anchor='end' fill='#444'>{visible.index[-1].isoformat()}</text>"
     )
 
+    # ---- wave-derived horizontal lines (observation-only) -------
+    if wave_derived_lines:
+        parts.append(
+            _wave_derived_lines_svg_fragment(
+                wave_derived_lines=wave_derived_lines,
+                y_of=y_of,
+                price_lo=price_lo, price_hi=price_hi,
+                margin_l=margin_l, margin_t=margin_t,
+                plot_w=plot_w, plot_h=plot_h,
+            )
+        )
+
     # ---- wave skeleton overlay (observation-only) ---------------
     if wave_overlay:
         parts.append(
@@ -1778,6 +1826,7 @@ def _build_wave_only_svg(
     status: str | None,
     side_bias: str | None,
     entry_summary: dict | None,
+    wave_derived_lines: list[dict] | None = None,
 ) -> str | None:
     """Build a self-contained "波形だけ" SVG.
 
@@ -1815,6 +1864,13 @@ def _build_wave_only_svg(
             extra_prices.append(float(v))
         except (TypeError, ValueError):
             continue
+    for line in (wave_derived_lines or []):
+        v = line.get("price")
+        if v is not None:
+            try:
+                extra_prices.append(float(v))
+            except (TypeError, ValueError):
+                continue
     if extra_prices:
         p_lo = min(p_lo, min(extra_prices))
         p_hi = max(p_hi, max(extra_prices))
@@ -1878,6 +1934,46 @@ def _build_wave_only_svg(
             f"<text x='{margin_l + plot_w - 4}' y='{yv - 3:.1f}' "
             f"text-anchor='end' fill='{color}'>"
             f"{_html_escape(label)}={float(v):.5f}</text>"
+        )
+
+    # 0. Wave-derived horizontal lines (drawn behind the skeleton)
+    for line in (wave_derived_lines or []):
+        price = line.get("price")
+        if price is None:
+            continue
+        try:
+            yv = y_of(float(price))
+        except (TypeError, ValueError):
+            continue
+        if not (margin_t <= yv <= margin_t + plot_h):
+            continue
+        kind_str = line.get("kind", "")
+        style = _WAVE_LINE_STYLE.get(kind_str, {
+            "color": "#7b1fa2", "dash": "6,4", "width": 1.6,
+        })
+        line_id = line.get("id", "")
+        parts.append(
+            f"<line class='wave-derived-line wave-derived-{_html_escape(kind_str)}' "
+            f"x1='{margin_l}' y1='{yv:.1f}' "
+            f"x2='{margin_l + plot_w}' y2='{yv:.1f}' "
+            f"stroke='{style['color']}' stroke-width='{style['width']}' "
+            f"stroke-dasharray='{style['dash']}' opacity='0.85'/>"
+        )
+        # Right-edge label so it doesn't collide with the family marker
+        label_w = max(28, 10 * len(line_id) + 8)
+        parts.append(
+            f"<rect class='wave-derived-line-label-bg' "
+            f"x='{margin_l + plot_w - label_w - 4:.1f}' "
+            f"y='{yv - 9:.1f}' width='{label_w}' height='18' "
+            f"fill='white' stroke='{style['color']}' "
+            f"stroke-width='1.2' rx='3'/>"
+        )
+        parts.append(
+            f"<text class='wave-derived-line-label' "
+            f"x='{margin_l + plot_w - label_w / 2 - 4:.1f}' "
+            f"y='{yv + 4:.1f}' text-anchor='middle' "
+            f"fill='{style['color']}' font-weight='bold' "
+            f"font-size='11'>{_html_escape(line_id)}</text>"
         )
 
     # 1. Skeleton polyline
@@ -1994,6 +2090,97 @@ def _build_wave_only_svg(
 
     parts.append("</svg>")
     return "".join(parts)
+
+
+_WAVE_LINE_STYLE: Final[dict] = {
+    "neckline":              {"color": "#7b1fa2", "dash": "6,4", "width": 2.0},
+    "pivot_low":             {"color": "#0d47a1", "dash": "0",   "width": 1.4},
+    "pivot_high":            {"color": "#0d47a1", "dash": "0",   "width": 1.4},
+    "shoulder":              {"color": "#0d47a1", "dash": "0",   "width": 1.4},
+    "head":                  {"color": "#0d47a1", "dash": "0",   "width": 1.6},
+    "pattern_invalidation":  {"color": "#c62828", "dash": "5,3", "width": 2.0},
+    "pattern_target":        {"color": "#2e7d32", "dash": "5,3", "width": 2.0},
+    "pattern_upper":         {"color": "#ef6c00", "dash": "4,3", "width": 1.6},
+    "pattern_lower":         {"color": "#ef6c00", "dash": "4,3", "width": 1.6},
+    "pattern_breakout":      {"color": "#7b1fa2", "dash": "6,4", "width": 2.0},
+}
+
+
+def _wave_derived_lines_svg_fragment(
+    *,
+    wave_derived_lines: list[dict] | None,
+    y_of,
+    price_lo: float, price_hi: float,
+    margin_l: float, margin_t: float,
+    plot_w: float, plot_h: float,
+) -> str:
+    """Build an SVG <g> overlay drawing wave-derived horizontal lines
+    (WNL / WB1 / WB2 / WSL / WTP / WUP / WLOW / WBR) on top of the
+    candle chart.
+
+    Each line is keyed by `kind` to a colour / dash style; the line's
+    `id` is rendered as a left-edge label so the user can cross-check
+    with the description table below the chart.
+    """
+    if not wave_derived_lines:
+        return ""
+    out: list[str] = ["<g class='wave-derived-lines'>"]
+    for line in wave_derived_lines:
+        price = line.get("price")
+        if price is None:
+            continue
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            continue
+        if price < price_lo or price > price_hi:
+            continue
+        y = y_of(price)
+        kind = line.get("kind", "")
+        style = _WAVE_LINE_STYLE.get(kind, {
+            "color": "#7b1fa2", "dash": "6,4", "width": 1.6,
+        })
+        line_id = line.get("id", "")
+        out.append(
+            f"<line class='wave-derived-line wave-derived-{_html_escape(kind)}' "
+            f"x1='{margin_l:.1f}' y1='{y:.1f}' "
+            f"x2='{margin_l + plot_w:.1f}' y2='{y:.1f}' "
+            f"stroke='{style['color']}' stroke-width='{style['width']}' "
+            f"stroke-dasharray='{style['dash']}' opacity='0.85'/>"
+        )
+        # Optional zone band (kind=="neckline" usually has a zone)
+        zlow = line.get("zone_low")
+        zhigh = line.get("zone_high")
+        if zlow is not None and zhigh is not None:
+            try:
+                y_top = y_of(max(float(zlow), float(zhigh)))
+                y_bot = y_of(min(float(zlow), float(zhigh)))
+            except (TypeError, ValueError):
+                y_top = y_bot = None
+            if y_top is not None and y_bot is not None:
+                out.append(
+                    f"<rect class='wave-derived-zone' x='{margin_l:.1f}' "
+                    f"y='{y_top:.1f}' width='{plot_w:.1f}' "
+                    f"height='{abs(y_bot - y_top):.1f}' "
+                    f"fill='{style['color']}' opacity='0.10'/>"
+                )
+        # Left-edge label
+        label_w = max(28, 10 * len(line_id) + 8)
+        out.append(
+            f"<rect class='wave-derived-line-label-bg' "
+            f"x='{margin_l + 4:.1f}' y='{y - 9:.1f}' "
+            f"width='{label_w}' height='18' fill='white' "
+            f"stroke='{style['color']}' stroke-width='1.2' rx='3'/>"
+        )
+        out.append(
+            f"<text class='wave-derived-line-label' "
+            f"x='{margin_l + 4 + label_w / 2:.1f}' y='{y + 4:.1f}' "
+            f"text-anchor='middle' fill='{style['color']}' "
+            f"font-weight='bold' font-size='11'>"
+            f"{_html_escape(line_id)}</text>"
+        )
+    out.append("</g>")
+    return "".join(out)
 
 
 def _wave_overlay_svg_fragment(
@@ -2609,6 +2796,23 @@ img.thumb { width: 220px; height: auto; border: 1px solid #ddd; }
   border-radius: 4px; padding: 8px 12px; margin: 8px 0; }
 .hold-waveform-note h3 { margin-top: 6px; font-size: 13px; }
 .hold-waveform-note .small { color: #555; font-size: 11px; }
+.hold-waveform-note h4 { margin: 8px 0 4px; font-size: 13px; }
+/* wave-derived lines (entry / stop / target / parts) */
+.wave-derived-line { pointer-events: none; }
+.wave-derived-line-label-bg, .wave-derived-line-label { pointer-events: none; }
+.wave-derived-zone { pointer-events: none; }
+.wave-derived-lines-table { background: #f7f9ff; border: 1px solid #c5d2eb;
+  border-radius: 4px; padding: 8px 12px; margin: 8px 0; }
+.wave-derived-lines-table .small { color: #555; font-size: 11px; }
+.wave-derived-table { font-size: 12px; }
+.line-count-summary-v2 { background: #fffaf0; border: 1px solid #f0d49a;
+  border-radius: 4px; padding: 8px 12px; margin: 8px 0; }
+.line-count-summary-v2 .line-count-table { font-size: 12px; max-width: 360px; }
+.line-count-summary-v2 .small { color: #555; font-size: 11px; margin-top: 4px; }
+.line-count-summary-v2 .note-info { background: #e8f4ff; border-left: 3px solid #1565c0;
+  padding: 6px 8px; margin-top: 6px; font-size: 12px; }
+.line-count-summary-v2 .note-warn { background: #ffe5e0; border-left: 3px solid #c62828;
+  padding: 6px 8px; margin-top: 6px; font-size: 12px; }
 /* wave overlay (drawn on top of candle chart) */
 .wave-skeleton-line { pointer-events: none; }
 .wave-pivot-dot { pointer-events: none; }
@@ -3447,8 +3651,109 @@ def _render_entry_summary_html(es: dict | None) -> str:
     )
 
 
+def _render_wave_derived_lines_table_html(
+    lines: list[dict] | None,
+) -> str:
+    """Render the explanation table for wave-derived lines."""
+    if not lines:
+        return (
+            "<div class='wave-derived-lines-table'>"
+            "<p class='placeholder'>波形由来の線は出ていません。</p>"
+            "</div>"
+        )
+    rows = []
+    for line in lines:
+        price = line.get("price")
+        try:
+            price_str = f"{float(price):.5f}" if price is not None else "—"
+        except (TypeError, ValueError):
+            price_str = "—"
+        rows.append(
+            "<tr>"
+            f"<td><b>{_html_escape(line.get('id', ''))}</b></td>"
+            f"<td>{_html_escape(line.get('kind', ''))}</td>"
+            f"<td>{price_str}</td>"
+            f"<td>{_html_escape(line.get('role', ''))}</td>"
+            f"<td>{_html_escape(line.get('reason_ja', ''))}</td>"
+            f"<td>{'✗' if not line.get('used_in_decision') else '✓'}</td>"
+            "</tr>"
+        )
+    return (
+        "<div class='wave-derived-lines-table'>"
+        "<p class='small'>波形由来の線 (observation-only — 売買判断には使われません):</p>"
+        "<table class='wave-derived-table'>"
+        "<tr><th>id</th><th>種別</th><th>price</th><th>役割</th>"
+        "<th>説明</th><th>used_in_decision</th></tr>"
+        + "".join(rows) + "</table></div>"
+    )
+
+
+def _render_line_count_summary_html(
+    *,
+    overlays: dict | None,
+    wave_derived_lines: list[dict] | None,
+) -> str:
+    """Combined line-count summary (existing SR / TL + wave-derived).
+
+    Adds an interpretation note when existing lines are sparse but
+    wave-derived lines are present, and vice versa.
+    """
+    from .wave_derived_lines import line_count_summary
+
+    counts = line_count_summary(
+        overlays=overlays, wave_derived=wave_derived_lines,
+    )
+    sr_total = counts["sr_selected"] + counts["sr_rejected"]
+    tl_total = counts["trendline_selected"] + counts["trendline_rejected"]
+    wd_total = counts["wave_derived_total"]
+    note = ""
+    if (counts["sr_selected"] + counts["trendline_selected"]) <= 1 and wd_total >= 2:
+        note = (
+            "<p class='note-info'>"
+            "既存のサポレジ/トレンドラインは少ないですが、"
+            "波形認識から WNL1 / WSL1 などの参考線が出ています。"
+            "これらを人間が見て自然か確認してください。"
+            "</p>"
+        )
+    elif (counts["sr_selected"] + counts["trendline_selected"]) <= 1 and wd_total == 0:
+        note = (
+            "<p class='note-warn'>"
+            "既存線も波形由来線も少ないです。"
+            "このケースでは、システムが人間の線引きを十分に再現できていない"
+            "可能性があります。"
+            "</p>"
+        )
+    return (
+        "<div class='line-count-summary-v2'>"
+        "<table class='line-count-table'>"
+        "<tr><th>区分</th><th>採用</th><th>不採用</th><th>合計</th></tr>"
+        f"<tr><td>サポレジ (S/R)</td>"
+        f"<td>{counts['sr_selected']}</td>"
+        f"<td>{counts['sr_rejected']}</td>"
+        f"<td>{sr_total}</td></tr>"
+        f"<tr><td>トレンドライン (T/X)</td>"
+        f"<td>{counts['trendline_selected']}</td>"
+        f"<td>{counts['trendline_rejected']}</td>"
+        f"<td>{tl_total}</td></tr>"
+        f"<tr><td>波形由来ライン (W*)</td>"
+        f"<td colspan='2'>—</td>"
+        f"<td>{wd_total}</td></tr>"
+        "</table>"
+        "<p class='small'>"
+        f"波形由来の内訳: ネックライン {counts['wave_derived_neckline']} "
+        f"/ 損切り候補 {counts['wave_derived_stop']} "
+        f"/ 利確候補 {counts['wave_derived_target']}"
+        "</p>"
+        + note
+        + "</div>"
+    )
+
+
 def _hold_waveform_extra_html(
-    *, action: str | None, review: dict | None,
+    *,
+    action: str | None,
+    review: dict | None,
+    wave_derived_lines: list[dict] | None = None,
 ) -> str:
     """When action is HOLD, surface what shape-only readings would
     have suggested vs what royal v2 actually requires.
@@ -3456,8 +3761,9 @@ def _hold_waveform_extra_html(
     When a best_pattern exists with a neckline part, an explicit
     sentence is added that connects the chart labels (B1/B2/NL) to
     the HOLD reason ("形は候補として見えていますが、NL を未ブレイク
-    のため王道v2は見送りです。"). Without a candidate pattern, a
-    "明確な波形候補が出ていません" note is emitted.
+    のため王道v2は見送りです。"). When wave-derived lines exist
+    (WNL1 / WSL1 / WTP1 / ...), they are referenced by id so the
+    user can cross-check the chart labels.
     """
     if action != "HOLD" or not review:
         return ""
@@ -3486,32 +3792,80 @@ def _hold_waveform_extra_html(
         chart_pointer_lines.append(
             "<li>チャート上の <b>LS / H / RS / NL</b> を確認してください。</li>"
         )
+
+    # Wave-derived line references (WNL1 / WSL1 / WTP1 ...)
+    wd_lines = wave_derived_lines or []
+    wd_neckline_ids = [l["id"] for l in wd_lines if l.get("kind") == "neckline"]
+    wd_stop_ids = [l["id"] for l in wd_lines if l.get("role") == "stop_candidate"]
+    wd_target_ids = [l["id"] for l in wd_lines if l.get("role") == "target_candidate"]
+
+    waveform_lines_html = ""
+    if wd_lines:
+        items = []
+        items.append(
+            f"<li>{_html_escape(best.get('human_label') or '')}</li>"
+        )
+        if wd_neckline_ids:
+            items.append(
+                f"<li><b>{_html_escape(' / '.join(wd_neckline_ids))}</b> "
+                "ネックラインあり</li>"
+            )
+        if wd_stop_ids:
+            items.append(
+                f"<li><b>{_html_escape(' / '.join(wd_stop_ids))}</b> "
+                "波形損切り候補あり</li>"
+            )
+        if wd_target_ids:
+            items.append(
+                f"<li><b>{_html_escape(' / '.join(wd_target_ids))}</b> "
+                "波形利確候補あり</li>"
+            )
+        waveform_lines_html = "<ul>" + "".join(items) + "</ul>"
+
     status = best.get("status") or ""
-    closing_lines: list[str] = []
-    if status == "forming":
-        closing_lines.append(
-            "<p>形は候補として見えていますが、NL を未ブレイクのため王道v2は見送りです。</p>"
+    closing_items: list[str] = []
+    if wd_neckline_ids and status == "forming":
+        nl_label = wd_neckline_ids[0]
+        closing_items.append(
+            f"<li><b>{_html_escape(nl_label)}</b> をまだ明確に上抜けていない "
+            "(未ブレイク)</li>"
         )
-    elif status == "neckline_broken":
-        closing_lines.append(
-            "<p>NL は形上ブレイク済みですが、リターンムーブ未確認のため王道v2は見送りです。</p>"
+    elif wd_neckline_ids and status == "neckline_broken":
+        nl_label = wd_neckline_ids[0]
+        closing_items.append(
+            f"<li><b>{_html_escape(nl_label)}</b> は形上ブレイクしているが"
+            "リターンムーブ未確認</li>"
         )
-    closing_lines.append(
-        f"<p class='small'>(波形上の根拠は observation-only であり、"
-        f"royal_road_decision_v2 の最終判断には影響しません。)</p>"
+    elif status == "forming":
+        closing_items.append(
+            "<li>NL を未ブレイク (形成中)</li>"
+        )
+    closing_items.append(
+        "<li>リターンムーブ未確認</li>"
     )
+    closing_items.append(
+        "<li>他の根拠軸が不足</li>"
+    )
+    closing_items.append(
+        "<li>ファンダは方向根拠として未実装/不明</li>"
+    )
+
     return (
         "<div class='hold-waveform-note'>"
-        "<h3>波形上は入れそうに見える点</h3>"
+        "<h3>このチャートはエントリーできそうに見える可能性があります</h3>"
+        "<h4>波形認識上は</h4>"
         f"<ul>"
         f"<li>{_html_escape(best.get('human_label') or '')} "
         f"({_html_escape(best.get('status') or '')})</li>"
         f"<li>{_html_escape(best.get('human_explanation') or '')}</li>"
         + "".join(chart_pointer_lines)
         + "</ul>"
-        "<h3>それでも王道v2が見送った理由</h3>"
-        + "".join(closing_lines)
+        + (waveform_lines_html if waveform_lines_html else "")
+        + "<h4>それでも王道v2が見送った理由</h4>"
+        + "<ul>" + "".join(closing_items) + "</ul>"
         + f"<p>{_html_escape(review.get('risk_note_ja') or '')}</p>"
+        + "<p class='small'>(波形上の根拠は observation-only であり、"
+        "royal_road_decision_v2 の最終判断には影響しません。)</p>"
         + "</div>"
     )
 
@@ -3641,11 +3995,21 @@ def _mobile_case_section_html(
 
     wave_review = payload.get("wave_shape_review") or {}
     entry_summary = payload.get("entry_summary") or {}
+    wave_derived = payload.get("wave_derived_lines") or []
     wave_review_html = _render_wave_shape_review_html(wave_review)
     pattern_dissection_html = _render_pattern_dissection_html(wave_review)
     entry_summary_html = _render_entry_summary_html(entry_summary)
+    line_count_html = _render_line_count_summary_html(
+        overlays=payload.get("overlays") or {},
+        wave_derived_lines=wave_derived,
+    )
+    wave_derived_table_html = _render_wave_derived_lines_table_html(
+        wave_derived,
+    )
     hold_waveform_html = _hold_waveform_extra_html(
-        action=v2.get("action"), review=wave_review,
+        action=v2.get("action"),
+        review=wave_review,
+        wave_derived_lines=wave_derived,
     )
     wave_only_html = (
         f"<div class='wave-only-wrap'>{wave_only_svg}</div>"
@@ -3662,6 +4026,10 @@ def _mobile_case_section_html(
             + wave_only_html
             if wave_only_html else ""
         )
+        + "<h3>線カウントサマリ (S/R + T/X + 波形由来)</h3>"
+        + line_count_html
+        + "<h3>波形由来の線 (wave-derived lines)</h3>"
+        + wave_derived_table_html
         + "<h3>結論カード (entry / stop / RR)</h3>"
         + entry_summary_html
         + "<h3>波形レビュー (waveform shape review — observation only)</h3>"
@@ -3740,6 +4108,7 @@ def render_visual_audit_mobile_single_file(
         case_label = f"{sym} @ {ts} ({action})"
         # Pick the wave overlay (best_pattern's scale) for chart drawing.
         wave_overlay = _select_wave_overlay(payload)
+        wd_lines = payload.get("wave_derived_lines") or []
         # Build the inline SVG chart string (or None on failure).
         svg_xml: str | None = None
         if df is not None and len(df) > 0:
@@ -3751,6 +4120,7 @@ def render_visual_audit_mobile_single_file(
                     overlays=payload.get("overlays") or {},
                     title=payload.get("title", ""),
                     wave_overlay=wave_overlay,
+                    wave_derived_lines=wd_lines,
                 )
             except Exception:  # noqa: BLE001
                 svg_xml = None
@@ -3767,6 +4137,7 @@ def render_visual_audit_mobile_single_file(
                 status=wave_overlay.get("status"),
                 side_bias=wave_overlay.get("side_bias"),
                 entry_summary=payload.get("entry_summary"),
+                wave_derived_lines=wd_lines,
             )
             if wave_overlay else None
         )
