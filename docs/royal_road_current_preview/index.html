@@ -118,15 +118,53 @@
   </style>
 </head>
 <body>
-  <h1>現在の王道判断プレビュー (Phase F / G + 波形可視化復旧版)</h1>
+  <h1>現在の王道判断プレビュー (Phase F / G / I 入口)</h1>
   <p class="meta">
     ブランチ: <code>artifact/visual-audit-mobile-preview</code><br>
-    生成元 commit: <code>b1f4024</code> (<code>feat/royal-road-complete-v2</code>)<br>
+    生成元 commit: <code>16c8d3a</code> (<code>feat/royal-road-complete-v2</code>)<br>
     プロファイル: <code>royal_road_decision_v2_integrated</code>
   </p>
 
   <div class="changelog">
-    <h2>今回の追加修正 (スマホ視認性強化)</h2>
+    <h2>今回の追加 (Phase I-1/I-2 — エントリー候補基盤)</h2>
+    <p>右側パネルに <b>「7. エントリー候補」</b> セクションを新設しました。
+    これは観測・表示専用の基盤で、今までの <code>entry_plan_v1</code> や
+    最終 <code>action</code> は 1 ピクセルも変えていません。</p>
+    <ul>
+      <li><b>EntryCandidate / EntryMethodContext</b> スキーマを追加
+        (<code>entry_candidate_v1</code>)。</li>
+      <li>共通ハードゲート: イベント中の <code>READY</code> →
+        <code>WAIT_EVENT_CLEAR</code> 降格、entry/stop/target 不在 / RR 不足 /
+        逆向き価格順 / stop_quality=BAD / target_clearance=BLOCKED /
+        breakout_quality=BLOCK で <code>HOLD</code>。
+        既に <code>WAIT_*</code> / <code>WATCH</code> / <code>HOLD</code>
+        の候補は触りません。</li>
+      <li>セレクタ: READY が複数あれば <code>final_score</code> 最高、
+        それ以外は WAIT 状態の優先度
+        (<code>WAIT_EVENT_CLEAR &gt; WAIT_RETEST &gt; WAIT_BREAKOUT &gt;
+        WAIT_TRIGGER &gt; WATCH &gt; HOLD</code>) で選択。</li>
+      <li>今回登録した候補は <code>neckline_retest</code> 1 本のみ。
+        既存の <code>entry_plan</code> 結果をそのまま 1 候補に変換し、
+        採用候補として表示します。後続フェーズ
+        (direct_breakout_quality / pullback_buy / return_sell /
+        range_bounce / false_breakout_reversal / daily10k_micro_retest)
+        は <b>まだ実装しません</b>。</li>
+      <li>payload に <code>entry_candidates</code> /
+        <code>selected_entry_candidate</code> を追加。
+        通常パスと WAIT_EVENT_CLEAR の早期 HOLD パスの両方で出ます。</li>
+      <li>既存の <code>entry_plan</code> スキーマは破壊していません。
+        <code>selected_candidate_to_entry_plan()</code> はコア
+        フィールド (<code>entry_status</code> / <code>side</code> /
+        <code>entry_price</code> / <code>stop_price</code> /
+        <code>target_price</code> / <code>rr</code>) を上書きしません。</li>
+    </ul>
+    <p>テスト: <code>tests/test_entry_candidates.py</code> 26/26 PASS、
+    <code>tests/test_visual_audit_entry_candidates.py</code> 6/6 PASS、
+    geometry 14/14 PASS、decision_trace + v2 + integrated 65/65 PASS。</p>
+  </div>
+
+  <div class="changelog">
+    <h2>前回の追加修正 (スマホ視認性強化)</h2>
     <p>SVG が <code>viewBox=1200x600</code> で <code>@media (max-width:800px)</code> により
     幅 100% に縮小されるため、390 px 幅の端末では実効スケールが約 0.32×。
     そのままでは <code>font-size='11'</code> の文字が約 3.6 px、
