@@ -118,15 +118,76 @@
   </style>
 </head>
 <body>
-  <h1>現在の王道判断プレビュー (Phase F / G / I + 王道手順チェック)</h1>
+  <h1>現在の王道判断プレビュー (Phase F / G / I + 構造ライン)</h1>
   <p class="meta">
     ブランチ: <code>artifact/visual-audit-mobile-preview</code><br>
-    生成元 commit: <code>11335d7</code> (<code>feat/royal-road-complete-v2</code>)<br>
+    生成元 commit: <code>dd3bd31</code> (<code>feat/royal-road-complete-v2</code>)<br>
     プロファイル: <code>royal_road_decision_v2_integrated</code>
   </p>
 
   <div class="changelog">
-    <h2>今回の小修正 (確認足を P0必須 へ)</h2>
+    <h2>今回の追加 (Phase I 続き — 王道波形構造から導く線)</h2>
+    <p>「数値で引けた線」と「波形構造から引くべき王道線」を分けて
+    表示できるようにしました。既存の <code>detect_trendlines</code> /
+    <code>trendline_context</code> / <code>support_resistance_v2</code> は
+    そのまま残し、その横に新しい <code>structural_lines</code> 層を
+    追加しています。</p>
+    <ul>
+      <li>新セクション <b>「8. 構造ライン」</b>: 各構造ラインを
+        <code>id</code> / <code>kind</code> / <code>role</code> /
+        <code>source</code> / <code>anchor_parts</code> /
+        <code>price</code> or <code>slope</code> /
+        <code>numeric_alignment</code> + 引いた理由 (<code>reason_ja</code>)
+        付きで表示。</li>
+      <li>線の種類:
+        <code>SNL</code> (structural neckline / NL由来),
+        <code>SIL</code> (structural invalidation / P2/B2由来),
+        <code>STP</code> (structural target / BR由来),
+        <code>STL</code> (structural trendline / DT P1↔P2 / DB B1↔B2 /
+        ダウHL-HL / LH-LH 由来)。</li>
+      <li>数値検出ライン (<code>T1</code>/<code>T2</code>/<code>T3</code>) と
+        構造ライン (<code>STL</code>/<code>SNL</code>/<code>SIL</code>/
+        <code>STP</code>) を <b>別CSSクラス</b> でチャートに描画。
+        混同しません。</li>
+      <li>構造トレンドラインと数値トレンドラインの slope を比較し、
+        <code>MATCH</code> / <code>NEAR</code> / <code>CONFLICT</code> /
+        <code>NONE</code> / <code>UNKNOWN</code> を表示。
+        <code>CONFLICT</code> は「自動トレンドライン検出が人間の波形構造と
+        ズレている可能性」を示します。</li>
+      <li>王道手順チェックの「トレンドライン」「重要水平線」「Wライン」
+        ステップが構造ラインを evidence として読むよう更新。
+        構造ラインだけ存在する場合は PASS、数値だけなら WARN、
+        両方あって CONFLICT なら WARN として可視化されます。</li>
+      <li>「9. エントリー候補」パネルの <code>debug</code> に
+        <code>structural_lines_count</code>,
+        <code>structural_neckline_ids</code>,
+        <code>structural_trendline_ids</code>,
+        <code>numeric_structural_alignment</code> を追加。</li>
+      <li>セクション順を再番号: 7. 王道手順チェック / 8. 構造ライン /
+        9. エントリー候補 / 10. 手動線操作。</li>
+    </ul>
+    <p>本ページの 8 サンプルでは、各ページに 4–5 本の構造ラインが
+    生成され、READY ページの <code>SNL1</code>/<code>SIL1</code>/<code>STP1</code>
+    が <code>WNL</code>/<code>WSL</code>/<code>WTP</code> と同じ価格に
+    引かれていることを確認できます。一部ページでは構造 STL の slope と
+    数値 T1 の slope が CONFLICT となっており、これは設計通りの
+    「線引き根拠が一致していない」というサインです。</p>
+    <p>テスト: <code>tests/test_structural_lines.py</code> 16/16 PASS、
+    <code>tests/test_visual_audit_structural_lines.py</code> 9/9 PASS、
+    <code>tests/test_royal_road_procedure_checklist.py</code> 18/18 PASS、
+    <code>tests/test_visual_audit_royal_road_procedure.py</code> 13/13 PASS、
+    <code>tests/test_entry_candidates.py</code> 26/26 PASS、
+    <code>tests/test_visual_audit_entry_candidates.py</code> 7/7 PASS、
+    geometry 14/14 PASS、decision_trace + v2 + integrated 65/65 PASS。
+    既存の <code>detect_trendlines</code> / <code>trendline_context</code> /
+    <code>support_resistance_v2</code> /
+    <code>entry_plan</code> / 最終 <code>action</code> /
+    <code>current_runtime</code> / <code>live</code> /
+    <code>OANDA</code> / <code>paper</code> はいずれも触っていません。</p>
+  </div>
+
+  <div class="changelog">
+    <h2>前回の小修正 (確認足を P0必須 へ)</h2>
     <p>王道手順チェックリストの <code>confirmation_candle</code>
     (ローソク足確認) ステップを <b>P1 → P0</b> に修正しました。
     既存 <code>entry_plan_v1</code> の READY 契約
