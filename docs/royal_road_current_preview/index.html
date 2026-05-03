@@ -118,15 +118,71 @@
   </style>
 </head>
 <body>
-  <h1>現在の王道判断プレビュー (Phase F / G / I 入口)</h1>
+  <h1>現在の王道判断プレビュー (Phase F / G / I + 王道手順チェック)</h1>
   <p class="meta">
     ブランチ: <code>artifact/visual-audit-mobile-preview</code><br>
-    生成元 commit: <code>16c8d3a</code> (<code>feat/royal-road-complete-v2</code>)<br>
+    生成元 commit: <code>2225004</code> (<code>feat/royal-road-complete-v2</code>)<br>
     プロファイル: <code>royal_road_decision_v2_integrated</code>
   </p>
 
   <div class="changelog">
-    <h2>今回の追加 (Phase I-1/I-2 — エントリー候補基盤)</h2>
+    <h2>今回の追加 (Phase I 続き — 王道手順チェックを接続)</h2>
+    <p>「READY と表示されても、何が揃ったから READY なのか分からない」
+    というユーザー指摘に対応するため、<b>王道手順チェックリスト</b>
+    を <code>EntryCandidate</code> と接続しました。観測・表示専用で、
+    既存の <code>entry_plan_v1</code> READY 条件・最終 <code>action</code>・
+    <code>current_runtime</code>・<code>live</code>/<code>OANDA</code>/
+    <code>paper</code> は 1 ピクセルも変えていません。</p>
+    <ul>
+      <li>新セクション <b>「7. 王道手順チェック」</b>: 環境認識 →
+        ダウ理論 → 重要水平線 → トレンドライン → 波形認識 →
+        Wライン (WNL/WSL/WTP) → ブレイク確認 → リターンムーブ確認 →
+        ローソク足確認 → ENTRY → STOP → TP → RR → イベント確認
+        の 14 項目を、王道の順番で必ず表示。各行に
+        <code>PASS</code> / <code>WAIT</code> / <code>BLOCK</code> /
+        <code>WARN</code> / <code>UNKNOWN</code> と
+        条件 / 結果 / 不足理由を表示。</li>
+      <li>「8. エントリー候補」パネルに <b>「王道P0: PASS / NOT PASS」</b>
+        バッジを追加。NOT PASS のときは不足項目
+        (例: <code>retest_confirmed</code>, <code>wave_lines</code>) を
+        その場で表示。</li>
+      <li>各 <code>EntryCandidate.debug</code> に
+        <code>royal_road_procedure_summary</code>,
+        <code>royal_road_p0_pass</code>,
+        <code>royal_road_p0_missing_or_blocked</code>,
+        <code>royal_road_wait_reasons</code>,
+        <code>royal_road_block_reasons</code> を追加。</li>
+      <li>チャート上に <b><code>BREAK</code> / <code>RETEST</code> /
+        <code>CONFIRM</code> マーカー</b> を追加。
+        <code>breakout_confirmed</code> /
+        <code>retest_confirmed</code> /
+        <code>confirmation_candle</code> が真のときのみ表示。
+        各マーカーは
+        <code>data-source='entry_plan'</code> /
+        <code>data-trigger-line-id='WNL1'</code> 等の
+        <code>data-*</code> 属性を保持。</li>
+      <li>WAIT_EVENT_CLEAR では、テクニカル条件 (波形 / Wライン /
+        BREAK / RETEST / CONFIRM / ENTRY / STOP / TP / RR) を
+        <b>残したまま</b>、<code>環境認識</code> と
+        <code>イベント確認</code> だけ <code>BLOCK</code> になる
+        構成を維持しています。</li>
+      <li>セクション順を再番号: 7. 王道手順チェック / 8. エントリー候補 /
+        9. 手動線操作。</li>
+    </ul>
+    <p>本ページの 8 件のサンプルでは、READY ページ (double_bottom /
+    double_top / normal_balanced) が <code>王道P0: PASS</code> +
+    BREAK + RETEST + CONFIRM の 3 マーカー、wait_retest が
+    BREAK のみ、wait_breakout が マーカーなし、wait_event_clear は
+    全マーカーが残ったまま「イベント待ち」となっています。</p>
+    <p>テスト: <code>tests/test_royal_road_procedure_checklist.py</code>
+    16/16 PASS、<code>tests/test_visual_audit_royal_road_procedure.py</code>
+    12/12 PASS、<code>tests/test_visual_audit_entry_candidates.py</code>
+    6/6 PASS、<code>tests/test_entry_candidates.py</code> 26/26 PASS、
+    geometry 14/14 PASS、decision_trace + v2 + integrated 65/65 PASS。</p>
+  </div>
+
+  <div class="changelog">
+    <h2>前回の追加 (Phase I-1/I-2 — エントリー候補基盤)</h2>
     <p>右側パネルに <b>「7. エントリー候補」</b> セクションを新設しました。
     これは観測・表示専用の基盤で、今までの <code>entry_plan_v1</code> や
     最終 <code>action</code> は 1 ピクセルも変えていません。</p>
