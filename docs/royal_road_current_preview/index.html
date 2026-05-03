@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>現在の王道判断プレビュー (Phase F/G)</title>
+  <title>現在の王道判断プレビュー (Phase F/G + 改修版)</title>
   <style>
     body {
       font-family: -apple-system, sans-serif;
@@ -27,6 +27,14 @@
       margin: 12px 0 16px;
     }
     .what-to-check h2 { margin-top: 0; color: #0d47a1; }
+    .changelog {
+      background: #fff3e0;
+      border: 2px solid #ef6c00;
+      padding: 10px 14px;
+      border-radius: 6px;
+      margin: 8px 0 16px;
+    }
+    .changelog h2 { margin-top: 0; color: #bf360c; }
     .demo-card {
       border: 1px solid #ccc;
       padding: 10px 14px;
@@ -110,35 +118,57 @@
   </style>
 </head>
 <body>
-  <h1>現在の王道判断プレビュー (Phase F / G 完了状態)</h1>
+  <h1>現在の王道判断プレビュー (Phase F / G + 改修版)</h1>
   <p class="meta">
     ブランチ: <code>artifact/visual-audit-mobile-preview</code><br>
-    生成元 commit: <code>1938f3d</code> (<code>feat/royal-road-complete-v2</code>)<br>
+    生成元 commit: <code>2f349e1</code> (<code>feat/royal-road-complete-v2</code>)<br>
     プロファイル: <code>royal_road_decision_v2_integrated</code>
   </p>
+
+  <div class="changelog">
+    <h2>今回の改修ポイント (前回プレビューからの変更点)</h2>
+    <ol>
+      <li><b>各ケースの最上段</b>に「状態 / 結論 / ENTRY / STOP / TP / RR / 次に待つ条件」だけを集約した
+        <b>compact 判断カード</b> を追加。詳細パネルは下に <code>&lt;details&gt;</code> で折りたたみ。</li>
+      <li><b>チャート上の文字</b>は <code>WNL</code> / <code>STOP</code> / <code>TP</code> / <code>EVENT</code> のみ。
+        <code>WB1</code> / <code>WB2</code> / <code>WBR</code> / <code>WPH</code> / <code>WFIB*</code> 等の補助線は
+        線だけ描画して、ラベルは右側パネルに集約。</li>
+      <li>右側パネルに <b>5b. 未接続ファンダ</b> を追加。
+        <code>DXY</code> / <code>米金利 (10y)</code> / <code>ニュース</code> / <code>経済カレンダー</code> を
+        赤(未接続) / 緑(接続済) で常時表示。</li>
+      <li>右側パネルに <b>6. 自動線一覧 (タップで非表示切替)</b> を追加。スマホで
+        細い SVG 線を直接タップしなくても、ボタンで on/off できる。</li>
+      <li>右側パネルの <b>7. 手動線操作</b> に
+        「<b>このブラウザ内 (localStorage) だけに保存。別端末との共有・正式保存には
+        annotations.json のダウンロードが必要</b>」の警告を高コントラストで表示。</li>
+      <li><code>pattern_levels</code> の <b>STOP / TP が W ライン由来でなく
+        skeleton から補完された</b> 場合、判断カード直下に橙色の警告
+        (<code>level_source = skeleton_fallback</code>) を表示。</li>
+      <li>波形 → pattern_levels → entry_plan → integrated action の
+        <b>間接決定経路</b> を <code>wave_derived_lines.py</code> docstring と
+        画面表示で明示。</li>
+    </ol>
+  </div>
 
   <div class="what-to-check">
     <h2>このプレビューでユーザーに確認してほしいこと</h2>
     <ol>
-      <li>ダブルボトム / ダブルトップで <b>ENTRY / STOP / TP</b> と
-        <b>WNL / WSL / WTP</b> がチャートに正しく描かれているか</li>
-      <li>右サイドの <b>6 行情報パネル</b> (現在の状態 / エントリープラン /
-        ファンダ・イベント / 王道根拠 / 未接続 / 手動線操作) が読めるか</li>
-      <li><b>entry_plan</b> が状況に応じて
-        <span class="pill pill-ready">READY</span>
-        <span class="pill pill-wait">WAIT_BREAKOUT</span>
-        <span class="pill pill-wait">WAIT_RETEST</span>
-        <span class="pill pill-wait">WAIT_EVENT_CLEAR</span>
-        <span class="pill pill-hold">HOLD</span>
-        と切り替わっているか</li>
-      <li>イベントリスク (FOMC など) が来ているとき、
-        チャート上に <b>赤い縦バンド</b> が描かれ、最終アクションが
-        <b>HOLD (WAIT_EVENT_CLEAR)</b> にダウングレードされているか</li>
-      <li>手動線 UI (追加 / エクスポート) が見えているか —
-        既定は <code>display_only</code> で、ユーザーが描いた線は
-        判断には使われないこと</li>
-      <li>本番系 (live / OANDA / paper) は触っていないこと
-        (このプレビューは観測専用 opt-in プロファイル)</li>
+      <li>各ケースの一番上に <b>状態 / 結論 / ENTRY / STOP / TP / RR / 次に待つ条件</b> が
+        まとまって読めるか (チャートを見る前にそれだけで判断できるか)</li>
+      <li>チャート上に余計な記号 (<code>WB1/WB2/WBR/WPH/WFIB*</code>) が
+        ないか — あるのは <code>WNL/STOP/TP/EVENT</code> だけのはず</li>
+      <li>右側パネルの <b>5b. 未接続ファンダ</b> が DXY/米金利/ニュース/経済カレンダー の状態を
+        赤/緑で見せているか</li>
+      <li>右側パネルの <b>6. 自動線一覧</b> から [非表示] ボタンでチャート上の線を
+        消せるか (スマホでもタップしやすいか)</li>
+      <li>右側パネルの <b>7. 手動線操作</b> に「ブラウザ内のみ保存」の警告が
+        ハッキリ見えるか</li>
+      <li>WAIT_RETEST のケースで <b>「まだ入らない理由」</b>
+        (戻り (リターンムーブ) 待ち / 確定足待ち) が読めるか</li>
+      <li>WAIT_EVENT_CLEAR のケースで <b>赤い縦バンド</b> + 右パネルに
+        <b>FOMC + BLOCK</b> 表示が出ているか</li>
+      <li>STOP / TP が skeleton から補完されたケースで <b>橙色の補完警告</b> が
+        判断カード直下に出ているか</li>
     </ol>
   </div>
 
@@ -153,11 +183,9 @@
       </a>
     </p>
     <ul class="check-points">
-      <li>波形に B1 / NL / B2 / BR が振られている</li>
-      <li>WNL / WSL / WTP の 3 線が引かれている</li>
-      <li>ENTRY / STOP / TP がパターンレベルから派生している</li>
-      <li>右パネル「2. エントリープラン」の状態が READY / BUY</li>
-      <li>「4. 王道根拠」に波形・ダウ・ローソクの根拠が並ぶ</li>
+      <li>判断カード最上段に ENTRY / STOP / TP / RR が並ぶ</li>
+      <li>結論行が「入れる (READY)」</li>
+      <li>STOP / TP が skeleton 補完の場合は橙色警告が出る</li>
     </ul>
   </div>
 
@@ -170,14 +198,12 @@
       </a>
     </p>
     <ul class="check-points">
-      <li>波形に P1 / NL / P2 / BR が振られている (DT 仕様)</li>
-      <li>方向 (SELL) と STOP / TP の上下関係が逆転している</li>
-      <li>右パネル「2. エントリープラン」の状態が READY / SELL</li>
+      <li>方向が SELL、判断カードが赤系</li>
     </ul>
   </div>
 
   <div class="demo-card demo-fixture">
-    <h3>3. パターン形成中 → <span class="pill pill-wait">WAIT_BREAKOUT</span>
+    <h3>3. <span class="pill pill-wait">WAIT_BREAKOUT</span> 専用ページ
       <span class="label-fixture">合成データ</span></h3>
     <p>
       <a href="wait_breakout_demo_mobile.html">
@@ -185,16 +211,14 @@
       </a>
     </p>
     <ul class="check-points">
-      <li>波形は B1 / NL / B2 まで認識されているが、まだ WNL を上抜けていない</li>
-      <li>右パネル「2. エントリープラン」が
-        <span class="pill pill-wait">WAIT_BREAKOUT</span>、最終アクションは HOLD</li>
-      <li>「ENTRY 待機: WNL を上抜けるまで動かない」旨が日本語で表示される</li>
+      <li>表示されるすべてのケースが WAIT_BREAKOUT</li>
+      <li>結論行は「まだ待つ — ブレイク待ち」</li>
+      <li>次に待つ条件: 「WNL を上抜けるまで…」</li>
     </ul>
   </div>
 
   <div class="demo-card demo-fixture">
-    <h3>4. ブレイク済 / 戻り待ち →
-      <span class="pill pill-wait">WAIT_RETEST</span>
+    <h3>4. <span class="pill pill-wait">WAIT_RETEST</span> 専用ページ
       <span class="label-fixture">合成データ</span></h3>
     <p>
       <a href="wait_retest_demo_mobile.html">
@@ -202,38 +226,44 @@
       </a>
     </p>
     <ul class="check-points">
-      <li>WNL を一度抜けたが、戻り (リターンムーブ) と確定足を待っている</li>
-      <li>右パネル「2. エントリープラン」が
-        <span class="pill pill-wait">WAIT_RETEST</span>、最終アクションは HOLD</li>
-      <li>breakout_quality_gate (3 条件: ビルドアップ / HTF整合 / 損切り集積)
-        の所見が表示される</li>
+      <li>表示されるすべてのケースが WAIT_RETEST</li>
+      <li>結論行は「まだ待つ — 戻り (リターンムーブ) 待ち」</li>
+      <li>次に待つ条件: 「WNL_derived 付近への戻りと反発の確定足を待ちます」</li>
     </ul>
   </div>
 
   <div class="demo-card demo-fixture">
-    <h3>5. イベントリスク BLOCK →
-      <span class="pill pill-block">WAIT_EVENT_CLEAR</span>
-      <span class="label-fixture">合成データ</span></h3>
+    <h3>5. <span class="pill pill-block">WAIT_EVENT_CLEAR</span> 専用ページ
+      <span class="label-fixture">合成データ + FOMC 注入</span></h3>
     <p>
       <a href="wait_event_clear_demo_mobile.html">
         wait_event_clear_demo_mobile.html を開く →
       </a>
     </p>
     <ul class="check-points">
-      <li>READY 条件は揃っているが、4 時間後に FOMC が控えている</li>
-      <li>チャートに <b>赤い縦バンド</b> + 中央の点線 + イベント名ラベル
-        (FOMC) が描かれる</li>
-      <li>右パネル「3. ファンダ・イベント」が
-        <span class="pill pill-block">BLOCK</span>、
-        「2. エントリープラン」が
-        <span class="pill pill-block">WAIT_EVENT_CLEAR</span>、
-        最終アクションは HOLD</li>
-      <li>HOLD 理由文に「FOMC」が含まれる</li>
+      <li>すべてのケースが WAIT_EVENT_CLEAR</li>
+      <li>チャートに <b>赤い縦バンド</b> + 中央の点線 + ラベル <b>EVENT FOMC</b> が描かれる</li>
+      <li>右側パネル「3. ファンダ・イベント」が <span class="pill pill-block">BLOCK</span>、
+        ブロック中のイベントが FOMC として表示される</li>
+      <li>結論行は「イベント待ち (ファンダ・リスク)」</li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-fixture">
+    <h3>6. パターン形成不足 → HOLD
+      <span class="label-fixture">合成データ</span></h3>
+    <p>
+      <a href="forming_pattern_integrated_hold_demo_mobile.html">
+        forming_pattern_integrated_hold_demo_mobile.html を開く →
+      </a>
+    </p>
+    <ul class="check-points">
+      <li>波形未確認、結論「見送り (HOLD)」</li>
     </ul>
   </div>
 
   <div class="demo-card demo-real">
-    <h3>6. 通常レポート (integrated_balanced)
+    <h3>7. 通常レポート (integrated_balanced)
       <span class="label-real">合成 OHLC を統合プロファイルで連続実行</span></h3>
     <p>
       <a href="normal_integrated_balanced_report_mobile.html">
@@ -241,23 +271,13 @@
       </a>
     </p>
     <ul class="check-points">
-      <li>合成ランダムウォーク 350 本 → 統合判断 (balanced) を流したケース集</li>
-      <li>READY / WAIT_BREAKOUT / WAIT_RETEST / HOLD が混じった現実的な分布</li>
-      <li>各ケースが
-        <code>1. 現在の状態</code> /
-        <code>2. エントリープラン</code> /
-        <code>3. ファンダ・イベント</code> /
-        <code>4. 王道根拠</code> /
-        <code>5. 未接続/注意</code> /
-        <code>6. 手動線操作</code>
-        の 6 行パネルで読み解けるか</li>
-      <li>balanced は欠損データ (例: macro_alignment) を許容するため
-        WARN は出るが HOLD にはしない</li>
+      <li>READY / WAIT_BREAKOUT / HOLD が混じった現実的な分布</li>
+      <li>各ケースの判断カードを左から右にスワイプするように読める</li>
     </ul>
   </div>
 
   <div class="demo-card demo-real">
-    <h3>7. 厳格レポート (integrated_strict)
+    <h3>8. 厳格レポート (integrated_strict)
       <span class="label-real">同データを strict モードで再評価</span></h3>
     <p>
       <a href="normal_integrated_strict_report_mobile.html">
@@ -265,39 +285,55 @@
       </a>
     </p>
     <ul class="check-points">
-      <li>同じデータを <code>strict</code> モードで判断したもの</li>
-      <li>未接続データ (macro / fundamental など) があると HOLD に倒す</li>
-      <li>balanced と比較して、HOLD の割合が増えていることを確認</li>
+      <li>未接続ファンダがあると HOLD に倒れやすい</li>
     </ul>
   </div>
 
-  <h2>凡例</h2>
+  <h2>凡例 (判断カードの状態)</h2>
   <table class="legend-table">
-    <tr><th>状態</th><th>意味</th></tr>
+    <tr><th>状態</th><th>結論行</th><th>意味</th></tr>
     <tr><td><span class="pill pill-ready">READY</span></td>
-      <td>波形 + 直近サポレジ + 確定足が揃っており、
-        最小 RR (≥ 2) も満たしている。エントリーが推奨される状態。</td></tr>
+      <td>入れる (READY)</td>
+      <td>波形 + 直近サポレジ + 確定足 + 最小 RR (≥ 2) を満たしている。</td></tr>
     <tr><td><span class="pill pill-wait">WAIT_BREAKOUT</span></td>
-      <td>波形は認識されたが、ネックライン (WNL) をまだ越えていない。
-        待機 (HOLD)。</td></tr>
+      <td>まだ待つ — ブレイク待ち</td>
+      <td>波形は認識されたが、ネックライン (WNL) をまだ越えていない。</td></tr>
     <tr><td><span class="pill pill-wait">WAIT_RETEST</span></td>
-      <td>WNL を一度抜けたが、戻りと確定足がまだ来ていない。待機 (HOLD)。</td></tr>
+      <td>まだ待つ — 戻り (リターンムーブ) 待ち</td>
+      <td>WNL を一度抜けたが、戻りと確定足がまだ来ていない。</td></tr>
     <tr><td><span class="pill pill-block">WAIT_EVENT_CLEAR</span></td>
-      <td>READY だったがイベント (FOMC など) が窓内にあるため
-        ダウングレード。待機 (HOLD)。</td></tr>
+      <td>イベント待ち (ファンダ・リスク)</td>
+      <td>READY だがイベント (FOMC など) が窓内にあるためダウングレード。</td></tr>
     <tr><td><span class="pill pill-hold">HOLD</span></td>
-      <td>波形未確認・RR 不足・root 拒否などで条件を満たしていない。</td></tr>
+      <td>見送り (HOLD)</td>
+      <td>条件不足・root 拒否などで条件を満たしていない。</td></tr>
   </table>
+
+  <h2>波形 → 判断 までの間接経路 (重要)</h2>
+  <p>
+    画面上で <code>used_in_decision = false</code> と書かれている W ライン
+    (raw な波形由来の自動線) <b>そのもの</b>は、最終 BUY/SELL/HOLD を直接変更しません。
+    ただし integrated profile では:
+  </p>
+  <pre style="background:#f5f5f5; padding:8px; border-radius:4px; font-size:12px;">
+raw W ライン  →  pattern_levels  →  entry_plan  →  integrated action
+  </pre>
+  <p>
+    の経路で <b>間接的に判断に使われています</b>。
+    判断カードの ENTRY / STOP / TP / RR は <code>pattern_levels</code> 経由の値で、
+    その元データは W ラインまたは skeleton 補完です (skeleton 補完だった場合は
+    判断カード直下に橙色警告が出ます)。
+  </p>
 
   <h2>まだ未接続 / 未完成な項目</h2>
   <ul>
     <li><b>Daily 10k preset</b>: まだ着手していない (本プレビューの後段で別タスク)</li>
-    <li>合成 OHLC のため <b>マクロ系 (macro_alignment / vix etc.)</b>
-      は限定的な値で表示される</li>
-    <li>イベントカレンダーは合成イベント (FOMC) を 1 件注入している
-      — 実カレンダーへの接続は別途</li>
+    <li><b>DXY / 米金利 / ニュース / 経済カレンダー</b> の実フィード: 未接続
+      (合成データのため 5b パネルでは「未接続」表示)</li>
+    <li>イベントカレンダーは <b>合成 FOMC イベント 1 件</b> を注入している
+      (WAIT_EVENT_CLEAR デモ用) — 実カレンダーへの接続は別途</li>
     <li><b>手動線の永続化</b> は localStorage のみ
-      (サーバ送信なし、デバイス間共有なし)</li>
+      (サーバ送信なし、デバイス間共有なし、annotations.json で持ち出し)</li>
   </ul>
 
   <p class="footer">
