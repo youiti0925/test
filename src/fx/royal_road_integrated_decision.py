@@ -979,6 +979,7 @@ def _build_panels_from_df(
     tp_atr_mult: float,
     pre_supplied: dict | None = None,
     now: "pd.Timestamp | None" = None,
+    risk_state: "RiskState | None" = None,
 ) -> dict:
     """Build the minimum panel set used by the integrated decision."""
     pre = pre_supplied or {}
@@ -1288,6 +1289,16 @@ def _build_panels_from_df(
     fundamental_sidebar = pre.get("fundamental_sidebar")
     if fundamental_sidebar is None:
         events_for_sidebar = pre.get("events_for_sidebar")
+        # When events weren't supplied via audit_panels, fall back to
+        # the calendar feed already attached to the engine's RiskState.
+        # Without this, engine-driven runs (live + backtest) silently
+        # had event_risk_status=UNKNOWN even when high-impact events
+        # were inside the window, so the WAIT_EVENT_CLEAR downgrade
+        # could never fire end-to-end.
+        if events_for_sidebar is None and risk_state is not None:
+            rs_events = getattr(risk_state, "events", None) or ()
+            if rs_events:
+                events_for_sidebar = list(rs_events)
         macro_align_dict = {
             "macro_score": float(macro_snap.macro_score),
             "macro_strong_against": macro_snap.macro_strong_against,
@@ -1406,16 +1417,74 @@ def decide_royal_road_v2_integrated(
             label="HOLD_RISK_GATE",
             reason_ja=f"リスクゲートで HOLD: {','.join(codes)}",
         )
+        # Phase G follow-up: when the gate block is event-driven,
+        # synthesise a fundamental_sidebar + a WAIT_EVENT_CLEAR
+        # entry_plan so the audit/HTML still tells the user *why*
+        # they can't enter (rather than just "HOLD_RISK_GATE: code").
+        # This makes the WAIT_EVENT_CLEAR state visible end-to-end
+        # through the engine path, not only via the integrated flow.
+        gate_advisory = {
+            "profile": PROFILE_NAME_V2_INTEGRATED,
+            "mode": canonical_mode,
+            "integrated_decision": integrated.to_dict(),
+        }
+        rs_events = list(getattr(risk_state, "events", None) or ())
+        is_event_block = any(
+            "event" in c.lower() or "high_impact" in c.lower()
+            for c in codes
+        )
+        if rs_events:
+            gate_now = (
+                getattr(risk_state, "now", None) or base_bar_close_ts
+            )
+            if hasattr(gate_now, "to_pydatetime"):
+                gate_now_dt = gate_now.to_pydatetime()
+            else:
+                gate_now_dt = gate_now
+            gate_sidebar = build_fundamental_sidebar(
+                symbol=symbol,
+                now=gate_now_dt,
+                events=rs_events,
+                macro_alignment=None,
+                macro_context=macro_context,
+                final_action="HOLD",
+                entry_status="WAIT_EVENT_CLEAR" if is_event_block else None,
+            )
+            gate_advisory["fundamental_sidebar"] = gate_sidebar
+            if is_event_block:
+                blocking = (gate_sidebar.get("blocking_events") or [{}])
+                first = blocking[0] if blocking else {}
+                gate_advisory["entry_plan"] = {
+                    "schema_version": "entry_plan_v1",
+                    "side": "NEUTRAL",
+                    "entry_type": "none",
+                    "entry_status": "WAIT_EVENT_CLEAR",
+                    "trigger_line_id": None,
+                    "trigger_line_price": None,
+                    "entry_price": None,
+                    "stop_price": None,
+                    "target_price": None,
+                    "target_extended_price": None,
+                    "rr": None,
+                    "breakout_confirmed": False,
+                    "retest_confirmed": False,
+                    "confirmation_candle": "",
+                    "reason_ja": (
+                        f"{first.get('title') or '高インパクトイベント'} "
+                        "が HOLD ウィンドウ内にあるためエントリー禁止です。"
+                    ),
+                    "what_to_wait_for_ja": (
+                        f"{first.get('title') or 'イベント'} の通過を待つ。"
+                    ),
+                    "block_reasons": ["event_risk_block_window"],
+                    "downgraded_from_ready_by_event_risk": True,
+                }
         return _hold(
             reason="risk gate blocked",
             blocked_by=codes,
             chain=tuple(chain),
             confidence=0.0,
-            advisory={
-                "profile": PROFILE_NAME_V2_INTEGRATED,
-                "mode": canonical_mode,
-                "integrated_decision": integrated.to_dict(),
-            },
+            advisory=gate_advisory,
         )
 
     # 2. Build panel set (or use pre-supplied)
@@ -1431,6 +1500,7 @@ def decide_royal_road_v2_integrated(
         tp_atr_mult=tp_atr_mult,
         pre_supplied=audit_panels,
         now=base_bar_close_ts,
+        risk_state=risk_state,
     )
 
     # 3. Build axes

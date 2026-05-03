@@ -107,6 +107,11 @@ def _empty_panel(reason: str) -> dict:
         "breakout_confirmed": False,
         "retest_confirmed": False,
         "pattern_height": None,
+        # Provenance for STOP / TP. None when the panel is empty.
+        # See derive_pattern_levels for the populated case.
+        "level_source": None,
+        "fallback_used": False,
+        "fallback_reason": None,
         "reason_ja": "パターン情報が不足しています。",
         "unavailable_reason": reason,
     }
@@ -391,6 +396,13 @@ def derive_pattern_levels(
     target_line = _line_by_role(wave_derived_lines, "target_candidate")
     stop_price = _safe_float(stop_line.get("price") if stop_line else None)
     target_price = _safe_float(target_line.get("price") if target_line else None)
+    # Track which source ultimately supplied STOP / TP so the audit
+    # report can warn the user when the wave_derived_lines were missing
+    # or wrong-sided and a skeleton-based fallback recomputed the levels.
+    stop_from_wave = stop_price is not None
+    target_from_wave = target_price is not None
+    stop_recomputed_from_skeleton = False
+    target_recomputed_from_skeleton = False
 
     # When wave_derived_lines stop / target are missing or sit on
     # the wrong side of the trigger, recompute from skeleton-derived
@@ -411,8 +423,10 @@ def derive_pattern_levels(
             if pattern_height > 0:
                 if stop_price is None or stop_price >= (trigger_price or nl_price_struct or 0.0):
                     stop_price = lowest - 0.30 * pattern_height
+                    stop_recomputed_from_skeleton = True
                 if target_price is None or target_price <= (trigger_price or nl_price_struct or 0.0):
                     target_price = float(nl_price_struct) + pattern_height
+                    target_recomputed_from_skeleton = True
                 # Extended target = 2× measured move (classic breakout
                 # extension, used for RR gate so retest entries are
                 # actionable; chart draws the 1× target).
@@ -430,9 +444,28 @@ def derive_pattern_levels(
             if pattern_height > 0:
                 if stop_price is None or stop_price <= (trigger_price or nl_price_struct or 0.0):
                     stop_price = highest + 0.30 * pattern_height
+                    stop_recomputed_from_skeleton = True
                 if target_price is None or target_price >= (trigger_price or nl_price_struct or 0.0):
                     target_price = float(nl_price_struct) - pattern_height
+                    target_recomputed_from_skeleton = True
                 target_extended_price = float(nl_price_struct) - 2.0 * pattern_height
+
+    # Provenance: which source ultimately supplied STOP / TP?
+    if stop_recomputed_from_skeleton or target_recomputed_from_skeleton:
+        fallback_used = True
+        if not stop_from_wave and not target_from_wave:
+            fallback_reason = "wave_derived_lines_missing"
+        else:
+            fallback_reason = "wave_derived_lines_missing_or_wrong_side"
+        level_source = "skeleton_fallback"
+    elif stop_price is not None and target_price is not None:
+        fallback_used = False
+        fallback_reason = None
+        level_source = "wave_derived_lines"
+    else:
+        fallback_used = False
+        fallback_reason = None
+        level_source = None
 
     # RR: classic (1× projection) and extended (2×). The integrated
     # gate uses rr_extended for action gating because that reflects
@@ -498,6 +531,12 @@ def derive_pattern_levels(
         "breakout_confirmed": breakout_confirmed,
         "retest_confirmed": retest_confirmed,
         "pattern_height": float(pattern_height) if pattern_height is not None else None,
+        # Provenance: where STOP / TP came from. Surfaced in the audit
+        # so the user can tell when wave_derived_lines were unusable
+        # and the skeleton-based fallback was applied instead.
+        "level_source": level_source,           # "wave_derived_lines" / "skeleton_fallback" / None
+        "fallback_used": fallback_used,
+        "fallback_reason": fallback_reason,     # None when fallback_used=False
         "reason_ja": reason_ja,
         "unavailable_reason": None,
     }

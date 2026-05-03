@@ -1,5 +1,5 @@
 """Derive entry / stop / target / pattern-part lines from a matched
-waveform pattern (observation-only).
+waveform pattern.
 
 These are the "lines a human would draw when they see this pattern" —
 they live alongside (NOT inside) the existing `support_resistance_v2`
@@ -7,11 +7,31 @@ and `trendline_context` outputs so the audit reviewer can compare:
 
   既存サポレジ / トレンドライン  vs  波形認識から引いた線
 
+Decision-coupling (重要)
+-----------------------
+これは raw な W ライン (この dict) 自体は、直接 royal_road_decision_v2 /
+royal_road_decision_v2_integrated の最終 action を変更しません
+(`used_in_decision = False` のまま)。
+
+ただし integrated profile (Phase F 以降) では、
+このモジュールが出した W ラインを基に
+`pattern_level_derivation.derive_pattern_levels` が
+canonical pattern_levels (B1/B2/NL/BR + ENTRY/STOP/TP/RR) を作り、
+さらに `entry_plan` がそれを見て READY / WAIT_BREAKOUT /
+WAIT_RETEST を出します。
+
+つまり:
+
+  raw W ライン  →  pattern_levels  →  entry_plan  →  integrated action
+
+の経路で **間接的に判断に使われている** ことに注意してください。
+画面上は raw な行 (used_in_decision=False) と、それを使って組み立てた
+pattern_levels / entry_plan を分けて表示すること。
+
 Strict invariants
 -----------------
-- Every line carries `used_in_decision = False`. This module is
-  observation-only; the lines never feed `royal_road_decision_v2`'s
-  final BUY/SELL/HOLD logic.
+- Every line carries `used_in_decision = False`. This module's *raw*
+  output never modifies the final BUY/SELL/HOLD logic directly.
 - Heuristic projections (target = NL ± pattern_height) are flagged
   via the `reason_ja` field so the user can judge whether the line
   is reasonable.

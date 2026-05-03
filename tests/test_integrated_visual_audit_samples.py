@@ -31,6 +31,10 @@ from scripts.generate_visual_audit_smoke import (  # noqa: E402
 )
 
 
+# Phase E.4 originally required exactly these 5 modes; the Phase G
+# follow-up added 3 wait-state demos (wait_breakout / wait_retest /
+# wait_event_clear) for the mobile preview, so the registered set is
+# now 8.
 INTEGRATED_DEMO_NAMES = (
     "normal_integrated_balanced_report",
     "normal_integrated_strict_report",
@@ -39,10 +43,22 @@ INTEGRATED_DEMO_NAMES = (
     "forming_pattern_integrated_hold_demo",
 )
 
+INTEGRATED_DEMO_NAMES_PHASE_G_FOLLOWUP = (
+    "wait_breakout_demo",
+    "wait_retest_demo",
+    "wait_event_clear_demo",
+)
+
 
 def test_all_five_integrated_builders_registered():
-    """Phase E.4 requires exactly these 5 mobile demo modes."""
-    assert set(_INTEGRATED_DEMO_BUILDERS.keys()) == set(INTEGRATED_DEMO_NAMES)
+    """The original Phase E.4 set must remain registered. Phase G
+    follow-up additions are tested separately to keep the original
+    coverage explicit."""
+    keys = set(_INTEGRATED_DEMO_BUILDERS.keys())
+    for name in INTEGRATED_DEMO_NAMES:
+        assert name in keys, f"E.4 builder missing: {name!r}"
+    for name in INTEGRATED_DEMO_NAMES_PHASE_G_FOLLOWUP:
+        assert name in keys, f"Phase G follow-up builder missing: {name!r}"
 
 
 def test_smoke_generator_cli_accepts_integrated_modes():

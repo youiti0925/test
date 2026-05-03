@@ -70,7 +70,13 @@ def test_mobile_html_contains_g5_right_panel(tmp_path: Path):
 
 
 def test_mobile_html_includes_six_panel_rows(tmp_path: Path):
-    """The right sidebar has 6 numbered sections per spec."""
+    """The right sidebar has the expected numbered sections.
+
+    Phase G follow-up extended the original 6-row layout with two
+    additional rows (5b. unconnected fundamentals, 6. auto-line list)
+    and renumbered the manual-line section to 7. The original 6
+    semantic blocks must still be present, plus the two new ones.
+    """
     import sys
     sys.path.insert(0, str(REPO_ROOT / "scripts"))
     from generate_visual_audit_smoke import (
@@ -85,7 +91,9 @@ def test_mobile_html_includes_six_panel_rows(tmp_path: Path):
         "3. ファンダ・イベント",
         "4. 王道根拠",
         "5. 未接続 / 注意",
-        "6. 手動線操作",
+        "5b. 未接続ファンダ",          # Phase G follow-up — DXY/米金利/...
+        "6. 自動線一覧",                # Phase G follow-up — hide-list
+        "7. 手動線操作",
     ):
         assert header in html, f"sidebar row missing: {header!r}"
 

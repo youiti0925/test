@@ -1327,6 +1327,10 @@ BATCH_SCHEMA_VERSION: Final[str] = "visual_audit_report_v1"
 # Per-priority counters (the "important case" picker bucketises cases)
 PRIORITY_LABELS: Final[tuple[str, ...]] = (
     "v2_directional",
+    # Phase G follow-up — surface WAIT_BREAKOUT / WAIT_RETEST /
+    # WAIT_EVENT_CLEAR cases right after directional ones so the
+    # mobile preview reliably shows the fixture's intended state.
+    "wait_state_present",
     "v2_vs_current_diff",
     "high_quality_hold",
     "low_quality_directional_attempt",
@@ -1403,8 +1407,16 @@ def select_important_cases(
         sp = (v2.get("structure_stop_plan") or {})
         chart_p = (v2.get("chart_pattern_v2") or {})
         # Priority bucket selection (first match wins)
+        entry_status = (v2.get("entry_plan") or {}).get("entry_status") or ""
         if action in ("BUY", "SELL"):
             bucket = "v2_directional"
+        elif entry_status in (
+            "WAIT_BREAKOUT", "WAIT_RETEST", "WAIT_EVENT_CLEAR",
+        ):
+            # Phase G follow-up: prioritise wait-states so the mobile
+            # preview shows the WAIT_RETEST / WAIT_EVENT_CLEAR fixture
+            # cases instead of generic HOLD bars.
+            bucket = "wait_state_present"
         elif diff != "same":
             bucket = "v2_vs_current_diff"
         elif rq_total >= 0.5:
@@ -2023,7 +2035,23 @@ def _build_wave_only_svg(
             f"{_html_escape(label)}={float(v):.5f}</text>"
         )
 
-    # 0. Wave-derived horizontal lines (drawn behind the skeleton)
+    # 0. Wave-derived horizontal lines (drawn behind the skeleton).
+    #
+    # Mobile-first label policy: only WNL / ENTRY / STOP / TP get a
+    # *visible* on-chart label so the chart stays readable on a phone.
+    # Other lines (WB1 / WB2 / WBR / WPH / WPL / WP1 / WP2 / WLS / WH /
+    # WRS / WFIB*) are still drawn (so the user can see them) but their
+    # right-edge label is omitted — they are listed in the right info
+    # panel instead, where they can be toggled off.
+    #
+    # Every <line> + <rect> + <text> carries data-line-id="<id>" so the
+    # static-HTML hide-list in the right panel can toggle visibility
+    # without needing to tap the SVG line itself.
+    _CHART_LABEL_BY_ROLE = {
+        "entry_confirmation_line": "WNL",
+        "stop_candidate":          "STOP",
+        "target_candidate":        "TP",
+    }
     for line in (wave_derived_lines or []):
         price = line.get("price")
         if price is None:
@@ -2039,29 +2067,35 @@ def _build_wave_only_svg(
             "color": "#7b1fa2", "dash": "6,4", "width": 1.6,
         })
         line_id = line.get("id", "")
+        line_role = line.get("role", "")
+        compact_label = _CHART_LABEL_BY_ROLE.get(line_role)
         parts.append(
             f"<line class='wave-derived-line wave-derived-{_html_escape(kind_str)}' "
+            f"data-line-id='{_html_escape(line_id)}' "
             f"x1='{margin_l}' y1='{yv:.1f}' "
             f"x2='{margin_l + plot_w}' y2='{yv:.1f}' "
             f"stroke='{style['color']}' stroke-width='{style['width']}' "
             f"stroke-dasharray='{style['dash']}' opacity='0.85'/>"
         )
-        # Right-edge label so it doesn't collide with the family marker
-        label_w = max(28, 10 * len(line_id) + 8)
-        parts.append(
-            f"<rect class='wave-derived-line-label-bg' "
-            f"x='{margin_l + plot_w - label_w - 4:.1f}' "
-            f"y='{yv - 9:.1f}' width='{label_w}' height='18' "
-            f"fill='white' stroke='{style['color']}' "
-            f"stroke-width='1.2' rx='3'/>"
-        )
-        parts.append(
-            f"<text class='wave-derived-line-label' "
-            f"x='{margin_l + plot_w - label_w / 2 - 4:.1f}' "
-            f"y='{yv + 4:.1f}' text-anchor='middle' "
-            f"fill='{style['color']}' font-weight='bold' "
-            f"font-size='11'>{_html_escape(line_id)}</text>"
-        )
+        if compact_label is not None:
+            # Right-edge label — only for the 3 essentials per mobile policy
+            label_w = max(36, 10 * len(compact_label) + 8)
+            parts.append(
+                f"<rect class='wave-derived-line-label-bg' "
+                f"data-line-id='{_html_escape(line_id)}' "
+                f"x='{margin_l + plot_w - label_w - 4:.1f}' "
+                f"y='{yv - 9:.1f}' width='{label_w}' height='18' "
+                f"fill='white' stroke='{style['color']}' "
+                f"stroke-width='1.2' rx='3'/>"
+            )
+            parts.append(
+                f"<text class='wave-derived-line-label' "
+                f"data-line-id='{_html_escape(line_id)}' "
+                f"x='{margin_l + plot_w - label_w / 2 - 4:.1f}' "
+                f"y='{yv + 4:.1f}' text-anchor='middle' "
+                f"fill='{style['color']}' font-weight='bold' "
+                f"font-size='11'>{_html_escape(compact_label)}</text>"
+            )
 
     # 1. Skeleton polyline
     poly_pts = " ".join(
@@ -2371,15 +2405,24 @@ def _wave_derived_lines_svg_fragment(
     plot_w: float, plot_h: float,
 ) -> str:
     """Build an SVG <g> overlay drawing wave-derived horizontal lines
-    (WNL / WB1 / WB2 / WSL / WTP / WUP / WLOW / WBR) on top of the
-    candle chart.
+    on top of the candle chart.
 
-    Each line is keyed by `kind` to a colour / dash style; the line's
-    `id` is rendered as a left-edge label so the user can cross-check
-    with the description table below the chart.
+    Mobile-first label policy (Phase G follow-up): only the trigger
+    (WNL), stop (STOP) and target (TP) get a *visible* left-edge label.
+    Other lines (WB1 / WB2 / WBR / WPH / WPL / WP1 / WP2 / WLS / WH /
+    WRS / WFIB*) are still drawn so the user can see them, but their
+    text label is omitted to keep the chart readable on a phone. Every
+    element carries `data-line-id="<id>"` so the right-panel hide-list
+    (Phase G follow-up) can toggle visibility from the side, without
+    the user having to tap the thin SVG line itself.
     """
     if not wave_derived_lines:
         return ""
+    _CHART_LABEL_BY_ROLE = {
+        "entry_confirmation_line": "WNL",
+        "stop_candidate":          "STOP",
+        "target_candidate":        "TP",
+    }
     out: list[str] = ["<g class='wave-derived-lines'>"]
     for line in wave_derived_lines:
         price = line.get("price")
@@ -2397,8 +2440,11 @@ def _wave_derived_lines_svg_fragment(
             "color": "#7b1fa2", "dash": "6,4", "width": 1.6,
         })
         line_id = line.get("id", "")
+        line_role = line.get("role", "")
+        compact_label = _CHART_LABEL_BY_ROLE.get(line_role)
         out.append(
             f"<line class='wave-derived-line wave-derived-{_html_escape(kind)}' "
+            f"data-line-id='{_html_escape(line_id)}' "
             f"x1='{margin_l:.1f}' y1='{y:.1f}' "
             f"x2='{margin_l + plot_w:.1f}' y2='{y:.1f}' "
             f"stroke='{style['color']}' stroke-width='{style['width']}' "
@@ -2415,26 +2461,30 @@ def _wave_derived_lines_svg_fragment(
                 y_top = y_bot = None
             if y_top is not None and y_bot is not None:
                 out.append(
-                    f"<rect class='wave-derived-zone' x='{margin_l:.1f}' "
+                    f"<rect class='wave-derived-zone' "
+                    f"data-line-id='{_html_escape(line_id)}' "
+                    f"x='{margin_l:.1f}' "
                     f"y='{y_top:.1f}' width='{plot_w:.1f}' "
                     f"height='{abs(y_bot - y_top):.1f}' "
                     f"fill='{style['color']}' opacity='0.10'/>"
                 )
-        # Left-edge label
-        label_w = max(28, 10 * len(line_id) + 8)
-        out.append(
-            f"<rect class='wave-derived-line-label-bg' "
-            f"x='{margin_l + 4:.1f}' y='{y - 9:.1f}' "
-            f"width='{label_w}' height='18' fill='white' "
-            f"stroke='{style['color']}' stroke-width='1.2' rx='3'/>"
-        )
-        out.append(
-            f"<text class='wave-derived-line-label' "
-            f"x='{margin_l + 4 + label_w / 2:.1f}' y='{y + 4:.1f}' "
-            f"text-anchor='middle' fill='{style['color']}' "
-            f"font-weight='bold' font-size='11'>"
-            f"{_html_escape(line_id)}</text>"
-        )
+        if compact_label is not None:
+            label_w = max(36, 10 * len(compact_label) + 8)
+            out.append(
+                f"<rect class='wave-derived-line-label-bg' "
+                f"data-line-id='{_html_escape(line_id)}' "
+                f"x='{margin_l + 4:.1f}' y='{y - 9:.1f}' "
+                f"width='{label_w}' height='18' fill='white' "
+                f"stroke='{style['color']}' stroke-width='1.2' rx='3'/>"
+            )
+            out.append(
+                f"<text class='wave-derived-line-label' "
+                f"data-line-id='{_html_escape(line_id)}' "
+                f"x='{margin_l + 4 + label_w / 2:.1f}' y='{y + 4:.1f}' "
+                f"text-anchor='middle' fill='{style['color']}' "
+                f"font-weight='bold' font-size='11'>"
+                f"{_html_escape(compact_label)}</text>"
+            )
     out.append("</g>")
     return "".join(out)
 
@@ -3238,6 +3288,84 @@ svg .event-window.event-block { /* set by inline attrs; kept for reference */ }
 svg .event-label { font-family: -apple-system, sans-serif; }
 svg .user-line { pointer-events: stroke; cursor: pointer; }
 svg .user-line-label { font-family: -apple-system, sans-serif; }
+/* Auto-line hide toggles (data-line-id matches between right panel
+   and SVG). When the panel button is pressed, JS adds the line id
+   to a class on the section root: .gx-line-hidden-<ID> hides every
+   element carrying that data-line-id. */
+svg [data-line-id].gx-line-hidden { display: none; }
+/* Phase G follow-up — top decision card (mobile-first) */
+.gx-top-decision-card {
+  border: 2px solid #1565c0;
+  border-left-width: 8px;
+  background: #f5faff;
+  border-radius: 6px;
+  padding: 10px 14px;
+  margin: 8px 0 14px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.gx-top-decision-card.gx-card-buy   { border-color: #2e7d32; background: #f4faf4; }
+.gx-top-decision-card.gx-card-sell  { border-color: #c62828; background: #fff5f5; }
+.gx-top-decision-card.gx-card-hold  { border-color: #6a6a6a; background: #fafafa; }
+.gx-top-decision-card .gx-row { margin: 3px 0; }
+.gx-top-decision-card .gx-label {
+  display: inline-block; min-width: 6em; color: #555; font-weight: 600;
+}
+.gx-top-decision-card .gx-state-pill {
+  display: inline-block; padding: 2px 8px; border-radius: 3px;
+  font-weight: bold; color: white; font-size: 12px;
+}
+.gx-state-pill.gx-state-ready              { background: #2e7d32; }
+.gx-state-pill.gx-state-wait-breakout,
+.gx-state-pill.gx-state-wait-retest        { background: #ef6c00; }
+.gx-state-pill.gx-state-wait-event-clear   { background: #c62828; }
+.gx-state-pill.gx-state-hold               { background: #6a6a6a; }
+.gx-conclusion-take    { color: #2e7d32; font-weight: bold; }
+.gx-conclusion-wait    { color: #ef6c00; font-weight: bold; }
+.gx-conclusion-event   { color: #c62828; font-weight: bold; }
+.gx-conclusion-skip    { color: #5d4037; font-weight: bold; }
+.gx-fallback-warn {
+  background: #fff3e0; border: 1px solid #ef6c00; color: #bf360c;
+  padding: 6px 8px; border-radius: 4px; margin: 4px 0; font-size: 12px;
+}
+/* Auto-line hide list inside the right panel */
+.g5-info-panel .g5-line-list { padding-left: 16px; margin: 3px 0;
+  font-size: 11px; }
+.g5-info-panel .g5-line-list li { margin: 2px 0; }
+.g5-info-panel .gx-line-toggle {
+  display: inline-block; padding: 0 6px; margin-left: 4px;
+  border: 1px solid #888; border-radius: 3px; cursor: pointer;
+  background: #f0f0f0; font-size: 10px;
+}
+.g5-info-panel .gx-line-toggle.gx-line-toggle-hidden {
+  background: #ffd54f; border-color: #f9a825;
+}
+/* Unconnected fundamentals block (Phase G follow-up) */
+.g5-info-panel .gx-unconnected-fund { margin: 3px 0; }
+.g5-info-panel .gx-unconnected-fund li {
+  list-style: none; padding: 2px 6px; border-radius: 3px;
+  margin: 2px 0; font-size: 11px;
+  background: #fff8e1; border-left: 3px solid #f9a825;
+}
+.g5-info-panel .gx-unconnected-fund li.gx-fund-missing {
+  background: #ffebee; border-left-color: #c62828;
+}
+.g5-info-panel .gx-unconnected-fund li.gx-fund-stale {
+  background: #fff8e1; border-left-color: #f9a825;
+}
+.g5-info-panel .gx-unconnected-fund li.gx-fund-connected {
+  background: #f1f8e9; border-left-color: #2e7d32;
+}
+.gx-detail-block { margin: 8px 0; }
+.gx-detail-block > summary {
+  cursor: pointer; padding: 4px 8px; background: #eceff1;
+  border-radius: 4px; font-weight: 600; font-size: 13px;
+}
+.gx-localstorage-warn {
+  background: #fff3e0; border: 1px solid #ef6c00; color: #bf360c;
+  padding: 4px 6px; border-radius: 3px; margin: 4px 0; font-size: 11px;
+  line-height: 1.4;
+}
 """
 
 
@@ -3379,6 +3507,29 @@ _PHASE_G_INTERACTIVE_JS: str = """\
     saveAnnotations(sectionId, symbol, timeframe, anns);
     renderList(sectionId, symbol, timeframe);
     t.style.opacity = '0.2';
+  });
+  // Phase G follow-up — auto-line hide toggle inside the right panel.
+  // Each [非表示] / [表示] button carries data-line-id; clicking it
+  // toggles the .gx-line-hidden class on every SVG element with the
+  // same data-line-id inside the same section. No SVG-tap required.
+  document.addEventListener('click', function(ev){
+    var btn = ev.target;
+    if (!btn.classList || !btn.classList.contains('gx-line-toggle')) return;
+    var sec = btn.closest('section.case-section');
+    if (!sec) return;
+    var lineId = btn.getAttribute('data-line-id');
+    if (!lineId) return;
+    var hidden = btn.classList.toggle('gx-line-toggle-hidden');
+    btn.textContent = hidden ? '[表示]' : '[非表示]';
+    var sel = sec.querySelectorAll(
+      "svg [data-line-id='" + lineId.replace(/'/g, "\\'") + "']");
+    sel.forEach(function(el){
+      if (hidden) {
+        el.classList.add('gx-line-hidden');
+      } else {
+        el.classList.remove('gx-line-hidden');
+      }
+    });
   });
   // On load, render any existing annotations
   document.addEventListener('DOMContentLoaded', function(){
@@ -5515,6 +5666,239 @@ def _select_wave_overlay(payload: dict) -> dict | None:
     }
 
 
+# ----------------------------------------------------------------------
+# Phase G follow-up — top decision card + auto-line list + unconnected
+# fundamentals block. All three are rendered inside _mobile_case_section
+# (top card outside the side panel, the others inside it).
+# ----------------------------------------------------------------------
+
+
+# (JA label, [missing_data name aliases], [macro_drivers name aliases]).
+# Status precedence: missing_data hit > driver value present > "no feed".
+_FUND_DRIVER_SLOTS_JA: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
+    ("DXY",            ("dxy", "dxy_alignment"),
+                       ("dxy_alignment", "dxy")),
+    ("米金利 (10y)",   ("us10y_yield", "us_yield_10y", "us10y", "yield_alignment"),
+                       ("yield_alignment", "us10y_yield")),
+    ("ニュース",       ("news_calendar", "news_feed", "news"),
+                       ("news_feed", "news")),
+    ("経済カレンダー", ("event_calendar", "economic_calendar", "calendar"),
+                       ("event_calendar", "economic_calendar")),
+)
+
+
+def _render_top_decision_card_html(
+    *,
+    v2: dict,
+    entry_plan: dict,
+    pattern_levels: dict,
+    fundamental_sidebar: dict,
+) -> str:
+    """Mobile-first top card. Single block the user sees first.
+
+    Renders state / conclusion / ENTRY / STOP / TP / RR / next-wait.
+    Detail rendering stays in the existing section bodies (collapsed
+    behind <details>).
+    """
+    final_action = (v2.get("action") or "—").upper()
+    entry_status = (entry_plan.get("entry_status") or "—").upper()
+
+    # Pick the conclusion line in plain Japanese
+    if entry_status == "READY":
+        conclusion = ("入れる (READY)", "gx-conclusion-take")
+    elif entry_status == "WAIT_BREAKOUT":
+        conclusion = ("まだ待つ — ブレイク待ち", "gx-conclusion-wait")
+    elif entry_status == "WAIT_RETEST":
+        conclusion = ("まだ待つ — 戻り (リターンムーブ) 待ち", "gx-conclusion-wait")
+    elif entry_status == "WAIT_EVENT_CLEAR":
+        conclusion = ("イベント待ち (ファンダ・リスク)", "gx-conclusion-event")
+    else:
+        conclusion = ("見送り (HOLD)", "gx-conclusion-skip")
+
+    # Pricing — prefer entry_plan, fall back to pattern_levels
+    def _f(v) -> str:
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):.5f}"
+        except Exception:  # noqa: BLE001
+            return str(v)
+
+    def _f_rr(v) -> str:
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):.2f}"
+        except Exception:  # noqa: BLE001
+            return str(v)
+
+    side = (entry_plan.get("side") or pattern_levels.get("side") or "—").upper()
+    entry_price = entry_plan.get("entry_price")
+    if entry_price is None:
+        entry_price = pattern_levels.get("trigger_line_price")
+    stop_price = entry_plan.get("stop_price") or pattern_levels.get("stop_price")
+    target_price = entry_plan.get("target_price") or pattern_levels.get("target_price")
+    rr = entry_plan.get("rr") or pattern_levels.get("rr_at_extended_target") \
+        or pattern_levels.get("rr_at_reference")
+
+    # Next-wait condition (what the user is literally waiting for)
+    next_wait = (
+        entry_plan.get("what_to_wait_for_ja")
+        or entry_plan.get("reason_ja")
+        or pattern_levels.get("reason_ja")
+        or "—"
+    )
+
+    # Fallback warning band (skeleton-derived STOP/TP)
+    fb_html = ""
+    if pattern_levels.get("fallback_used"):
+        fb_html = (
+            "<div class='gx-fallback-warn'>"
+            "<b>注意:</b> この STOP / TP は W ライン (波形由来の自動線) からではなく、"
+            "skeleton (波形骨格) から補完しています。"
+            f" (理由: <code>{_html_escape(pattern_levels.get('fallback_reason') or '—')}</code>) "
+            "線生成の信頼度を確認してください。"
+            "</div>"
+        )
+
+    # Card-tone class follows final action so colour matches the conclusion
+    card_class = "gx-top-decision-card"
+    if final_action == "BUY":
+        card_class += " gx-card-buy"
+    elif final_action == "SELL":
+        card_class += " gx-card-sell"
+    else:
+        card_class += " gx-card-hold"
+
+    state_pill_class = (
+        "gx-state-pill gx-state-" + entry_status.lower().replace("_", "-")
+    )
+
+    return (
+        f"<div class='{card_class}'>"
+        f"<div class='gx-row'><span class='gx-label'>状態:</span> "
+        f"<span class='{state_pill_class}'>{_html_escape(entry_status)}</span>"
+        f" / final_action: <b>{_html_escape(final_action)}</b></div>"
+        f"<div class='gx-row'><span class='gx-label'>結論:</span> "
+        f"<span class='{conclusion[1]}'>{_html_escape(conclusion[0])}</span>"
+        f" ({_html_escape(side)})</div>"
+        f"<div class='gx-row'><span class='gx-label'>ENTRY:</span> "
+        f"{_f(entry_price)}</div>"
+        f"<div class='gx-row'><span class='gx-label'>STOP:</span> "
+        f"{_f(stop_price)}</div>"
+        f"<div class='gx-row'><span class='gx-label'>TP:</span> "
+        f"{_f(target_price)}</div>"
+        f"<div class='gx-row'><span class='gx-label'>RR:</span> "
+        f"{_f_rr(rr)}</div>"
+        f"<div class='gx-row'><span class='gx-label'>次に待つ条件:</span> "
+        f"{_html_escape(str(next_wait)[:160])}</div>"
+        + fb_html
+        + "</div>"
+    )
+
+
+def _render_g5_auto_line_list_html(
+    *,
+    wave_derived_lines: list[dict],
+    section_id: str,
+) -> str:
+    """Sidebar block — list every auto wave-derived line with a
+    [非表示] toggle. Lets the user hide narrow SVG lines without
+    having to tap them on a phone."""
+    lines = wave_derived_lines or []
+    if not lines:
+        return (
+            "<div class='g5-row'><h4>6. 自動線一覧</h4>"
+            "<p class='small'>(自動線なし)</p></div>"
+        )
+    items: list[str] = []
+    for ln in lines:
+        lid = ln.get("id") or ""
+        if not lid:
+            continue
+        kind = ln.get("kind") or ""
+        role = ln.get("role") or ""
+        price = ln.get("price")
+        try:
+            price_str = f"{float(price):.5f}" if price is not None else "—"
+        except Exception:  # noqa: BLE001
+            price_str = "—"
+        items.append(
+            f"<li><b>{_html_escape(lid)}</b> "
+            f"<span class='small'>({_html_escape(kind)}, {_html_escape(role)}) "
+            f"@ {price_str}</span> "
+            f"<button type='button' class='gx-line-toggle' "
+            f"data-line-id='{_html_escape(lid)}' "
+            f"data-section-id='{_html_escape(section_id)}'>[非表示]</button>"
+            f"</li>"
+        )
+    return (
+        "<div class='g5-row'><h4>6. 自動線一覧 (タップで非表示切替)</h4>"
+        "<p class='small'>"
+        "スマホでチャート上の細い線を直接タップしなくても、"
+        "ここから on / off できます。"
+        "</p>"
+        "<ul class='g5-line-list'>" + "".join(items) + "</ul>"
+        "</div>"
+    )
+
+
+def _render_g5_unconnected_fundamentals_html(
+    fundamental_sidebar: dict,
+) -> str:
+    """Highlight DXY / US yields / news / economic calendar status as
+    red (missing) / green (connected). Connected status is determined by
+    whether the slot appears in the macro_drivers block AND has a
+    non-empty value. Missing detection accepts several upstream alias
+    names per slot so future fundamental_sidebar field renames don't
+    silently flip a slot back to "connected"."""
+    fs = fundamental_sidebar or {}
+    drivers = fs.get("macro_drivers") or []
+    drivers_by_name = {(d.get("name") or "").lower(): d for d in drivers}
+    missing = fs.get("missing_data") or []
+    missing_by_name = {(m.get("name") or "").lower(): m for m in missing}
+
+    rows: list[str] = []
+    for ja_label, missing_aliases, driver_aliases in _FUND_DRIVER_SLOTS_JA:
+        m = next(
+            (missing_by_name.get(a) for a in missing_aliases
+             if missing_by_name.get(a) is not None),
+            None,
+        )
+        d = next(
+            (drivers_by_name.get(a) for a in driver_aliases
+             if drivers_by_name.get(a) is not None
+             and drivers_by_name.get(a, {}).get("value") not in (None, "", "—")),
+            None,
+        )
+        if m is not None:
+            st_class = "gx-fund-missing"
+            st_text = m.get("status") or "未接続"
+            value_text = ""
+        elif d is not None:
+            st_class = "gx-fund-connected"
+            st_text = "接続済"
+            value_text = f" — {_html_escape(str(d.get('value')))}"
+        else:
+            # Neither a driver value nor an explicit missing-entry → mark
+            # as unconnected so the user is never silently lulled into
+            # thinking the feed is live.
+            st_class = "gx-fund-missing"
+            st_text = "未接続 (フィードなし)"
+            value_text = ""
+        rows.append(
+            f"<li class='{st_class}'>"
+            f"<b>{_html_escape(ja_label)}</b>: "
+            f"{_html_escape(st_text)}{value_text}"
+            f"</li>"
+        )
+    return (
+        "<div class='g5-row'><h4>5b. 未接続ファンダ (要注意)</h4>"
+        "<ul class='gx-unconnected-fund'>" + "".join(rows) + "</ul>"
+        "</div>"
+    )
+
+
 def _render_g5_right_panel_html(
     *,
     payload: dict,
@@ -5694,16 +6078,37 @@ def _render_g5_right_panel_html(
         + "</div>"
     )
 
-    # Row 6 — 手動線操作 (interactive, static-HTML)
+    # Row 5b — Unconnected fundamentals (DXY / 米金利 / ニュース / 経済カレンダー)
+    unconnected_fund_html = _render_g5_unconnected_fundamentals_html(fs)
+
+    # Row 6 — 自動線一覧 (auto-line hide list, mobile-tap friendly).
+    # Merge in the WFIB* lines surfaced by fibonacci_context_review so
+    # the panel mirrors what the chart actually draws.
+    wd_lines = list(payload.get("wave_derived_lines") or [])
+    mc_panels = (payload.get("masterclass_panels") or {}).get("panels") or {}
+    fib_panel = mc_panels.get("fibonacci_context_review") or {}
+    for fib_line in (fib_panel.get("fib_wave_lines") or []):
+        wd_lines.append(fib_line)
+    auto_line_list_html = _render_g5_auto_line_list_html(
+        wave_derived_lines=wd_lines, section_id=section_id,
+    )
+
+    # Row 7 — 手動線操作 (interactive, static-HTML)
     sym = payload.get("symbol") or ""
     tf = (payload.get("interval") or payload.get("timeframe") or "1h")
     annotations_html = (
         "<div class='g5-row g5-anno-row'>"
-        "<h4>6. 手動線操作</h4>"
+        "<h4>7. 手動線操作</h4>"
         "<p class='small'>"
         "manual_line_policy = <b>display_only</b> (初期値、安全側)。"
         "ここで追加した線は表示のみ。BUY/SELL 判断には影響しません。"
         "</p>"
+        "<div class='gx-localstorage-warn'>"
+        "<b>注意:</b> この手動線はこのブラウザ内 (localStorage) "
+        "だけに保存されます。<br>"
+        "別端末との共有・正式な保存には "
+        "<b>annotations.json のダウンロード</b> が必要です。"
+        "</div>"
         "<div class='g5-anno-controls'>"
         "<label>kind: <select class='g5-anno-kind'>"
         "<option value='support'>support</option>"
@@ -5727,13 +6132,12 @@ def _render_g5_right_panel_html(
         f" data-section-id='{_html_escape(section_id)}'"
         ">annotations.json をダウンロード</button>"
         "</div>"
-        "<p class='small'>localStorage に保存されます。"
-        "リロード後も残ります。サーバ送信なし。</p>"
         f"<ul class='g5-anno-list' data-section-id='{_html_escape(section_id)}'>"
         "</ul>"
         "<p class='small'><i>"
-        "自動線を非表示にしたい場合: チャート上の線をクリック → "
-        "REJECTED_BY_USER 状態で記録(物理削除ではなく履歴保持)。"
+        "自動線を非表示にしたい場合は、上の「6. 自動線一覧」から "
+        "[非表示] ボタンを使ってください "
+        "(SVG 上の線を直接タップしても REJECTED_BY_USER として記録されます)。"
         "</i></p>"
         "</div>"
     )
@@ -5745,6 +6149,8 @@ def _render_g5_right_panel_html(
         + fund_html
         + royal_html
         + missing_html
+        + unconnected_fund_html
+        + auto_line_list_html
         + annotations_html
         + "</aside>"
     )
@@ -5893,51 +6299,102 @@ def _mobile_case_section_html(
         + "</div>"
     )
 
-    return (
-        f"<section class='case-section' id='{_html_escape(section_id)}'>"
-        f"<h2>{title}</h2>"
-        # Decision bridge first — answers "what drove this action?"
+    # Phase G follow-up — top decision card (mobile-first compact summary).
+    # Renders BEFORE the chart so the user sees state / conclusion /
+    # ENTRY / STOP / TP / RR / next-wait above the fold.
+    pattern_levels_for_card = v2.get("pattern_levels") or {}
+    entry_plan_for_card = v2.get("entry_plan") or {}
+    fundamental_sidebar_for_card = payload.get("fundamental_sidebar") or {}
+    top_decision_card_html = _render_top_decision_card_html(
+        v2=v2,
+        entry_plan=entry_plan_for_card,
+        pattern_levels=pattern_levels_for_card,
+        fundamental_sidebar=fundamental_sidebar_for_card,
+    )
+
+    # All "developer-detail" sections fold under <details> so the mobile
+    # view stays focused on the top card + chart + side panel.
+    detail_sections_html = (
+        "<details class='gx-detail-block'>"
+        "<summary>判断橋 (bridge — どの根拠でこの結論になったか)</summary>"
         + decision_bridge_html
-        + (legend_html if legend_html else "")
-        + "<h3>chart</h3>"
-        + phase_g_chart_with_panel
+        + "</details>"
         + (
-            f"<h3>{_html_escape(wave_only_heading)}</h3>"
+            "<details class='gx-detail-block'>"
+            "<summary>" + _html_escape(wave_only_heading) + "</summary>"
             + wave_only_html
+            + "</details>"
             if wave_only_html else ""
         )
-        + "<h3>線カウントサマリ (S/R + T/X + 波形由来)</h3>"
+        + "<details class='gx-detail-block'>"
+        "<summary>線カウントサマリ (S/R + T/X + 波形由来)</summary>"
         + line_count_html
-        + "<h3>波形由来の線 (wave-derived lines)</h3>"
+        + "</details>"
+        + "<details class='gx-detail-block'>"
+        "<summary>波形由来の線 (wave-derived lines, 一覧表)</summary>"
         + wave_derived_table_html
-        + "<h3>結論カード (entry / stop / RR)</h3>"
+        + "</details>"
+        + "<details class='gx-detail-block'>"
+        "<summary>結論カード (entry / stop / RR — 詳細)</summary>"
         + entry_summary_html
-        + "<h3>波形レビュー (waveform shape review — observation only)</h3>"
+        + "</details>"
+        + "<details class='gx-detail-block'>"
+        "<summary>波形レビュー (observation only)</summary>"
         + wave_review_html
+        + "</details>"
         + (
-            "<h3>パターン解剖 (pattern parts)</h3>"
+            "<details class='gx-detail-block'>"
+            "<summary>パターン解剖 (pattern parts)</summary>"
             + pattern_dissection_html
+            + "</details>"
             if pattern_dissection_html else ""
         )
         + (hold_waveform_html if hold_waveform_html else "")
-        + "<h3>Masterclass パネル (16機能 — observation only)</h3>"
+        + "<details class='gx-detail-block'>"
+        "<summary>Masterclass パネル (16機能 — observation only)</summary>"
         + masterclass_panels_html
-        + "<h3>Royal Road Checklist Panels</h3>"
+        + "</details>"
+        + "<details class='gx-detail-block'>"
+        "<summary>Royal Road Checklist Panels</summary>"
         + panels_html
-        + "<h3>current_runtime vs royal_road_v2</h3>"
+        + "</details>"
+        + "<details class='gx-detail-block'>"
+        "<summary>current_runtime vs royal_road_v2</summary>"
         + cmp_html
-        + "<h3>setup_candidates</h3>"
+        + "</details>"
+        + "<details class='gx-detail-block'>"
+        "<summary>setup_candidates</summary>"
         + setup_html
-        + "<h3>block_reasons</h3>"
+        + "</details>"
+        + "<details class='gx-detail-block'>"
+        "<summary>block_reasons</summary>"
         + block_html
-        + "<h3>cautions</h3>"
+        + "</details>"
+        + "<details class='gx-detail-block'>"
+        "<summary>cautions</summary>"
         + cautions_html
-        + "<h3>reconstruction_quality</h3>"
+        + "</details>"
+        + "<details class='gx-detail-block'>"
+        "<summary>reconstruction_quality</summary>"
         + rq_html
-        + "<h3>audit summary (raw)</h3>"
+        + "</details>"
+        + "<details class='gx-detail-block'>"
+        "<summary>audit summary (raw)</summary>"
         + f"<pre>{_html_escape(json.dumps(raw_excerpt, indent=2, default=str))}</pre>"
-        "<p><a href='#case-list'>↑ back to case list</a></p>"
-        "</section>"
+        + "</details>"
+    )
+
+    return (
+        f"<section class='case-section' id='{_html_escape(section_id)}'>"
+        f"<h2>{title}</h2>"
+        # Top decision card — mobile-first, the only thing the user
+        # needs to see at a glance.
+        + top_decision_card_html
+        + (legend_html if legend_html else "")
+        + phase_g_chart_with_panel
+        + detail_sections_html
+        + "<p><a href='#case-list'>↑ back to case list</a></p>"
+        + "</section>"
     )
 
 

@@ -1050,13 +1050,19 @@ def _build_forming_pattern_integrated_hold_demo_mobile(*, out_path: Path) -> dic
 def _double_bottom_pre_breakout_ohlcv(n: int = 320, seed: int = 11) -> pd.DataFrame:
     """DB curve truncated BEFORE the neckline breakout — pattern is
     visible (B1 / NL / B2) but the trigger has not fired yet, so the
-    integrated profile reports entry_status=WAIT_BREAKOUT."""
+    integrated profile reports entry_status=WAIT_BREAKOUT.
+
+    Curve mirrors the READY-version with-retest fixture but cuts off
+    at the bar BEFORE the breakout knot; the last several bars hover
+    just below the neckline (basing) so wave_shape_review classifies
+    it as a forming double_bottom rather than a triangle."""
     knots = [
         (0.00, 0.70),  # prior high
-        (0.20, 0.05),  # B1
-        (0.55, 0.55),  # NL
-        (0.85, 0.10),  # B2
-        (1.00, 0.42),  # rising back toward NL but NOT through it
+        (0.15, 0.05),  # B1
+        (0.40, 0.55),  # NL
+        (0.65, 0.10),  # B2
+        (0.85, 0.45),  # rising back toward NL
+        (1.00, 0.50),  # hugging just below NL — no breakout yet
     ]
     return _ohlc_from_curve(_piecewise_curve(knots, n), seed=seed)
 
@@ -1066,16 +1072,50 @@ def _double_bottom_post_breakout_pre_retest_ohlcv(
 ) -> pd.DataFrame:
     """DB curve cropped AFTER the neckline breakout but BEFORE the
     retest pullback completes / a confirming bullish bar forms.
-    The integrated profile reports entry_status=WAIT_RETEST."""
+    The integrated profile reports entry_status=WAIT_RETEST.
+
+    The breakout bar is placed early (knot at 0.55) and the last 45%
+    of bars hover around the neckline (alternating retests and
+    shallow pullbacks) — neither a clean confirmation bar nor a fresh
+    breakdown — so the integrated profile parks in WAIT_RETEST."""
     knots = [
         (0.00, 0.70),
-        (0.18, 0.05),  # B1
-        (0.45, 0.55),  # NL
-        (0.70, 0.10),  # B2
-        (0.92, 0.62),  # break above NL
-        (1.00, 0.58),  # immediate, shallow pullback (retest pending)
+        (0.10, 0.05),  # B1
+        (0.30, 0.55),  # NL
+        (0.45, 0.10),  # B2
+        (0.55, 0.62),  # break above NL
+        (0.65, 0.55),  # retest at NL
+        (0.75, 0.58),
+        (0.85, 0.54),
+        (0.93, 0.57),
+        (1.00, 0.55),  # still hovering at NL — no confirmation candle
     ]
     return _ohlc_from_curve(_piecewise_curve(knots, n), seed=seed)
+
+
+def _filter_traces_to_entry_status(
+    traces, target_status: str, *, max_n: int = 6,
+) -> list:
+    """Return up to `max_n` traces whose v2.entry_plan.entry_status
+    matches `target_status`. Used by the wait_*_demo builders so the
+    rendered cases reliably show the target state instead of being
+    crowded out by neighbouring HOLD bars.
+
+    Falls back to the original trace list when no match is found, so
+    the demo always renders at least one case.
+    """
+    matched = []
+    for tr in traces:
+        v2 = tr.royal_road_decision_v2
+        if v2 is None:
+            continue
+        v2d = v2.to_dict() if hasattr(v2, "to_dict") else dict(v2)
+        ep = v2d.get("entry_plan") or {}
+        if (ep.get("entry_status") or "").upper() == target_status:
+            matched.append(tr)
+            if len(matched) >= max_n:
+                break
+    return matched if matched else list(traces)
 
 
 def _build_wait_breakout_demo_mobile(*, out_path: Path) -> dict:
@@ -1087,11 +1127,14 @@ def _build_wait_breakout_demo_mobile(*, out_path: Path) -> dict:
         decision_profile="royal_road_decision_v2_integrated",
         integrated_mode="integrated_balanced",
     )
+    target = _filter_traces_to_entry_status(
+        res.decision_traces, "WAIT_BREAKOUT", max_n=6,
+    )
     return render_visual_audit_mobile_single_file(
-        traces=res.decision_traces,
+        traces=target,
         df_by_symbol={sym: df},
         out_path=out_path,
-        max_cases=3,
+        max_cases=6,
         title="visual_audit_mobile_v1 — WAIT_BREAKOUT demo",
         demo_fixture_banner=(
             "ダブルボトムらしい形が見えてきたものの、まだネックライン (WNL) を"
@@ -1110,11 +1153,14 @@ def _build_wait_retest_demo_mobile(*, out_path: Path) -> dict:
         decision_profile="royal_road_decision_v2_integrated",
         integrated_mode="integrated_balanced",
     )
+    target = _filter_traces_to_entry_status(
+        res.decision_traces, "WAIT_RETEST", max_n=6,
+    )
     return render_visual_audit_mobile_single_file(
-        traces=res.decision_traces,
+        traces=target,
         df_by_symbol={sym: df},
         out_path=out_path,
-        max_cases=3,
+        max_cases=6,
         title="visual_audit_mobile_v1 — WAIT_RETEST demo",
         demo_fixture_banner=(
             "ネックライン (WNL) を一度抜けたあと、戻し (リターンムーブ) と"
@@ -1144,11 +1190,14 @@ def _build_wait_event_clear_demo_mobile(*, out_path: Path) -> dict:
         integrated_mode="integrated_balanced",
         events=(fomc,),
     )
+    target = _filter_traces_to_entry_status(
+        res.decision_traces, "WAIT_EVENT_CLEAR", max_n=6,
+    )
     return render_visual_audit_mobile_single_file(
-        traces=res.decision_traces,
+        traces=target,
         df_by_symbol={sym: df},
         out_path=out_path,
-        max_cases=3,
+        max_cases=6,
         title="visual_audit_mobile_v1 — WAIT_EVENT_CLEAR demo",
         demo_fixture_banner=(
             "READY 条件は揃っているが、4 時間後に FOMC が控えているため"
