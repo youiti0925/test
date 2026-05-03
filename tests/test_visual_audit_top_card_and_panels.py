@@ -443,9 +443,15 @@ def test_mobile_html_top_card_lives_above_chart(tmp_path: Path):
 def test_mobile_html_chart_only_shows_compact_wnl_stop_tp_labels(
     tmp_path: Path,
 ):
-    """The candle chart must not surface the verbose W* / WB* / WP* /
-    WFIB* labels on the chart itself (those go in the right panel).
-    Only WNL / STOP / TP / EVENT are allowed as visible chart labels."""
+    """The candle chart must not surface verbose / fibonacci / pivot
+    sub-ids (WB1 / WPH / WFIB382 etc.) on the chart itself — they
+    belong in the right-panel inventory.
+
+    Allowed wave-derived-line labels (post Phase G follow-up #2):
+      WNL / WSL / WTP    — short identifiers for the W lines
+      ENTRY / STOP / TP  — actionable role labels (stacked next to W*)
+    Anything else (specifically WB1/WB2/WPH/WPL/WP1/WP2/WLS/WH/WRS/
+    WFIB*) is a regression."""
     import sys
     sys.path.insert(0, str(REPO_ROOT / "scripts"))
     from generate_visual_audit_smoke import (
@@ -454,11 +460,10 @@ def test_mobile_html_chart_only_shows_compact_wnl_stop_tp_labels(
     out = tmp_path / "chart_labels.html"
     _build_double_bottom_integrated_buy_demo_mobile(out_path=out)
     html = out.read_text(encoding="utf-8")
-    # Extract every wave-derived-line text label in the document
     visible_labels = re.findall(
         r"<text class='wave-derived-line-label'[^>]*>([^<]+)</text>", html,
     )
-    allowed = {"WNL", "STOP", "TP"}
+    allowed = {"WNL", "WSL", "WTP", "ENTRY", "STOP", "TP"}
     bad = [l for l in visible_labels if l not in allowed]
     assert not bad, (
         f"Chart leaked verbose wave-line labels (mobile-policy violation): "

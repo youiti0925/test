@@ -1487,6 +1487,7 @@ def _build_candle_svg_xml(
     wave_derived_lines: list[dict] | None = None,
     events_for_chart: list[dict] | None = None,
     user_annotations: list[dict] | None = None,
+    entry_status: str | None = None,
 ) -> str | None:
     """Build the SVG candle-chart as an XML string.
 
@@ -1590,6 +1591,7 @@ def _build_candle_svg_xml(
     parts.append(
         f"<?xml version='1.0' encoding='UTF-8'?>\n"
         f"<svg xmlns='http://www.w3.org/2000/svg' "
+        f"data-testid='main-candle-chart' "
         f"viewBox='0 0 {W} {H}' width='{W}' height='{H}' "
         f"font-family='-apple-system, sans-serif' font-size='11'>"
     )
@@ -1862,6 +1864,41 @@ def _build_candle_svg_xml(
             )
         )
 
+    # ---- entry-status badge (Phase G follow-up) -----------------
+    # Drawn last so it sits on top of every overlay. Renders the
+    # literal "WAIT BREAKOUT" / "WAIT RETEST" / "WAIT EVENT" /
+    # "READY" text near the top of the chart so users can tell at
+    # a glance which state the system is in (and SVG-scoped tests
+    # can assert on those exact tokens).
+    if entry_status:
+        es = str(entry_status).upper()
+        badge_text_map = {
+            "WAIT_BREAKOUT":     ("WAIT BREAKOUT", "#ef6c00"),
+            "WAIT_RETEST":       ("WAIT RETEST",   "#ef6c00"),
+            "WAIT_EVENT_CLEAR":  ("WAIT EVENT",    "#c62828"),
+            "READY":             ("READY",         "#2e7d32"),
+            "HOLD":              ("HOLD",          "#6a6a6a"),
+        }
+        badge = badge_text_map.get(es)
+        if badge is not None:
+            text, fill = badge
+            badge_w = max(80, 9 * len(text) + 16)
+            bx = margin_l + plot_w - badge_w - 8
+            by = margin_t + 8
+            parts.append(
+                f"<rect class='entry-status-badge-bg' "
+                f"x='{bx:.1f}' y='{by:.1f}' "
+                f"width='{badge_w}' height='22' "
+                f"fill='{fill}' opacity='0.92' rx='4'/>"
+            )
+            parts.append(
+                f"<text class='entry-status-badge' "
+                f"x='{bx + badge_w / 2:.1f}' y='{by + 16:.1f}' "
+                f"text-anchor='middle' fill='white' "
+                f"font-weight='bold' font-size='12'>"
+                f"{_html_escape(text)}</text>"
+            )
+
     parts.append("</svg>\n")
     return "".join(parts)
 
@@ -1884,6 +1921,14 @@ _PATTERN_PART_LABELS: Final[dict] = {
     "head": "H",
     # Continuation patterns / wedges / triangles
     "breakout": "BR",
+    # Canonical pattern_levels labels (identity map) — lets
+    # _wave_overlay_svg_fragment label matched_parts that came directly
+    # from pattern_level_derivation.derive_pattern_levels (which uses
+    # B1 / B2 / P1 / P2 / LS / H / RS / NL / BR as part keys).
+    "B1": "B1", "B2": "B2", "P1": "P1", "P2": "P2",
+    "LS": "LS", "H": "H", "RS": "RS",
+    "NL": "NL", "BR": "BR",
+    "PH": "PH", "PL": "PL",
     "apex": "AP",
     "lower_anchor_1": "A1",
     "upper_anchor_1": "A1",
@@ -1994,7 +2039,8 @@ def _build_wave_only_svg(
 
     parts: list[str] = []
     parts.append(
-        f"<svg xmlns='http://www.w3.org/2000/svg' class='wave-only-chart' "
+        f"<svg xmlns='http://www.w3.org/2000/svg' "
+        f"data-testid='wave-only-chart' class='wave-only-chart' "
         f"viewBox='0 0 {W} {H}' width='{W}' height='{H}' "
         f"font-family='-apple-system, sans-serif' font-size='11'>"
     )
@@ -2323,12 +2369,15 @@ def _event_bands_svg_fragment(
             f"stroke='{stroke}' stroke-width='1.4' "
             f"stroke-dasharray='4,3' opacity='0.85' />"
         )
-        # Label tag at top of chart
+        # Label tag at top of chart. Always prefix with the literal
+        # "EVENT" token so SVG-scoped tests can assert visibility
+        # without coupling to a particular event-kind string.
         kind = ev.get("kind") or ev.get("impact") or "EVENT"
         title_text = (ev.get("title") or "")[:24]
-        label = f"{kind}"
+        body = f"{kind}"
         if title_text and title_text != kind:
-            label = f"{kind} ({title_text})"
+            body = f"{kind} ({title_text})"
+        label = f"EVENT {body}"
         out.append(
             f"<text class='event-label event-{status.lower()}' "
             f"x='{x_center + 3:.1f}' y='{margin_t + 12:.1f}' "
@@ -2407,22 +2456,21 @@ def _wave_derived_lines_svg_fragment(
     """Build an SVG <g> overlay drawing wave-derived horizontal lines
     on top of the candle chart.
 
-    Mobile-first label policy (Phase G follow-up): only the trigger
-    (WNL), stop (STOP) and target (TP) get a *visible* left-edge label.
-    Other lines (WB1 / WB2 / WBR / WPH / WPL / WP1 / WP2 / WLS / WH /
-    WRS / WFIB*) are still drawn so the user can see them, but their
-    text label is omitted to keep the chart readable on a phone. Every
-    element carries `data-line-id="<id>"` so the right-panel hide-list
-    (Phase G follow-up) can toggle visibility from the side, without
-    the user having to tap the thin SVG line itself.
+    Mobile-first label policy (Phase G follow-up):
+      role=entry_confirmation_line → WNL + ENTRY (two stacked labels
+        sharing the same horizontal line, since trigger price = entry)
+      role=stop_candidate          → WSL + STOP
+      role=target_candidate        → WTP + TP
+      role=breakout_line           → WBR (short id only, no separate label)
+      role=pattern_part            → keep id as-is (WB1 / WP1 / ...)
+      kind starts with "fibonacci_" → line drawn but NO chart label
+        (label still in right panel's auto-line list)
+    Every element carries `data-line-id="<id>"` so the right-panel
+    hide-list can toggle visibility from the side without requiring
+    the user to tap thin SVG lines on a phone.
     """
     if not wave_derived_lines:
         return ""
-    _CHART_LABEL_BY_ROLE = {
-        "entry_confirmation_line": "WNL",
-        "stop_candidate":          "STOP",
-        "target_candidate":        "TP",
-    }
     out: list[str] = ["<g class='wave-derived-lines'>"]
     for line in wave_derived_lines:
         price = line.get("price")
@@ -2441,7 +2489,21 @@ def _wave_derived_lines_svg_fragment(
         })
         line_id = line.get("id", "")
         line_role = line.get("role", "")
-        compact_label = _CHART_LABEL_BY_ROLE.get(line_role)
+        # Build the visible label set per role.
+        labels: list[str] = []
+        if line_role == "entry_confirmation_line":
+            labels = ["WNL", "ENTRY"]
+        elif line_role == "stop_candidate":
+            labels = ["WSL", "STOP"]
+        elif line_role == "target_candidate":
+            labels = ["WTP", "TP"]
+        elif line_role == "breakout_line":
+            labels = ["WBR"]
+        elif line_role == "pattern_part" and not kind.startswith(
+            "fibonacci_"
+        ) and line_id:
+            labels = [line_id]
+        # else (fibonacci_*, unknown roles) → line only, no chart label
         out.append(
             f"<line class='wave-derived-line wave-derived-{_html_escape(kind)}' "
             f"data-line-id='{_html_escape(line_id)}' "
@@ -2468,22 +2530,25 @@ def _wave_derived_lines_svg_fragment(
                     f"height='{abs(y_bot - y_top):.1f}' "
                     f"fill='{style['color']}' opacity='0.10'/>"
                 )
-        if compact_label is not None:
-            label_w = max(36, 10 * len(compact_label) + 8)
+        # Render each visible label as a stacked badge along the right
+        # edge so labels don't overlap when WNL+ENTRY share a line.
+        for n, label in enumerate(labels):
+            label_w = max(38, 10 * len(label) + 8)
+            label_x = margin_l + 4 + n * (label_w + 4)
             out.append(
                 f"<rect class='wave-derived-line-label-bg' "
                 f"data-line-id='{_html_escape(line_id)}' "
-                f"x='{margin_l + 4:.1f}' y='{y - 9:.1f}' "
+                f"x='{label_x:.1f}' y='{y - 9:.1f}' "
                 f"width='{label_w}' height='18' fill='white' "
                 f"stroke='{style['color']}' stroke-width='1.2' rx='3'/>"
             )
             out.append(
                 f"<text class='wave-derived-line-label' "
                 f"data-line-id='{_html_escape(line_id)}' "
-                f"x='{margin_l + 4 + label_w / 2:.1f}' y='{y + 4:.1f}' "
+                f"x='{label_x + label_w / 2:.1f}' y='{y + 4:.1f}' "
                 f"text-anchor='middle' fill='{style['color']}' "
                 f"font-weight='bold' font-size='11'>"
-                f"{_html_escape(compact_label)}</text>"
+                f"{_html_escape(label)}</text>"
             )
     out.append("</g>")
     return "".join(out)
@@ -4539,19 +4604,46 @@ def _build_user_facing_title(
 
     Replaces the previous developer-facing
     "best=SELL score=-0.300 | quality=0.628 | action=SELL".
+
+    Phase G follow-up: when wave_shape_review is empty (engine path),
+    fall back to pattern_levels.pattern_kind so 波形候補 still appears.
+    Reference-line ids are ordered: WNL > WSL > WTP > WBR > WB* / WP*
+    / WLS / WH / WRS > everything else > WFIB* last, so the chart
+    title reads with the recognised pattern's lines first instead of
+    the alphabetically-leading WFIB lines.
     """
     v2 = payload.get("royal_road_decision_v2") or {}
     action = v2.get("action") or "?"
     review = payload.get("wave_shape_review") or {}
     best = review.get("best_pattern") or {}
     kind = best.get("kind") or ""
+    if not kind:
+        # Engine path: read from pattern_levels.
+        pl = v2.get("pattern_levels") or {}
+        kind = pl.get("pattern_kind") or ""
     parts: list[str] = [f"判断: {_html_escape(action)}"]
     if kind:
         parts.append(
             f"波形候補: {_html_escape(_PATTERN_KIND_LABEL_JA.get(kind, kind))}"
         )
     if wave_derived:
-        ids = sorted({l.get("id", "") for l in wave_derived if l.get("id")})
+        # Stable order: pattern-essential first, fibonacci last.
+        priority = {
+            "WNL": 0, "WNL1": 0, "WSL": 1, "WSL1": 1,
+            "WTP": 2, "WTP1": 2, "WBR": 3, "WBR1": 3,
+        }
+        def _rank(lid: str) -> tuple[int, str]:
+            if lid in priority:
+                return (priority[lid], lid)
+            if lid.startswith("WFIB"):
+                return (90, lid)
+            if lid.startswith("W"):
+                return (10, lid)
+            return (50, lid)
+        ids = sorted(
+            {l.get("id", "") for l in wave_derived if l.get("id")},
+            key=_rank,
+        )
         if ids:
             # Cap at 6 ids to keep the title readable on phones.
             shown = ids[:6]
@@ -5632,7 +5724,20 @@ def _hold_waveform_extra_html(
     )
 
 
-def _select_wave_overlay(payload: dict) -> dict | None:
+_PATTERN_KIND_HUMAN_JA: Final[dict[str, str]] = {
+    "double_bottom": "ダブルボトム",
+    "double_top":    "ダブルトップ",
+    "head_and_shoulders":         "ヘッド&ショルダーズ",
+    "inverse_head_and_shoulders": "逆ヘッド&ショルダーズ",
+    "ascending_triangle":  "アセンディング・トライアングル",
+    "descending_triangle": "ディセンディング・トライアングル",
+    "symmetric_triangle":  "シンメトリック・トライアングル",
+}
+
+
+def _select_wave_overlay(
+    payload: dict, *, df: "pd.DataFrame | None" = None,
+) -> dict | None:
     """Pick the best per-scale skeleton + matched parts for chart
     overlay. Returns None when no candidate is available.
 
@@ -5643,26 +5748,110 @@ def _select_wave_overlay(payload: dict) -> dict | None:
          in royal_road_decision_v2.multi_scale_chart.
       3. Use best_pattern.matched_parts as the part-name → pivot.index
          mapping for label rendering.
+      4. Phase G follow-up: when wave_shape_review is empty but
+         pattern_level_derivation produced a pattern_levels dict with
+         parts (B1/B2/P1/P2/LS/H/RS/NL/BR), synthesise a wave_overlay
+         from pattern_levels so the chart still shows a visible
+         polyline + part labels. Without this fallback the integrated
+         profile renders only the WFIB lines (because wave_shape_review
+         is often empty in the engine path) and the user can no longer
+         see the recognised pattern on the chart.
     """
     review = payload.get("wave_shape_review") or {}
     best = review.get("best_pattern") or {}
-    if not best:
-        return None
-    scale = best.get("scale")
+    if best:
+        scale = best.get("scale")
+        v2 = payload.get("royal_road_decision_v2") or {}
+        multi = v2.get("multi_scale_chart") or {}
+        scales = multi.get("scales") or {}
+        skel = (scales.get(scale) or {}).get("wave_skeleton") or {}
+        if skel.get("pivots"):
+            return {
+                "skeleton": skel,
+                "matched_parts": best.get("matched_parts") or {},
+                "kind": best.get("kind") or "",
+                "human_label": best.get("human_label") or "",
+                "status": best.get("status") or "",
+                "side_bias": best.get("side_bias") or "",
+                "shape_score": best.get("shape_score"),
+            }
+    # Fallback: synthesise from pattern_levels.
     v2 = payload.get("royal_road_decision_v2") or {}
-    multi = v2.get("multi_scale_chart") or {}
-    scales = multi.get("scales") or {}
-    skel = (scales.get(scale) or {}).get("wave_skeleton") or {}
-    if not skel.get("pivots"):
+    pl = v2.get("pattern_levels") or {}
+    parts = pl.get("parts") or {}
+    if not parts or df is None or len(df) == 0:
         return None
+    # Build a synthetic skeleton + matched_parts from pattern_levels.
+    # parts is {label: {price, index}}; index is the bar position in the
+    # full-history df so we can recover ts via df.index[index].
+    pivots: list[dict] = []
+    matched_parts: dict[str, int] = {}
+    for label, p in parts.items():
+        if not isinstance(p, dict):
+            continue
+        try:
+            idx = int(p["index"])
+            price = float(p["price"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if idx < 0 or idx >= len(df):
+            continue
+        try:
+            ts = df.index[idx]
+            ts_iso = (
+                ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        # NL is a "high" pivot for BUY (DB) and a "low" for SELL (DT).
+        # H is always a high (head). LS / RS are highs (H&S) or lows
+        # (IHS). Use a heuristic: when the part label is in {NL, H, P1,
+        # P2, LS, RS} for SELL side it's a high; otherwise a low.
+        pl_side = (pl.get("side") or "").upper()
+        if label in ("B1", "B2"):
+            kind_marker = "L"
+        elif label in ("P1", "P2"):
+            kind_marker = "H"
+        elif label == "H":
+            # H = head: high in H&S (SELL), low in IHS (BUY)
+            kind_marker = "H" if pl_side == "SELL" else "L"
+        elif label in ("LS", "RS"):
+            # shoulders: same sign as H
+            kind_marker = "H" if pl_side == "SELL" else "L"
+        elif label == "NL":
+            # Neckline pivot: opposite of pattern bottoms/tops.
+            kind_marker = "H" if pl_side == "BUY" else "L"
+        elif label == "BR":
+            # Breakout direction follows side
+            kind_marker = "H" if pl_side == "BUY" else "L"
+        else:
+            kind_marker = ""
+        pivots.append({
+            "index": idx, "price": price, "ts": ts_iso,
+            "kind": kind_marker, "source": "pattern_levels",
+            "strength": 1.0,
+        })
+        matched_parts[label] = idx
+    if len(pivots) < 2:
+        return None
+    # Order pivots by bar index for the polyline.
+    pivots.sort(key=lambda p: int(p["index"]))
+    kind = pl.get("pattern_kind") or ""
     return {
-        "skeleton": skel,
-        "matched_parts": best.get("matched_parts") or {},
-        "kind": best.get("kind") or "",
-        "human_label": best.get("human_label") or "",
-        "status": best.get("status") or "",
-        "side_bias": best.get("side_bias") or "",
-        "shape_score": best.get("shape_score"),
+        "skeleton": {
+            "schema_version": "wave_skeleton_synthetic_v1",
+            "scale": "synthetic_from_pattern_levels",
+            "bars_used": len(df),
+            "pivots": pivots,
+            "atr_value": 0.0,
+            "trend_hint": pl_side or "UNKNOWN",
+        },
+        "matched_parts": matched_parts,
+        "kind": kind,
+        "human_label": _PATTERN_KIND_HUMAN_JA.get(kind, kind),
+        "status": pl.get("status") or "",
+        "side_bias": pl_side,
+        "shape_score": None,
     }
 
 
@@ -5794,6 +5983,107 @@ def _render_top_decision_card_html(
         f"{_html_escape(str(next_wait)[:160])}</div>"
         + fb_html
         + "</div>"
+    )
+
+
+def _render_g5_wave_parts_html(
+    *,
+    pattern_levels: dict,
+    wave_derived_lines: list[dict],
+) -> str:
+    """Side-panel inventory of the recognised wave's parts +
+    derived W lines. Lets the user match labels drawn on the chart
+    (B1 / B2 / P1 / P2 / LS / H / RS / NL / BR / WNL / WSL / WTP /
+    ENTRY / STOP / TP) with their numeric prices.
+
+    Reads pattern_levels.parts (canonical labels with price) and
+    pattern_levels.{trigger,stop,target}_price for the W lines.
+    """
+    pl = pattern_levels or {}
+    if not pl.get("available"):
+        return (
+            "<div class='g5-row'><h4>4b. 波形部位一覧</h4>"
+            "<p class='small'>(波形未認識 — pattern_levels.available=False)</p>"
+            "</div>"
+        )
+    kind = pl.get("pattern_kind") or ""
+    kind_ja = _PATTERN_KIND_HUMAN_JA.get(kind, kind)
+    status = pl.get("status") or "—"
+    side = pl.get("side") or "—"
+
+    def _f(v) -> str:
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):.5f}"
+        except Exception:  # noqa: BLE001
+            return str(v)
+
+    # Part rows (order matters: pattern shapes first, then NL, then BR).
+    label_order = ("B1", "B2", "P1", "P2", "LS", "H", "RS", "NL", "BR",
+                   "PH", "PL")
+    parts = pl.get("parts") or {}
+    part_rows: list[str] = []
+    for k in label_order:
+        if k not in parts:
+            continue
+        p = parts[k] or {}
+        part_rows.append(
+            f"<tr><th>{_html_escape(k)}</th>"
+            f"<td>{_f(p.get('price'))}</td></tr>"
+        )
+
+    # W-line rows (WNL/WSL/WTP) — prefer pattern_levels prices since
+    # they're the ones the integrated decision actually uses.
+    w_rows: list[str] = []
+    if pl.get("trigger_line_price") is not None:
+        w_rows.append(
+            f"<tr><th>WNL / ENTRY</th>"
+            f"<td>{_f(pl.get('trigger_line_price'))}</td></tr>"
+        )
+    if pl.get("stop_price") is not None:
+        w_rows.append(
+            f"<tr><th>WSL / STOP</th>"
+            f"<td>{_f(pl.get('stop_price'))}</td></tr>"
+        )
+    if pl.get("target_price") is not None:
+        w_rows.append(
+            f"<tr><th>WTP / TP</th>"
+            f"<td>{_f(pl.get('target_price'))}</td></tr>"
+        )
+
+    # Skeleton-fallback caution mirrors the top-card warn but in the
+    # panel (so the user sees provenance both above and beside).
+    fb_html = ""
+    if pl.get("fallback_used"):
+        fb_html = (
+            "<p class='small' style='color:#bf360c;'>"
+            "⚠ STOP / TP は skeleton から補完 "
+            f"(<code>{_html_escape(pl.get('fallback_reason') or '—')}</code>)</p>"
+        )
+
+    # Class g5-pattern-parts-panel + <h3>波形部位</h3> so the layout
+    # contract from the latest spec (data-testid-style scoping in
+    # tests) lines up. Outer wrapper still uses .g5-row so the panel
+    # CSS continues to apply.
+    return (
+        "<section class='g5-row g5-pattern-parts-panel'>"
+        "<h3>波形部位 (4b. 一覧)</h3>"
+        f"<p class='small'>"
+        f"pattern: <b>{_html_escape(kind_ja)}</b> "
+        f"({_html_escape(kind)}) / "
+        f"side: <b>{_html_escape(side)}</b> / "
+        f"status: <b>{_html_escape(status)}</b>"
+        "</p>"
+        + (
+            "<table class='g5-tbl'>"
+            "<tr><th>部位</th><th>価格</th></tr>"
+            + "".join(part_rows + w_rows) + "</table>"
+            if part_rows or w_rows else
+            "<p class='small'>(部位データなし)</p>"
+        )
+        + fb_html
+        + "</section>"
     )
 
 
@@ -6052,6 +6342,14 @@ def _render_g5_right_panel_html(
         + "</div>"
     )
 
+    # Row 4b — 波形部位一覧 (pattern_levels-driven inventory).
+    # Mirrors the labels drawn on the chart so the user can match
+    # B1 / B2 / NL / BR labels on the chart with their numeric prices.
+    wave_parts_html = _render_g5_wave_parts_html(
+        pattern_levels=pattern_levels,
+        wave_derived_lines=payload.get("wave_derived_lines") or [],
+    )
+
     # Row 5 — 未接続 / 注意
     missing = fs.get("missing_data") or []
     missing_lines = "".join(
@@ -6148,6 +6446,7 @@ def _render_g5_right_panel_html(
         + plan_html
         + fund_html
         + royal_html
+        + wave_parts_html
         + missing_html
         + unconnected_fund_html
         + auto_line_list_html
@@ -6312,20 +6611,25 @@ def _mobile_case_section_html(
         fundamental_sidebar=fundamental_sidebar_for_card,
     )
 
-    # All "developer-detail" sections fold under <details> so the mobile
-    # view stays focused on the top card + chart + side panel.
+    # The wave-only chart stays VISIBLE (not collapsed) because the
+    # whole point of Phase F/G is to show the recognised wave pattern
+    # — hiding it under <details> defeats the purpose. The remaining
+    # developer-detail sections still fold under <details> so the
+    # mobile view stays focused on top card + main chart + wave-only
+    # chart + side panel.
+    wave_only_visible_html = (
+        "<section class='wave-only-section'>"
+        f"<h3 class='gx-wave-only-heading'>"
+        f"波形専用チャート: {_html_escape(wave_only_heading)}</h3>"
+        + wave_only_html
+        + "</section>"
+        if wave_only_html else ""
+    )
     detail_sections_html = (
         "<details class='gx-detail-block'>"
         "<summary>判断橋 (bridge — どの根拠でこの結論になったか)</summary>"
         + decision_bridge_html
         + "</details>"
-        + (
-            "<details class='gx-detail-block'>"
-            "<summary>" + _html_escape(wave_only_heading) + "</summary>"
-            + wave_only_html
-            + "</details>"
-            if wave_only_html else ""
-        )
         + "<details class='gx-detail-block'>"
         "<summary>線カウントサマリ (S/R + T/X + 波形由来)</summary>"
         + line_count_html
@@ -6392,6 +6696,11 @@ def _mobile_case_section_html(
         + top_decision_card_html
         + (legend_html if legend_html else "")
         + phase_g_chart_with_panel
+        # Wave-only chart sits BETWEEN the main chart+panel row and the
+        # collapsible detail blocks. Phase F/G is a wave-shape system,
+        # so the recognised pattern's skeleton + part labels must stay
+        # visible by default (no <details>).
+        + wave_only_visible_html
         + detail_sections_html
         + "<p><a href='#case-list'>↑ back to case list</a></p>"
         + "</section>"
@@ -6446,8 +6755,51 @@ def render_visual_audit_mobile_single_file(
         ts = case.get("ts", "")
         case_label = f"{sym} @ {ts} ({action})"
         # Pick the wave overlay (best_pattern's scale) for chart drawing.
-        wave_overlay = _select_wave_overlay(payload)
+        # Pass df so the fallback path can recover ts from bar indices
+        # when synthesising an overlay from pattern_levels.
+        wave_overlay = _select_wave_overlay(payload, df=df)
         wd_lines = list(payload.get("wave_derived_lines") or [])
+        # Phase G follow-up: synthesise WNL / WSL / WTP from
+        # pattern_levels when the engine path produced no
+        # wave_derived_lines. Without this, the integrated profile
+        # leaves the chart with only WFIB labels and no W lines visible
+        # — the recognised pattern's neckline / stop / target are lost.
+        v2_for_lines = payload.get("royal_road_decision_v2") or {}
+        pl_for_lines = v2_for_lines.get("pattern_levels") or {}
+        if not wd_lines and pl_for_lines.get("available"):
+            trig = pl_for_lines.get("trigger_line_price")
+            stp  = pl_for_lines.get("stop_price")
+            tp   = pl_for_lines.get("target_price")
+            if trig is not None:
+                wd_lines.append({
+                    "id": pl_for_lines.get("trigger_line_id") or "WNL1",
+                    "kind": "neckline",
+                    "role": "entry_confirmation_line",
+                    "price": float(trig),
+                    "used_in_decision": False,
+                    "source_pattern": pl_for_lines.get("pattern_kind"),
+                    "reason_ja": "pattern_levels から復元したネックライン",
+                })
+            if stp is not None:
+                wd_lines.append({
+                    "id": "WSL1",
+                    "kind": "pattern_invalidation",
+                    "role": "stop_candidate",
+                    "price": float(stp),
+                    "used_in_decision": False,
+                    "source_pattern": pl_for_lines.get("pattern_kind"),
+                    "reason_ja": "pattern_levels から復元した損切候補",
+                })
+            if tp is not None:
+                wd_lines.append({
+                    "id": "WTP1",
+                    "kind": "pattern_target",
+                    "role": "target_candidate",
+                    "price": float(tp),
+                    "used_in_decision": False,
+                    "source_pattern": pl_for_lines.get("pattern_kind"),
+                    "reason_ja": "pattern_levels から復元した利確候補",
+                })
         # Append WFIB* lines from the fibonacci_context_review so the
         # chart overlay renders them alongside the wave-derived lines.
         # observation-only — used_in_decision is preserved (False).
@@ -6477,6 +6829,14 @@ def render_visual_audit_mobile_single_file(
                 user_annotations_payload = (
                     payload.get("user_chart_annotations") or {}
                 ).get("annotations") or []
+                # Surface entry_status onto the chart so the SVG
+                # carries the literal "WAIT BREAKOUT" / "WAIT RETEST"
+                # / "WAIT EVENT" / "READY" / "HOLD" token (Phase G
+                # follow-up — required for SVG-scoped tests).
+                _v2_for_status = (
+                    payload.get("royal_road_decision_v2") or {}
+                )
+                _ep_for_status = _v2_for_status.get("entry_plan") or {}
                 svg_xml = _build_candle_svg_xml(
                     df=df, end_ts=end_ts,
                     n_bars=int(payload.get("bars_used_in_render") or 0),
@@ -6486,6 +6846,7 @@ def render_visual_audit_mobile_single_file(
                     wave_derived_lines=wd_lines,
                     events_for_chart=events_for_chart or None,
                     user_annotations=user_annotations_payload or None,
+                    entry_status=_ep_for_status.get("entry_status"),
                 )
             except Exception:  # noqa: BLE001
                 svg_xml = None
