@@ -121,9 +121,10 @@ def test_panel_inventory_table_row_has_score(built_htmls):
     assert "score" in html or "final_score" in html
 
 
-def test_panel_renumbering_kept_manual_lines_at_8(built_htmls):
-    """Adding 7. エントリー候補 must shift 手動線操作 to 8. so the
-    section numbering stays consistent."""
+def test_panel_renumbering_after_phase_i_followup(built_htmls):
+    """Phase I follow-up adds 7. 王道手順チェック; the order is now
+    7. 王道手順チェック / 8. エントリー候補 / 9. 手動線操作."""
     html = built_htmls["double_bottom_integrated_buy_demo"]
-    assert "7. エントリー候補" in html
-    assert "8. 手動線操作" in html
+    assert "7. 王道手順チェック" in html
+    assert "8. エントリー候補" in html
+    assert "9. 手動線操作" in html

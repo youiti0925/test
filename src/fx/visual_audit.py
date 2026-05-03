@@ -1488,6 +1488,7 @@ def _build_candle_svg_xml(
     events_for_chart: list[dict] | None = None,
     user_annotations: list[dict] | None = None,
     entry_status: str | None = None,
+    entry_plan: dict | None = None,
 ) -> str | None:
     """Build the SVG candle-chart as an XML string.
 
@@ -1965,6 +1966,88 @@ def _build_candle_svg_xml(
                 f"text-anchor='middle' fill='white' "
                 f"font-weight='bold' font-size='24'>"
                 f"{_html_escape(text)}</text>"
+            )
+
+    # ── Phase I follow-up: royal-road BREAK / RETEST / CONFIRM markers
+    # Drawn after the entry-status badge so they sit on top. Phase I
+    # does not yet pin these to specific bar indices — they are placed
+    # along the trigger line near the right edge so the user can see
+    # the procedure state at a glance, and each marker carries data-
+    # attributes pointing at the entry_plan source for downstream
+    # consumers.
+    ep_for_markers = entry_plan or {}
+    if ep_for_markers:
+        trigger_line_id = (
+            ep_for_markers.get("trigger_line_id") or ""
+        )
+        trigger_line_price_raw = ep_for_markers.get("trigger_line_price")
+        try:
+            trigger_y = (
+                y_of(float(trigger_line_price_raw))
+                if trigger_line_price_raw is not None else None
+            )
+        except (TypeError, ValueError):
+            trigger_y = None
+        # Place markers along the trigger line (or just under the
+        # entry-status badge if no price is available).
+        marker_y = (
+            trigger_y if trigger_y is not None
+            else (margin_t + 56.0)
+        )
+        marker_x_break = margin_l + 12.0
+        marker_x_retest = margin_l + 110.0
+        marker_x_confirm = margin_l + 220.0
+        if bool(ep_for_markers.get("breakout_confirmed")):
+            parts.append(
+                "<g class='royal-road-markers royal-breakout'>"
+                "<rect class='royal-breakout-marker-bg' "
+                f"x='{marker_x_break:.1f}' "
+                f"y='{marker_y - 17:.1f}' width='80' height='28' "
+                "fill='#fff8e1' stroke='#ef6c00' "
+                "stroke-width='2' rx='4' opacity='0.95'/>"
+                "<text class='royal-breakout-marker' "
+                f"data-source='entry_plan' "
+                f"data-trigger-line-id='{_html_escape(trigger_line_id)}' "
+                f"x='{marker_x_break + 40:.1f}' "
+                f"y='{marker_y + 4:.1f}' text-anchor='middle' "
+                "fill='#bf360c' font-weight='bold' font-size='22'>"
+                "BREAK</text></g>"
+            )
+        if bool(ep_for_markers.get("retest_confirmed")):
+            parts.append(
+                "<g class='royal-road-markers royal-retest'>"
+                "<rect class='royal-retest-marker-bg' "
+                f"x='{marker_x_retest:.1f}' "
+                f"y='{marker_y - 17:.1f}' width='90' height='28' "
+                "fill='#e8f4ff' stroke='#1565c0' "
+                "stroke-width='2' rx='4' opacity='0.95'/>"
+                "<text class='royal-retest-marker' "
+                f"data-source='entry_plan' "
+                f"data-trigger-line-id='{_html_escape(trigger_line_id)}' "
+                f"x='{marker_x_retest + 45:.1f}' "
+                f"y='{marker_y + 4:.1f}' text-anchor='middle' "
+                "fill='#0d47a1' font-weight='bold' font-size='22'>"
+                "RETEST</text></g>"
+            )
+        confirmation_candle = (
+            ep_for_markers.get("confirmation_candle") or ""
+        )
+        if confirmation_candle:
+            parts.append(
+                "<g class='royal-road-markers royal-confirmation'>"
+                "<rect class='royal-confirmation-marker-bg' "
+                f"x='{marker_x_confirm:.1f}' "
+                f"y='{marker_y - 17:.1f}' width='110' height='28' "
+                "fill='#e8f5e9' stroke='#2e7d32' "
+                "stroke-width='2' rx='4' opacity='0.95'/>"
+                "<text class='royal-confirmation-marker' "
+                f"data-source='entry_plan' "
+                "data-confirmation-candle="
+                f"'{_html_escape(str(confirmation_candle))}' "
+                f"x='{marker_x_confirm + 55:.1f}' "
+                f"y='{marker_y + 4:.1f}' text-anchor='middle' "
+                "fill='#1b5e20' font-weight='bold' font-size='22'>"
+                "CONFIRM</text></g>"
             )
 
     # 0-line warnings — surface "no trendlines" / "no SR" inside the
@@ -3477,6 +3560,17 @@ img.thumb { width: 220px; height: auto; border: 1px solid #ddd; }
 .g5-info-panel .g5-anno-controls input[type='text'] { width: 120px; }
 .g5-info-panel .g5-anno-controls button { padding: 2px 6px;
   font-size: 11px; cursor: pointer; }
+/* Phase I follow-up — royal-road procedure checklist panel */
+.g5-royal-road-procedure-panel { font-size: 12px; }
+.g5-royal-road-procedure-panel .royal-road-procedure-summary {
+  border-left: 4px solid #1565c0; padding: 4px 8px; margin: 4px 0;
+  background: #f5faff; }
+.royal-road-procedure-table { font-size: 11px; }
+.royal-road-procedure-pass    { color: #2e7d32; font-weight: bold; }
+.royal-road-procedure-wait    { color: #ef6c00; font-weight: bold; }
+.royal-road-procedure-block   { color: #c62828; font-weight: bold; }
+.royal-road-procedure-warn    { color: #f9a825; font-weight: bold; }
+.royal-road-procedure-unknown { color: #6a6a6a; font-weight: bold; }
 /* Phase I-1/I-2 — entry candidate observation panel */
 .g5-entry-candidates-panel { font-size: 12px; }
 .g5-entry-candidates-panel .entry-candidate-selected {
@@ -6397,10 +6491,136 @@ def _render_g5_unconnected_fundamentals_html(
     )
 
 
+_PROCEDURE_STATUS_CLASS: dict = {
+    "PASS":    "royal-road-procedure-pass",
+    "WAIT":    "royal-road-procedure-wait",
+    "BLOCK":   "royal-road-procedure-block",
+    "WARN":    "royal-road-procedure-warn",
+    "UNKNOWN": "royal-road-procedure-unknown",
+}
+
+
+def _render_g5_royal_road_procedure_html(
+    checklist: dict,
+) -> str:
+    """Phase I follow-up — royal-road procedure checklist panel.
+
+    Renders the 14-step procedure checklist in canonical royal-road
+    order so the user can audit *why* the selected entry candidate
+    is READY / WAIT / HOLD. Observation-only.
+    """
+    cl = checklist or {}
+    steps = list(cl.get("steps") or [])
+
+    if not steps:
+        return (
+            "<div class='g5-row g5-royal-road-procedure-panel' "
+            "data-royal-road-procedure-schema="
+            "'royal_road_procedure_checklist_v1' "
+            "data-royal-road-step-count='0'>"
+            "<h4>7. 王道手順チェック</h4>"
+            "<p class='small'>"
+            "(royal_road_procedure_checklist が未提供 — "
+            "Phase I observation layer is dormant for this case.)"
+            "</p></div>"
+        )
+
+    summary = cl.get("summary_ja") or "—"
+    final_status = str(cl.get("final_status") or "—")
+    p0_pass = bool(cl.get("p0_pass"))
+    p0_missing = list(cl.get("p0_missing_or_blocked") or [])
+    side = str(cl.get("side") or "—")
+
+    p0_label = "PASS" if p0_pass else "NOT PASS"
+    p0_class = (
+        "royal-road-procedure-pass" if p0_pass
+        else "royal-road-procedure-block"
+    )
+
+    summary_html = (
+        "<div class='royal-road-procedure-summary'>"
+        f"<p><b>結論:</b> {_html_escape(summary)}</p>"
+        f"<p><b>final_status:</b> {_html_escape(final_status)} "
+        f"({_html_escape(side)})"
+        f" / <b>P0:</b> "
+        f"<span class='{p0_class}'>{p0_label}</span></p>"
+    )
+    if p0_missing:
+        summary_html += (
+            "<p class='small' style='color:#bf360c;'>"
+            "<b>不足/BLOCK の P0 項目:</b> "
+            + _html_escape(", ".join(p0_missing))
+            + "</p>"
+        )
+    summary_html += "</div>"
+
+    rows = ""
+    for i, s in enumerate(steps, start=1):
+        status = str(s.get("status") or "UNKNOWN").upper()
+        cls = _PROCEDURE_STATUS_CLASS.get(
+            status, "royal-road-procedure-unknown"
+        )
+        wait_or_block = ""
+        if s.get("block_reasons"):
+            wait_or_block = "block: " + ", ".join(
+                str(x) for x in (s.get("block_reasons") or [])[:4]
+            )
+        elif s.get("wait_reasons"):
+            wait_or_block = "wait: " + ", ".join(
+                str(x) for x in (s.get("wait_reasons") or [])[:4]
+            )
+        elif s.get("cautions"):
+            wait_or_block = "caution: " + ", ".join(
+                str(x) for x in (s.get("cautions") or [])[:4]
+            )
+        rows += (
+            "<tr class='royal-road-procedure-step "
+            + cls
+            + "' "
+            f"data-step-key='{_html_escape(s.get('key') or '')}' "
+            f"data-step-status='{_html_escape(status)}' "
+            f"data-step-importance='{_html_escape(s.get('importance') or '')}'>"
+            f"<td>{i}</td>"
+            f"<td>{_html_escape(s.get('label_ja') or '')}</td>"
+            f"<td><span class='{cls}'>{_html_escape(status)}</span></td>"
+            f"<td class='small'>"
+            f"{_html_escape(s.get('importance') or '')}</td>"
+            f"<td class='small'>"
+            f"{_html_escape(s.get('condition_ja') or '')}</td>"
+            f"<td class='small'>"
+            f"{_html_escape(s.get('result_ja') or '')}</td>"
+            f"<td class='small'>{_html_escape(wait_or_block)}</td>"
+            "</tr>"
+        )
+
+    table_html = (
+        "<table class='g5-tbl royal-road-procedure-table'>"
+        "<tr><th>順</th><th>項目</th><th>状態</th><th>P</th>"
+        "<th>条件</th><th>結果</th><th>不足/待ち/注意</th></tr>"
+        + rows
+        + "</table>"
+    )
+
+    return (
+        "<div class='g5-row g5-royal-road-procedure-panel' "
+        "data-royal-road-procedure-schema="
+        "'royal_road_procedure_checklist_v1' "
+        f"data-royal-road-step-count='{len(steps)}' "
+        f"data-royal-road-p0-pass='{int(p0_pass)}' "
+        f"data-royal-road-final-status='{_html_escape(final_status)}'>"
+        "<h4>7. 王道手順チェック</h4>"
+        + summary_html
+        + table_html
+        + "</div>"
+    )
+
+
 def _render_g5_entry_candidates_html(
     *,
     selected: dict,
     candidates: list,
+    royal_road_p0_pass: bool | None = None,
+    royal_road_p0_missing: list | None = None,
 ) -> str:
     """Phase I-1/I-2 — entry-candidate observation panel.
 
@@ -6409,6 +6629,10 @@ def _render_g5_entry_candidates_html(
     cautions, so the user can audit which entry method was picked
     and why the others were rejected. Phase I never overrides
     entry_plan_v1 — this is a pure observation view.
+
+    `royal_road_p0_pass` / `royal_road_p0_missing` are surfaced from
+    the procedure checklist so the user can see the 王道P0 verdict
+    next to the selected candidate without scrolling.
     """
     sel = selected or {}
     cands = list(candidates or [])
@@ -6449,13 +6673,31 @@ def _render_g5_entry_candidates_html(
             return "entry-candidate-watch"
         return "entry-candidate-hold"
 
+    p0_label = ""
+    if royal_road_p0_pass is True:
+        p0_label = (
+            "<p class='royal-road-procedure-pass'>"
+            "<b>王道P0:</b> PASS</p>"
+        )
+    elif royal_road_p0_pass is False:
+        miss_txt = (
+            ", ".join(str(x) for x in (royal_road_p0_missing or []))
+            or "—"
+        )
+        p0_label = (
+            "<p class='royal-road-procedure-block'>"
+            f"<b>王道P0:</b> NOT PASS / 不足: {_html_escape(miss_txt)}"
+            "</p>"
+        )
+
     if not sel and not cands:
         return (
             "<div class='g5-row g5-entry-candidates-panel' "
             "data-entry-candidate-schema='entry_candidate_v1' "
             "data-entry-candidates-count='0'>"
-            "<h4>7. エントリー候補</h4>"
-            "<p class='small'>"
+            "<h4>8. エントリー候補</h4>"
+            + p0_label
+            + "<p class='small'>"
             "(entry_candidates / selected_entry_candidate なし — "
             "Phase I observation layer is dormant for this case.)"
             "</p></div>"
@@ -6554,12 +6796,18 @@ def _render_g5_entry_candidates_html(
 
     sel_schema = sel.get("schema_version") or "entry_candidate_v1"
     sel_type = sel.get("entry_type") or ""
+    p0_attr = (
+        "1" if royal_road_p0_pass is True
+        else ("0" if royal_road_p0_pass is False else "")
+    )
     return (
         "<div class='g5-row g5-entry-candidates-panel' "
         f"data-entry-candidate-schema='{_html_escape(sel_schema)}' "
         f"data-entry-candidates-count='{len(cands)}' "
-        f"data-selected-entry-candidate-type='{_html_escape(sel_type)}'>"
-        "<h4>7. エントリー候補</h4>"
+        f"data-selected-entry-candidate-type='{_html_escape(sel_type)}' "
+        f"data-royal-road-p0-pass='{p0_attr}'>"
+        "<h4>8. エントリー候補</h4>"
+        + p0_label
         + sel_html
         + list_html
         + "</div>"
@@ -6575,15 +6823,17 @@ def _render_g5_right_panel_html(
 ) -> str:
     """Phase G.5 — right info panel that sits beside the chart.
 
-    Eight rows per spec:
+    Nine rows per spec:
       1. 現在の状態 (entry_status / final action)
       2. エントリープラン (entry / stop / target / RR)
       3. ファンダ・イベント (next event + macro drivers + risk status)
       4. 王道根拠 (axis summary)
       5. 未接続 / 注意 (missing data + cautions)
       6. 自動線一覧 / 6b. 検出統計
-      7. エントリー候補 (Phase I-1/I-2 observation panel)
-      8. 手動線操作 (manual annotation controls — interactive)
+      7. 王道手順チェック (Phase I follow-up procedure checklist)
+      8. エントリー候補 (Phase I-1/I-2 observation panel — carries
+         the 王道P0 verdict from row 7)
+      9. 手動線操作 (manual annotation controls — interactive)
     """
     fs = payload.get("fundamental_sidebar") or {}
     integrated = v2.get("integrated_decision") or {}
@@ -6806,18 +7056,35 @@ def _render_g5_right_panel_html(
         + "</div>"
     )
 
-    # Row 7 — エントリー候補 (Phase I-1/I-2 observation panel).
+    # Row 7 — 王道手順チェック (Phase I follow-up).
+    royal_road_checklist = (
+        v2.get("royal_road_procedure_checklist") or {}
+    )
+    royal_road_panel_html = _render_g5_royal_road_procedure_html(
+        royal_road_checklist
+    )
+
+    # Row 8 — エントリー候補 (Phase I-1/I-2 observation panel) — now
+    # carries the royal-road P0 verdict so users see "READY because
+    # of what" without scrolling to row 7.
     entry_candidates_html = _render_g5_entry_candidates_html(
         selected=v2.get("selected_entry_candidate") or {},
         candidates=v2.get("entry_candidates") or [],
+        royal_road_p0_pass=(
+            royal_road_checklist.get("p0_pass")
+            if royal_road_checklist else None
+        ),
+        royal_road_p0_missing=list(
+            royal_road_checklist.get("p0_missing_or_blocked") or []
+        ),
     )
 
-    # Row 8 — 手動線操作 (interactive, static-HTML)
+    # Row 9 — 手動線操作 (interactive, static-HTML)
     sym = payload.get("symbol") or ""
     tf = (payload.get("interval") or payload.get("timeframe") or "1h")
     annotations_html = (
         "<div class='g5-row g5-anno-row'>"
-        "<h4>8. 手動線操作</h4>"
+        "<h4>9. 手動線操作</h4>"
         "<p class='small'>"
         "manual_line_policy = <b>display_only</b> (初期値、安全側)。"
         "ここで追加した線は表示のみ。BUY/SELL 判断には影響しません。"
@@ -6872,6 +7139,7 @@ def _render_g5_right_panel_html(
         + unconnected_fund_html
         + auto_line_list_html
         + detection_stats_html
+        + royal_road_panel_html
         + entry_candidates_html
         + annotations_html
         + "</aside>"
@@ -7334,6 +7602,7 @@ def render_visual_audit_mobile_single_file(
                     events_for_chart=events_for_chart or None,
                     user_annotations=user_annotations_payload or None,
                     entry_status=_ep_for_status.get("entry_status"),
+                    entry_plan=_ep_for_status,
                 )
             except Exception:  # noqa: BLE001
                 svg_xml = None

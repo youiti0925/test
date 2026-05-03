@@ -814,6 +814,10 @@ class RoyalRoadDecisionV2Slice:
     # for legacy v2 / v1 / current_runtime callers.
     entry_candidates: list = field(default_factory=list)
     selected_entry_candidate: dict = field(default_factory=dict)
+    # Phase I follow-up: royal-road procedure checklist
+    # (integrated profile only). Empty default again preserves
+    # byte-identical legacy traces.
+    royal_road_procedure_checklist: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -881,6 +885,10 @@ class RoyalRoadDecisionV2Slice:
             # Phase I-1/I-2 entry-candidate observation layer.
             "entry_candidates": list(self.entry_candidates),
             "selected_entry_candidate": dict(self.selected_entry_candidate),
+            # Phase I follow-up royal-road procedure checklist.
+            "royal_road_procedure_checklist": dict(
+                self.royal_road_procedure_checklist
+            ),
         }
 
     @classmethod
@@ -935,6 +943,10 @@ class RoyalRoadDecisionV2Slice:
             entry_candidates=list(adv.get("entry_candidates") or []),
             selected_entry_candidate=dict(
                 adv.get("selected_entry_candidate") or {}
+            ),
+            # Phase I follow-up royal-road procedure checklist.
+            royal_road_procedure_checklist=dict(
+                adv.get("royal_road_procedure_checklist") or {}
             ),
         )
 

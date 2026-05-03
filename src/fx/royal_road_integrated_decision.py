@@ -38,7 +38,7 @@ Strict invariants:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Final
 
 import pandas as pd
@@ -65,6 +65,7 @@ from .pattern_level_derivation import derive_pattern_levels
 from .pattern_shape_review import build_pattern_shape_review
 from .patterns import PatternResult
 from .risk_gate import RiskState, evaluate as evaluate_gate
+from .royal_road_procedure import build_royal_road_procedure_checklist
 from .stop_modes import DEFAULT_STOP_MODE, plan_stop
 from .support_resistance import detect_levels
 from .trendlines import detect_trendlines
@@ -1366,6 +1367,32 @@ def _build_panels_from_df(
             blocking_event_minutes_until=first.get("minutes_until"),
         )
 
+    # ── Phase I follow-up: royal-road procedure checklist ──────────
+    # Build the ordered procedure checklist BEFORE the entry-candidate
+    # so the candidate's debug carries the checklist summary, and so
+    # the panels dict can surface the checklist alongside the entry
+    # candidates. Observation-only — never changes entry_plan or the
+    # final action.
+    sr_dict = (
+        sr_snapshot.to_dict() if sr_snapshot is not None else {}
+    )
+    tl_dict = (
+        trendline_ctx.to_dict() if trendline_ctx is not None else {}
+    )
+    royal_road_checklist = build_royal_road_procedure_checklist(
+        entry_plan=entry_plan,
+        pattern_levels=pattern_levels,
+        wave_derived_lines=wave_derived or [],
+        breakout_quality_gate=breakout_quality_gate or {},
+        fundamental_sidebar=fundamental_sidebar or {},
+        support_resistance_v2=sr_dict,
+        trendline_context=tl_dict,
+        dow_structure_review=dow or {},
+        candlestick_anatomy_review=candle or {},
+        min_rr=MIN_RISK_REWARD,
+    )
+    royal_road_checklist_dict = royal_road_checklist.to_dict()
+
     # ── Phase I-1/I-2: entry-candidate observation layer ─────────
     # Build entry candidates from the existing entry_plan. For now this
     # only produces a single "neckline_retest" candidate so the schema
@@ -1384,12 +1411,8 @@ def _build_panels_from_df(
         wave_derived_lines=wave_derived or [],
         breakout_quality_gate=breakout_quality_gate or {},
         fundamental_sidebar=fundamental_sidebar or {},
-        support_resistance_v2=(
-            sr_snapshot.to_dict() if sr_snapshot is not None else {}
-        ),
-        trendline_context=(
-            trendline_ctx.to_dict() if trendline_ctx is not None else {}
-        ),
+        support_resistance_v2=sr_dict,
+        trendline_context=tl_dict,
         dow_structure_review=dow or {},
         ma_context_review=ma_panel or {},
         candlestick_anatomy_review=candle or {},
@@ -1407,6 +1430,33 @@ def _build_panels_from_df(
         entry_plan=entry_plan,
         ctx=entry_ctx,
     )
+    # Inject the royal-road procedure summary into each candidate's
+    # debug dict so the visual_audit candidate panel can show why a
+    # candidate is READY / WAIT / HOLD without re-running the rules.
+    entry_candidates = [
+        replace(
+            c,
+            debug={
+                **dict(c.debug),
+                "royal_road_procedure_summary":
+                    royal_road_checklist_dict.get("summary_ja"),
+                "royal_road_p0_pass":
+                    royal_road_checklist_dict.get("p0_pass"),
+                "royal_road_p0_missing_or_blocked": list(
+                    royal_road_checklist_dict.get(
+                        "p0_missing_or_blocked"
+                    ) or []
+                ),
+                "royal_road_wait_reasons": list(
+                    royal_road_checklist_dict.get("wait_reasons") or []
+                ),
+                "royal_road_block_reasons": list(
+                    royal_road_checklist_dict.get("block_reasons") or []
+                ),
+            },
+        )
+        for c in entry_candidates
+    ]
     selected_entry_candidate = select_best_entry_candidate(entry_candidates)
     # Merge selector metadata into entry_plan without overwriting any
     # core entry_plan_v1 field (Phase I must not change action gating).
@@ -1454,6 +1504,8 @@ def _build_panels_from_df(
         # Phase I-1/I-2 — entry candidate observation layer.
         "entry_candidates": [c.to_dict() for c in entry_candidates],
         "selected_entry_candidate": selected_entry_candidate.to_dict(),
+        # Phase I follow-up — royal-road procedure checklist.
+        "royal_road_procedure_checklist": royal_road_checklist_dict,
     }
 
 
@@ -1600,6 +1652,10 @@ def decide_royal_road_v2_integrated(
                 )
                 gate_advisory["selected_entry_candidate"] = (
                     gate_panels.get("selected_entry_candidate") or {}
+                )
+                # Phase I follow-up — royal-road procedure checklist.
+                gate_advisory["royal_road_procedure_checklist"] = (
+                    gate_panels.get("royal_road_procedure_checklist") or {}
                 )
         elif rs_events:
             # Non-event-driven block but events present — just surface
@@ -1858,6 +1914,9 @@ def decide_royal_road_v2_integrated(
         # Phase I-1/I-2 — entry candidate observation layer.
         "entry_candidates":          panels.get("entry_candidates") or [],
         "selected_entry_candidate":  panels.get("selected_entry_candidate") or {},
+        # Phase I follow-up — royal-road procedure checklist.
+        "royal_road_procedure_checklist":
+            panels.get("royal_road_procedure_checklist") or {},
     }
 
     chain.extend([f"side_bias:{side_bias}", f"action:{action}"])
