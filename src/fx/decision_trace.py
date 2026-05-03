@@ -799,6 +799,16 @@ class RoyalRoadDecisionV2Slice:
     best_setup: dict | None = None
     reconstruction_quality: dict = field(default_factory=dict)
     multi_scale_chart: dict = field(default_factory=dict)
+    # Phase F + G: integrated profile carries these. Defaults None
+    # so legacy v2 / v1 / current_runtime traces keep their byte-
+    # identical shape.
+    integrated_decision: dict | None = None
+    pattern_levels: dict | None = None
+    entry_plan: dict | None = None
+    breakout_quality_gate: dict | None = None
+    fundamental_sidebar: dict | None = None
+    wave_shape_review: dict | None = None
+    wave_derived_lines: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -837,6 +847,32 @@ class RoyalRoadDecisionV2Slice:
             ),
             "reconstruction_quality": dict(self.reconstruction_quality),
             "multi_scale_chart": dict(self.multi_scale_chart),
+            # Phase F + G fields (integrated profile only)
+            "integrated_decision": (
+                dict(self.integrated_decision)
+                if self.integrated_decision is not None else None
+            ),
+            "pattern_levels": (
+                dict(self.pattern_levels)
+                if self.pattern_levels is not None else None
+            ),
+            "entry_plan": (
+                dict(self.entry_plan)
+                if self.entry_plan is not None else None
+            ),
+            "breakout_quality_gate": (
+                dict(self.breakout_quality_gate)
+                if self.breakout_quality_gate is not None else None
+            ),
+            "fundamental_sidebar": (
+                dict(self.fundamental_sidebar)
+                if self.fundamental_sidebar is not None else None
+            ),
+            "wave_shape_review": (
+                dict(self.wave_shape_review)
+                if self.wave_shape_review is not None else None
+            ),
+            "wave_derived_lines": list(self.wave_derived_lines),
         }
 
     @classmethod
@@ -878,6 +914,15 @@ class RoyalRoadDecisionV2Slice:
             best_setup=adv.get("best_setup"),
             reconstruction_quality=dict(adv.get("reconstruction_quality") or {}),
             multi_scale_chart=dict(adv.get("multi_scale_chart") or {}),
+            # Phase F + G — only the integrated profile populates these.
+            # Legacy v2 / v1 / current_runtime leave them None.
+            integrated_decision=adv.get("integrated_decision"),
+            pattern_levels=adv.get("pattern_levels"),
+            entry_plan=adv.get("entry_plan"),
+            breakout_quality_gate=adv.get("breakout_quality_gate"),
+            fundamental_sidebar=adv.get("fundamental_sidebar"),
+            wave_shape_review=adv.get("wave_shape_review"),
+            wave_derived_lines=list(adv.get("wave_derived_lines") or []),
         )
 
 
