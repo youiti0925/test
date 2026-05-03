@@ -66,6 +66,11 @@ def test_payload_emits_required_top_level_keys():
         "masterclass_panels",
         # Decision bridge (USED / PARTIAL / AUDIT_ONLY / NOT_CONNECTED)
         "decision_bridge",
+        # Phase G — fundamental_sidebar_v1 + user_chart_annotations.
+        # Both are observation-only and may be None for the legacy v2
+        # path (the integrated profile populates them).
+        "fundamental_sidebar",
+        "user_chart_annotations",
     }
     assert set(p.keys()) == expected
     assert p["schema_version"] == SCHEMA_VERSION
