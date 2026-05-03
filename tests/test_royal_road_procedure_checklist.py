@@ -124,6 +124,54 @@ def test_checklist_to_dict_round_trip_includes_steps_and_aggregates():
 
 
 # ─────────────────────────────────────────────────────────────────
+# confirmation_candle is P0-required (matches entry_plan_v1's
+# "trigger broken + retest + confirmation candle + stop / target +
+# RR ≥ 2.0" READY contract — confirmation candle is necessary for
+# neckline_retest READY, not optional context).
+# ─────────────────────────────────────────────────────────────────
+
+
+def test_confirmation_candle_is_p0_required_step():
+    data = _ready_inputs()
+    checklist = build_royal_road_procedure_checklist(**data)
+    d = checklist.to_dict()
+
+    confirmation = next(
+        s for s in d["steps"]
+        if s["key"] == "confirmation_candle"
+    )
+
+    assert confirmation["importance"] == "P0"
+    assert confirmation["status"] == "PASS"
+
+
+def test_missing_confirmation_candle_blocks_p0_after_retest():
+    data = _ready_inputs()
+    data["entry_plan"] = {
+        **data["entry_plan"],
+        "entry_status": "WAIT_TRIGGER",
+        "entry_price": None,
+        "breakout_confirmed": True,
+        "retest_confirmed": True,
+        "confirmation_candle": "",
+    }
+
+    checklist = build_royal_road_procedure_checklist(**data)
+    d = checklist.to_dict()
+
+    confirmation = next(
+        s for s in d["steps"]
+        if s["key"] == "confirmation_candle"
+    )
+
+    assert confirmation["importance"] == "P0"
+    assert confirmation["status"] == "WAIT"
+    assert d["p0_pass"] is False
+    assert "confirmation_candle" in d["p0_missing_or_blocked"]
+    assert "awaiting_confirmation_candle" in d["wait_reasons"]
+
+
+# ─────────────────────────────────────────────────────────────────
 # Happy path — READY
 # ─────────────────────────────────────────────────────────────────
 

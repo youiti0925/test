@@ -98,6 +98,41 @@ def test_ready_page_summary_says_ready(built_htmls):
     assert "王道手順のP0条件が揃っているためREADY" in html
 
 
+def test_visual_audit_confirmation_candle_is_shown_as_required_step(
+    built_htmls,
+):
+    """The confirmation-candle step is P0-required and must surface
+    that fact in the rendered procedure panel. Scoped to the panel
+    block so we don't accidentally match a "P0" / "ローソク足確認"
+    appearing elsewhere in the HTML."""
+    html = built_htmls["double_top_integrated_sell_demo"]
+
+    panel_match = re.search(
+        r"<div class='g5-row g5-royal-road-procedure-panel'"
+        r"[\s\S]*?</table>",
+        html,
+    )
+    assert panel_match, "royal-road procedure panel not found"
+    panel = panel_match.group(0)
+
+    # Step row is rendered with data-step-key + data-step-importance.
+    cc_row = re.search(
+        r"data-step-key='confirmation_candle' "
+        r"data-step-status='([A-Z_]+)' "
+        r"data-step-importance='([A-Z0-9]+)'",
+        panel,
+    )
+    assert cc_row, "confirmation_candle row not found in panel"
+    assert cc_row.group(2) == "P0", (
+        f"confirmation_candle must be P0 but rendered as "
+        f"{cc_row.group(2)!r}"
+    )
+    # 9. ローソク足確認 row is visible to the user.
+    assert "ローソク足確認" in panel
+    # P0 column header ("P") + at least one P0 cell are present.
+    assert "P0" in panel
+
+
 def test_wait_breakout_page_surfaces_wnl_not_broken(built_htmls):
     html = built_htmls["wait_breakout_demo"]
     assert "7. 王道手順チェック" in html

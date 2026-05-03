@@ -15,7 +15,7 @@ Royal-road order (locked):
   6. wave_lines            – WNL / WSL / WTP
   7. breakout_confirmed    – WNL / trigger ブレイクの確認
   8. retest_confirmed      – リターンムーブの確認
-  9. confirmation_candle   – ローソク足の確認
+  9. confirmation_candle   – ローソク足の確認 (P0必須)
  10. entry_price           – ENTRY
  11. stop_price            – STOP
  12. target_price          – TP
@@ -465,9 +465,10 @@ def build_royal_road_procedure_checklist(
         cc_result = "リターンムーブ確認後にローソク確認します。"
         cc_waits = ["awaiting_retest_first"]
     steps.append(_step(
-        "confirmation_candle", "ローソク足確認", cc_status, "P1",
+        "confirmation_candle", "ローソク足確認", cc_status, "P0",
         condition_ja=(
             "リターンムーブ後、方向に沿った確認ローソクが出ていること。"
+            "通常の neckline_retest READY では必須条件。"
         ),
         result_ja=cc_result,
         evidence={
