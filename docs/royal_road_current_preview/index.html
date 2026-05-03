@@ -1,0 +1,562 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>現在の王道判断プレビュー (Phase F/G + 改修版)</title>
+  <style>
+    body {
+      font-family: -apple-system, sans-serif;
+      margin: 12px;
+      color: #222;
+      line-height: 1.6;
+    }
+    h1 { font-size: 20px; margin-bottom: 4px; }
+    h2 { font-size: 16px; margin-top: 22px; }
+    h3 { font-size: 14px; margin-top: 16px; }
+    ul, ol { padding-left: 22px; }
+    li { margin: 6px 0; }
+    a { color: #1565c0; text-decoration: none; font-weight: 600; }
+    a:hover, a:active { text-decoration: underline; }
+    .meta { color:#666; font-size:13px; margin-top:0; }
+    .what-to-check {
+      background: #e8f4ff;
+      border: 2px solid #1565c0;
+      padding: 10px 14px;
+      border-radius: 6px;
+      margin: 12px 0 16px;
+    }
+    .what-to-check h2 { margin-top: 0; color: #0d47a1; }
+    .changelog {
+      background: #fff3e0;
+      border: 2px solid #ef6c00;
+      padding: 10px 14px;
+      border-radius: 6px;
+      margin: 8px 0 16px;
+    }
+    .changelog h2 { margin-top: 0; color: #bf360c; }
+    .demo-card {
+      border: 1px solid #ccc;
+      padding: 10px 14px;
+      border-radius: 6px;
+      margin: 10px 0;
+      background: #fafafa;
+    }
+    .demo-card.demo-fixture {
+      background: #fff8e1;
+      border-color: #f9a825;
+    }
+    .demo-card.demo-real {
+      background: #f5fff5;
+      border-color: #2e7d32;
+    }
+    .demo-card .label-fixture {
+      display: inline-block;
+      background: #f9a825;
+      color: white;
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 11px;
+      margin-left: 6px;
+      vertical-align: middle;
+    }
+    .demo-card .label-real {
+      display: inline-block;
+      background: #2e7d32;
+      color: white;
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 11px;
+      margin-left: 6px;
+      vertical-align: middle;
+    }
+    .check-points {
+      margin: 6px 0 0;
+      padding-left: 18px;
+      font-size: 13px;
+      color: #444;
+    }
+    .check-points li { margin: 2px 0; }
+    .legend-table {
+      width: 100%; border-collapse: collapse; font-size: 13px;
+      margin-top: 8px;
+    }
+    .legend-table th, .legend-table td {
+      border: 1px solid #ddd; padding: 4px 8px; text-align: left;
+      vertical-align: top;
+    }
+    .legend-table th {
+      background: #f0f0f0;
+    }
+    .footer {
+      color: #888;
+      font-size: 12px;
+      margin-top: 24px;
+      border-top: 1px solid #eee;
+      padding-top: 12px;
+    }
+    code { background: #eee; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+    .pill {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 11px;
+      font-weight: 600;
+      color: #fff;
+      vertical-align: middle;
+    }
+    .pill-ready { background: #2e7d32; }
+    .pill-wait  { background: #ef6c00; }
+    .pill-block { background: #c62828; }
+    .pill-hold  { background: #6a6a6a; }
+    @media (max-width: 800px) {
+      body { margin: 8px; }
+      h1 { font-size: 18px; }
+      h2 { font-size: 15px; }
+      h3 { font-size: 13px; }
+    }
+  </style>
+</head>
+<body>
+  <h1>現在の王道判断プレビュー (Phase F / G / I + 構造ライン)</h1>
+  <p class="meta">
+    ブランチ: <code>artifact/visual-audit-mobile-preview</code><br>
+    生成元 commit: <code>dd3bd31</code> (<code>feat/royal-road-complete-v2</code>)<br>
+    プロファイル: <code>royal_road_decision_v2_integrated</code>
+  </p>
+
+  <div class="changelog">
+    <h2>今回の追加 (Phase I 続き — 王道波形構造から導く線)</h2>
+    <p>「数値で引けた線」と「波形構造から引くべき王道線」を分けて
+    表示できるようにしました。既存の <code>detect_trendlines</code> /
+    <code>trendline_context</code> / <code>support_resistance_v2</code> は
+    そのまま残し、その横に新しい <code>structural_lines</code> 層を
+    追加しています。</p>
+    <ul>
+      <li>新セクション <b>「8. 構造ライン」</b>: 各構造ラインを
+        <code>id</code> / <code>kind</code> / <code>role</code> /
+        <code>source</code> / <code>anchor_parts</code> /
+        <code>price</code> or <code>slope</code> /
+        <code>numeric_alignment</code> + 引いた理由 (<code>reason_ja</code>)
+        付きで表示。</li>
+      <li>線の種類:
+        <code>SNL</code> (structural neckline / NL由来),
+        <code>SIL</code> (structural invalidation / P2/B2由来),
+        <code>STP</code> (structural target / BR由来),
+        <code>STL</code> (structural trendline / DT P1↔P2 / DB B1↔B2 /
+        ダウHL-HL / LH-LH 由来)。</li>
+      <li>数値検出ライン (<code>T1</code>/<code>T2</code>/<code>T3</code>) と
+        構造ライン (<code>STL</code>/<code>SNL</code>/<code>SIL</code>/
+        <code>STP</code>) を <b>別CSSクラス</b> でチャートに描画。
+        混同しません。</li>
+      <li>構造トレンドラインと数値トレンドラインの slope を比較し、
+        <code>MATCH</code> / <code>NEAR</code> / <code>CONFLICT</code> /
+        <code>NONE</code> / <code>UNKNOWN</code> を表示。
+        <code>CONFLICT</code> は「自動トレンドライン検出が人間の波形構造と
+        ズレている可能性」を示します。</li>
+      <li>王道手順チェックの「トレンドライン」「重要水平線」「Wライン」
+        ステップが構造ラインを evidence として読むよう更新。
+        構造ラインだけ存在する場合は PASS、数値だけなら WARN、
+        両方あって CONFLICT なら WARN として可視化されます。</li>
+      <li>「9. エントリー候補」パネルの <code>debug</code> に
+        <code>structural_lines_count</code>,
+        <code>structural_neckline_ids</code>,
+        <code>structural_trendline_ids</code>,
+        <code>numeric_structural_alignment</code> を追加。</li>
+      <li>セクション順を再番号: 7. 王道手順チェック / 8. 構造ライン /
+        9. エントリー候補 / 10. 手動線操作。</li>
+    </ul>
+    <p>本ページの 8 サンプルでは、各ページに 4–5 本の構造ラインが
+    生成され、READY ページの <code>SNL1</code>/<code>SIL1</code>/<code>STP1</code>
+    が <code>WNL</code>/<code>WSL</code>/<code>WTP</code> と同じ価格に
+    引かれていることを確認できます。一部ページでは構造 STL の slope と
+    数値 T1 の slope が CONFLICT となっており、これは設計通りの
+    「線引き根拠が一致していない」というサインです。</p>
+    <p>テスト: <code>tests/test_structural_lines.py</code> 16/16 PASS、
+    <code>tests/test_visual_audit_structural_lines.py</code> 9/9 PASS、
+    <code>tests/test_royal_road_procedure_checklist.py</code> 18/18 PASS、
+    <code>tests/test_visual_audit_royal_road_procedure.py</code> 13/13 PASS、
+    <code>tests/test_entry_candidates.py</code> 26/26 PASS、
+    <code>tests/test_visual_audit_entry_candidates.py</code> 7/7 PASS、
+    geometry 14/14 PASS、decision_trace + v2 + integrated 65/65 PASS。
+    既存の <code>detect_trendlines</code> / <code>trendline_context</code> /
+    <code>support_resistance_v2</code> /
+    <code>entry_plan</code> / 最終 <code>action</code> /
+    <code>current_runtime</code> / <code>live</code> /
+    <code>OANDA</code> / <code>paper</code> はいずれも触っていません。</p>
+  </div>
+
+  <div class="changelog">
+    <h2>前回の小修正 (確認足を P0必須 へ)</h2>
+    <p>王道手順チェックリストの <code>confirmation_candle</code>
+    (ローソク足確認) ステップを <b>P1 → P0</b> に修正しました。
+    既存 <code>entry_plan_v1</code> の READY 契約
+    (<i>trigger broken + retest confirmed + confirmation candle +
+    stop / target + RR ≥ 2.0</i>) では確認足は必須条件であり、
+    P1 (補助) ではなく P0 (必須) として扱われます。</p>
+    <ul>
+      <li>本ページの 8 サンプルでは、
+        確認足が出ていない <code>WAIT_BREAKOUT</code> /
+        <code>WAIT_RETEST</code> ページの
+        「8. エントリー候補」パネルに
+        <b>「王道P0: NOT PASS / 不足: confirmation_candle」</b>
+        が出るようになりました。</li>
+      <li><code>READY</code> ページではこれまで通り
+        「王道P0: PASS」、確認足は <code>PASS</code> のままです。</li>
+    </ul>
+    <p>テスト: <code>tests/test_royal_road_procedure_checklist.py</code>
+    18/18 PASS、<code>tests/test_visual_audit_royal_road_procedure.py</code>
+    13/13 PASS、<code>tests/test_entry_candidates.py</code> 26/26 PASS、
+    <code>tests/test_visual_audit_entry_candidates.py</code> 7/7 PASS、
+    geometry 14/14 PASS、decision_trace + v2 + integrated 65/65 PASS。
+    既存 <code>entry_plan</code> READY 条件・最終 <code>action</code>・
+    <code>current_runtime</code>・<code>live</code>/<code>OANDA</code>/
+    <code>paper</code> は触っていません。</p>
+  </div>
+
+  <div class="changelog">
+    <h2>前回の追加 (Phase I 続き — 王道手順チェックを接続)</h2>
+    <p>「READY と表示されても、何が揃ったから READY なのか分からない」
+    というユーザー指摘に対応するため、<b>王道手順チェックリスト</b>
+    を <code>EntryCandidate</code> と接続しました。観測・表示専用で、
+    既存の <code>entry_plan_v1</code> READY 条件・最終 <code>action</code>・
+    <code>current_runtime</code>・<code>live</code>/<code>OANDA</code>/
+    <code>paper</code> は 1 ピクセルも変えていません。</p>
+    <ul>
+      <li>新セクション <b>「7. 王道手順チェック」</b>: 環境認識 →
+        ダウ理論 → 重要水平線 → トレンドライン → 波形認識 →
+        Wライン (WNL/WSL/WTP) → ブレイク確認 → リターンムーブ確認 →
+        ローソク足確認 → ENTRY → STOP → TP → RR → イベント確認
+        の 14 項目を、王道の順番で必ず表示。各行に
+        <code>PASS</code> / <code>WAIT</code> / <code>BLOCK</code> /
+        <code>WARN</code> / <code>UNKNOWN</code> と
+        条件 / 結果 / 不足理由を表示。</li>
+      <li>「8. エントリー候補」パネルに <b>「王道P0: PASS / NOT PASS」</b>
+        バッジを追加。NOT PASS のときは不足項目
+        (例: <code>retest_confirmed</code>, <code>wave_lines</code>) を
+        その場で表示。</li>
+      <li>各 <code>EntryCandidate.debug</code> に
+        <code>royal_road_procedure_summary</code>,
+        <code>royal_road_p0_pass</code>,
+        <code>royal_road_p0_missing_or_blocked</code>,
+        <code>royal_road_wait_reasons</code>,
+        <code>royal_road_block_reasons</code> を追加。</li>
+      <li>チャート上に <b><code>BREAK</code> / <code>RETEST</code> /
+        <code>CONFIRM</code> マーカー</b> を追加。
+        <code>breakout_confirmed</code> /
+        <code>retest_confirmed</code> /
+        <code>confirmation_candle</code> が真のときのみ表示。
+        各マーカーは
+        <code>data-source='entry_plan'</code> /
+        <code>data-trigger-line-id='WNL1'</code> 等の
+        <code>data-*</code> 属性を保持。</li>
+      <li>WAIT_EVENT_CLEAR では、テクニカル条件 (波形 / Wライン /
+        BREAK / RETEST / CONFIRM / ENTRY / STOP / TP / RR) を
+        <b>残したまま</b>、<code>環境認識</code> と
+        <code>イベント確認</code> だけ <code>BLOCK</code> になる
+        構成を維持しています。</li>
+      <li>セクション順を再番号: 7. 王道手順チェック / 8. エントリー候補 /
+        9. 手動線操作。</li>
+    </ul>
+    <p>本ページの 8 件のサンプルでは、READY ページ (double_bottom /
+    double_top / normal_balanced) が <code>王道P0: PASS</code> +
+    BREAK + RETEST + CONFIRM の 3 マーカー、wait_retest が
+    BREAK のみ、wait_breakout が マーカーなし、wait_event_clear は
+    全マーカーが残ったまま「イベント待ち」となっています。</p>
+    <p>テスト: <code>tests/test_royal_road_procedure_checklist.py</code>
+    16/16 PASS、<code>tests/test_visual_audit_royal_road_procedure.py</code>
+    12/12 PASS、<code>tests/test_visual_audit_entry_candidates.py</code>
+    6/6 PASS、<code>tests/test_entry_candidates.py</code> 26/26 PASS、
+    geometry 14/14 PASS、decision_trace + v2 + integrated 65/65 PASS。</p>
+  </div>
+
+  <div class="changelog">
+    <h2>前回の追加 (Phase I-1/I-2 — エントリー候補基盤)</h2>
+    <p>右側パネルに <b>「7. エントリー候補」</b> セクションを新設しました。
+    これは観測・表示専用の基盤で、今までの <code>entry_plan_v1</code> や
+    最終 <code>action</code> は 1 ピクセルも変えていません。</p>
+    <ul>
+      <li><b>EntryCandidate / EntryMethodContext</b> スキーマを追加
+        (<code>entry_candidate_v1</code>)。</li>
+      <li>共通ハードゲート: イベント中の <code>READY</code> →
+        <code>WAIT_EVENT_CLEAR</code> 降格、entry/stop/target 不在 / RR 不足 /
+        逆向き価格順 / stop_quality=BAD / target_clearance=BLOCKED /
+        breakout_quality=BLOCK で <code>HOLD</code>。
+        既に <code>WAIT_*</code> / <code>WATCH</code> / <code>HOLD</code>
+        の候補は触りません。</li>
+      <li>セレクタ: READY が複数あれば <code>final_score</code> 最高、
+        それ以外は WAIT 状態の優先度
+        (<code>WAIT_EVENT_CLEAR &gt; WAIT_RETEST &gt; WAIT_BREAKOUT &gt;
+        WAIT_TRIGGER &gt; WATCH &gt; HOLD</code>) で選択。</li>
+      <li>今回登録した候補は <code>neckline_retest</code> 1 本のみ。
+        既存の <code>entry_plan</code> 結果をそのまま 1 候補に変換し、
+        採用候補として表示します。後続フェーズ
+        (direct_breakout_quality / pullback_buy / return_sell /
+        range_bounce / false_breakout_reversal / daily10k_micro_retest)
+        は <b>まだ実装しません</b>。</li>
+      <li>payload に <code>entry_candidates</code> /
+        <code>selected_entry_candidate</code> を追加。
+        通常パスと WAIT_EVENT_CLEAR の早期 HOLD パスの両方で出ます。</li>
+      <li>既存の <code>entry_plan</code> スキーマは破壊していません。
+        <code>selected_candidate_to_entry_plan()</code> はコア
+        フィールド (<code>entry_status</code> / <code>side</code> /
+        <code>entry_price</code> / <code>stop_price</code> /
+        <code>target_price</code> / <code>rr</code>) を上書きしません。</li>
+    </ul>
+    <p>テスト: <code>tests/test_entry_candidates.py</code> 26/26 PASS、
+    <code>tests/test_visual_audit_entry_candidates.py</code> 6/6 PASS、
+    geometry 14/14 PASS、decision_trace + v2 + integrated 65/65 PASS。</p>
+  </div>
+
+  <div class="changelog">
+    <h2>前回の追加修正 (スマホ視認性強化)</h2>
+    <p>SVG が <code>viewBox=1200x600</code> で <code>@media (max-width:800px)</code> により
+    幅 100% に縮小されるため、390 px 幅の端末では実効スケールが約 0.32×。
+    そのままでは <code>font-size='11'</code> の文字が約 3.6 px、
+    <code>stroke-width='0.6'</code> の線が 0.2 px 以下になり、
+    グラフ要素が事実上見えませんでした。今回:</p>
+    <ul>
+      <li>SVG ルートと全テキストの <code>font-size</code> を約 2 倍
+        (9→18, 10→20, 11→22, 12→24, 13→26)</li>
+      <li>波形 skeleton / トレンドライン / WNL/WSL/WTP / ENTRY/STOP/TP /
+        SR-zone 枠 / pivot dot の <code>stroke-width</code> と半径を
+        読める太さに引き上げ</li>
+      <li>WNL+ENTRY などの 2 バッジを 1 本のラインに横並びで表示し、
+        重なりを回避</li>
+      <li>ラベル背景 <code>&lt;rect&gt;</code> を拡大したテキストに合わせて拡大、
+        SR-zone <code>opacity 0.18 → 0.24</code></li>
+    </ul>
+    <p>クラス名・<code>data-*</code> 属性・必須トークン
+    (DB1/DT1/B1/B2/P1/P2/NL/BR/WNL/WSL/WTP/ENTRY/STOP/TP/
+    T1/S1/R1/EVENT/WAIT BREAKOUT/WAIT RETEST/WAIT EVENT) はそのまま、
+    geometry-aware test 14/14 + wave-shape test 12/12 PASS を維持。</p>
+  </div>
+
+  <div class="changelog">
+    <h2>前回の改修ポイント (波形可視化復旧)</h2>
+    <p>前回プレビューでメインチャートから消えていた波形構造を復旧しました。</p>
+    <ol>
+      <li><b>メインチャート SVG</b> に <code>data-testid="main-candle-chart"</code> を付与。
+        その中に必ず以下が描画されます:
+        <ul>
+          <li>波形ファミリー名: <code>DB1</code> / <code>DT1</code> / <code>HS1</code> / <code>IHS1</code></li>
+          <li>波形部位ラベル: <code>B1</code> / <code>B2</code> / <code>P1</code> / <code>P2</code> /
+            <code>LS</code> / <code>H</code> / <code>RS</code> / <code>NL</code> / <code>BR</code></li>
+          <li>W ライン: <code>WNL</code> / <code>WSL</code> / <code>WTP</code></li>
+          <li>アクション: <code>ENTRY</code> / <code>STOP</code> / <code>TP</code></li>
+          <li>状態バッジ: <code>READY</code> / <code>WAIT BREAKOUT</code> /
+            <code>WAIT RETEST</code> / <code>WAIT EVENT</code> / <code>HOLD</code></li>
+          <li>イベント帯ラベル: <code>EVENT &lt;kind&gt;</code></li>
+        </ul>
+      </li>
+      <li><b>波形専用チャート</b>: <code>data-testid="wave-only-chart"</code> 付き SVG を
+        <code>&lt;section class="wave-only-section"&gt;</code> で復活
+        (もう <code>&lt;details&gt;</code> で折りたたまれていません)。</li>
+      <li><b>右側パネル</b>に新セクション <code>g5-pattern-parts-panel</code>「波形部位」追加。
+        パターン名・状態・各部位 (B1/B2/P1/P2/LS/H/RS/NL/BR) と W ライン (WNL/WSL/WTP) の
+        価格を一覧表示。チャート上のラベルと数字を突き合わせられます。</li>
+      <li><b>チャートタイトル</b>: 波形候補が先頭、参考線は <code>WNL → WSL → WTP → WBR
+        → 波形部位 → WFIB</code> の順。WFIB が主役にならないようにしました。</li>
+      <li><b>WFIB ラベル</b>: 線は描画したまま、チャート上の文字を抑制。
+        右側パネル「自動線一覧」と「波形由来の線」表で確認できます。</li>
+      <li><b>STOP / TP fallback</b> の橙色警告 / <b>5b. 未接続ファンダ</b> /
+        <b>6. 自動線一覧</b> / <b>7. 手動線操作 localStorage 警告</b> は前回ラウンドのまま継続。</li>
+    </ol>
+  </div>
+
+  <div class="what-to-check">
+    <h2>このプレビューでユーザーに確認してほしいこと (P0)</h2>
+    <ol>
+      <li><b>メインチャート SVG 内</b> に DB1 / B1 / B2 / NL / BR / WNL / WSL / WTP /
+        ENTRY / STOP / TP が見えるか (ダブルボトムケース)</li>
+      <li><b>メインチャート SVG 内</b> に DT1 / P1 / P2 / NL / BR / WNL / WSL / WTP /
+        ENTRY / STOP / TP が見えるか (ダブルトップケース)</li>
+      <li>WAIT_BREAKOUT ケースで <b>「WAIT BREAKOUT」</b> の橙色バッジが
+        メインチャート右上に出ているか</li>
+      <li>WAIT_RETEST ケースで <b>「WAIT RETEST」</b> の橙色バッジが
+        メインチャート右上に出ているか</li>
+      <li>WAIT_EVENT_CLEAR ケースでイベント帯に <b>「EVENT FOMC」</b> ラベル +
+        右上に <b>「WAIT EVENT」</b> の赤いバッジが出ているか</li>
+      <li>波形専用チャート (<b>波形専用チャート: ...</b> 見出し)
+        に skeleton 線 + 部位ラベルが描かれているか</li>
+      <li>右側パネルに <b>波形部位</b> セクションが出て、
+        各部位 (B1/B2/...) の価格表が読めるか</li>
+      <li>チャートタイトルが「判断: BUY / 波形候補: ダブルボトム ...」と読めるか
+        (WFIB 主役になっていないか)</li>
+      <li>STOP / TP が skeleton から補完されたケースで <b>橙色の補完警告</b> が
+        判断カード直下に出ているか</li>
+    </ol>
+  </div>
+
+  <h2>サンプル一覧</h2>
+
+  <div class="demo-card demo-fixture">
+    <h3>1. ダブルボトム → BUY <span class="pill pill-ready">READY</span>
+      <span class="label-fixture">合成データ</span></h3>
+    <p>
+      <a href="double_bottom_integrated_buy_demo_mobile.html">
+        double_bottom_integrated_buy_demo_mobile.html を開く →
+      </a>
+    </p>
+    <ul class="check-points">
+      <li>判断カード最上段に ENTRY / STOP / TP / RR が並ぶ</li>
+      <li>結論行が「入れる (READY)」</li>
+      <li>STOP / TP が skeleton 補完の場合は橙色警告が出る</li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-fixture">
+    <h3>2. ダブルトップ → SELL <span class="pill pill-ready">READY</span>
+      <span class="label-fixture">合成データ</span></h3>
+    <p>
+      <a href="double_top_integrated_sell_demo_mobile.html">
+        double_top_integrated_sell_demo_mobile.html を開く →
+      </a>
+    </p>
+    <ul class="check-points">
+      <li>方向が SELL、判断カードが赤系</li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-fixture">
+    <h3>3. <span class="pill pill-wait">WAIT_BREAKOUT</span> 専用ページ
+      <span class="label-fixture">合成データ</span></h3>
+    <p>
+      <a href="wait_breakout_demo_mobile.html">
+        wait_breakout_demo_mobile.html を開く →
+      </a>
+    </p>
+    <ul class="check-points">
+      <li>表示されるすべてのケースが WAIT_BREAKOUT</li>
+      <li>結論行は「まだ待つ — ブレイク待ち」</li>
+      <li>次に待つ条件: 「WNL を上抜けるまで…」</li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-fixture">
+    <h3>4. <span class="pill pill-wait">WAIT_RETEST</span> 専用ページ
+      <span class="label-fixture">合成データ</span></h3>
+    <p>
+      <a href="wait_retest_demo_mobile.html">
+        wait_retest_demo_mobile.html を開く →
+      </a>
+    </p>
+    <ul class="check-points">
+      <li>表示されるすべてのケースが WAIT_RETEST</li>
+      <li>結論行は「まだ待つ — 戻り (リターンムーブ) 待ち」</li>
+      <li>次に待つ条件: 「WNL_derived 付近への戻りと反発の確定足を待ちます」</li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-fixture">
+    <h3>5. <span class="pill pill-block">WAIT_EVENT_CLEAR</span> 専用ページ
+      <span class="label-fixture">合成データ + FOMC 注入</span></h3>
+    <p>
+      <a href="wait_event_clear_demo_mobile.html">
+        wait_event_clear_demo_mobile.html を開く →
+      </a>
+    </p>
+    <ul class="check-points">
+      <li>すべてのケースが WAIT_EVENT_CLEAR</li>
+      <li>チャートに <b>赤い縦バンド</b> + 中央の点線 + ラベル <b>EVENT FOMC</b> が描かれる</li>
+      <li>右側パネル「3. ファンダ・イベント」が <span class="pill pill-block">BLOCK</span>、
+        ブロック中のイベントが FOMC として表示される</li>
+      <li>結論行は「イベント待ち (ファンダ・リスク)」</li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-fixture">
+    <h3>6. パターン形成不足 → HOLD
+      <span class="label-fixture">合成データ</span></h3>
+    <p>
+      <a href="forming_pattern_integrated_hold_demo_mobile.html">
+        forming_pattern_integrated_hold_demo_mobile.html を開く →
+      </a>
+    </p>
+    <ul class="check-points">
+      <li>波形未確認、結論「見送り (HOLD)」</li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-real">
+    <h3>7. 通常レポート (integrated_balanced)
+      <span class="label-real">合成 OHLC を統合プロファイルで連続実行</span></h3>
+    <p>
+      <a href="normal_integrated_balanced_report_mobile.html">
+        normal_integrated_balanced_report_mobile.html を開く →
+      </a>
+    </p>
+    <ul class="check-points">
+      <li>READY / WAIT_BREAKOUT / HOLD が混じった現実的な分布</li>
+      <li>各ケースの判断カードを左から右にスワイプするように読める</li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-real">
+    <h3>8. 厳格レポート (integrated_strict)
+      <span class="label-real">同データを strict モードで再評価</span></h3>
+    <p>
+      <a href="normal_integrated_strict_report_mobile.html">
+        normal_integrated_strict_report_mobile.html を開く →
+      </a>
+    </p>
+    <ul class="check-points">
+      <li>未接続ファンダがあると HOLD に倒れやすい</li>
+    </ul>
+  </div>
+
+  <h2>凡例 (判断カードの状態)</h2>
+  <table class="legend-table">
+    <tr><th>状態</th><th>結論行</th><th>意味</th></tr>
+    <tr><td><span class="pill pill-ready">READY</span></td>
+      <td>入れる (READY)</td>
+      <td>波形 + 直近サポレジ + 確定足 + 最小 RR (≥ 2) を満たしている。</td></tr>
+    <tr><td><span class="pill pill-wait">WAIT_BREAKOUT</span></td>
+      <td>まだ待つ — ブレイク待ち</td>
+      <td>波形は認識されたが、ネックライン (WNL) をまだ越えていない。</td></tr>
+    <tr><td><span class="pill pill-wait">WAIT_RETEST</span></td>
+      <td>まだ待つ — 戻り (リターンムーブ) 待ち</td>
+      <td>WNL を一度抜けたが、戻りと確定足がまだ来ていない。</td></tr>
+    <tr><td><span class="pill pill-block">WAIT_EVENT_CLEAR</span></td>
+      <td>イベント待ち (ファンダ・リスク)</td>
+      <td>READY だがイベント (FOMC など) が窓内にあるためダウングレード。</td></tr>
+    <tr><td><span class="pill pill-hold">HOLD</span></td>
+      <td>見送り (HOLD)</td>
+      <td>条件不足・root 拒否などで条件を満たしていない。</td></tr>
+  </table>
+
+  <h2>波形 → 判断 までの間接経路 (重要)</h2>
+  <p>
+    画面上で <code>used_in_decision = false</code> と書かれている W ライン
+    (raw な波形由来の自動線) <b>そのもの</b>は、最終 BUY/SELL/HOLD を直接変更しません。
+    ただし integrated profile では:
+  </p>
+  <pre style="background:#f5f5f5; padding:8px; border-radius:4px; font-size:12px;">
+raw W ライン  →  pattern_levels  →  entry_plan  →  integrated action
+  </pre>
+  <p>
+    の経路で <b>間接的に判断に使われています</b>。
+    判断カードの ENTRY / STOP / TP / RR は <code>pattern_levels</code> 経由の値で、
+    その元データは W ラインまたは skeleton 補完です (skeleton 補完だった場合は
+    判断カード直下に橙色警告が出ます)。
+  </p>
+
+  <h2>まだ未接続 / 未完成な項目</h2>
+  <ul>
+    <li><b>Daily 10k preset</b>: まだ着手していない (本プレビューの後段で別タスク)</li>
+    <li><b>DXY / 米金利 / ニュース / 経済カレンダー</b> の実フィード: 未接続
+      (合成データのため 5b パネルでは「未接続」表示)</li>
+    <li>イベントカレンダーは <b>合成 FOMC イベント 1 件</b> を注入している
+      (WAIT_EVENT_CLEAR デモ用) — 実カレンダーへの接続は別途</li>
+    <li><b>手動線の永続化</b> は localStorage のみ
+      (サーバ送信なし、デバイス間共有なし、annotations.json で持ち出し)</li>
+  </ul>
+
+  <p class="footer">
+    本プレビューは観測専用の opt-in プロファイル
+    <code>royal_road_decision_v2_integrated</code> の出力です。
+    既存の本番系 (live / OANDA / paper / current_runtime CLI 既定) は
+    一切変更されていません。
+  </p>
+</body>
+</html>

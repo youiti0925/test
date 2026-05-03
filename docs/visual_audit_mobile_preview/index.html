@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>王道 visual audit モバイルプレビュー</title>
+  <style>
+    body {
+      font-family: -apple-system, sans-serif;
+      margin: 12px;
+      color: #222;
+      line-height: 1.6;
+    }
+    h1 { font-size: 20px; margin-bottom: 4px; }
+    h2 { font-size: 16px; margin-top: 20px; }
+    h3 { font-size: 14px; margin-top: 16px; }
+    ul { padding-left: 22px; }
+    ol { padding-left: 22px; }
+    li { margin: 6px 0; }
+    a { color: #1565c0; text-decoration: none; font-weight: 600; }
+    a:hover, a:active { text-decoration: underline; }
+    .what-to-check {
+      background: #e8f4ff;
+      border: 2px solid #1565c0;
+      padding: 10px 14px;
+      border-radius: 6px;
+      margin: 12px 0 16px;
+    }
+    .what-to-check h2 { margin-top: 0; color: #0d47a1; }
+    .demo-card {
+      border: 1px solid #ccc;
+      padding: 10px 14px;
+      border-radius: 6px;
+      margin: 10px 0;
+      background: #fafafa;
+    }
+    .demo-card.demo-fixture {
+      background: #fff8e1;
+      border-color: #f9a825;
+    }
+    .demo-card .label-fixture {
+      display: inline-block;
+      background: #f9a825;
+      color: white;
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 11px;
+      margin-left: 6px;
+      vertical-align: middle;
+    }
+    .check-points {
+      margin: 6px 0 0;
+      padding-left: 18px;
+      font-size: 13px;
+      color: #444;
+    }
+    .check-points li { margin: 2px 0; }
+    .footer {
+      color: #888;
+      font-size: 12px;
+      margin-top: 24px;
+      border-top: 1px solid #eee;
+      padding-top: 12px;
+    }
+    code { background: #eee; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+    @media (max-width: 800px) {
+      body { margin: 8px; }
+      h1 { font-size: 18px; }
+      h2 { font-size: 15px; }
+      h3 { font-size: 13px; }
+    }
+  </style>
+</head>
+<body>
+  <h1>王道 visual audit モバイルプレビュー</h1>
+  <p style="color:#666;font-size:13px;margin-top:0;">
+    ブランチ: <code>artifact/visual-audit-mobile-preview</code> / 生成元 commit: <code>b3d36af</code>
+  </p>
+
+  <div class="what-to-check" style="background:#fff8e1;border-color:#d84315;">
+    <h2 style="color:#bf360c;">★ 最新追加: 「この判断の読み方 (decision bridge)」</h2>
+    <p style="font-size:13px;margin-bottom:0;">
+      各ケースの最上段に <strong>「★ この判断の読み方」</strong> が追加されました。<br>
+      表示されている情報を 4 段階に分類し、最終 BUY / SELL / HOLD と
+      どう結びついているかが一目で分かります:<br>
+      <strong>USED (緑) = 判断に使用</strong> — royal_road_v2 本体, block_reasons, stop_plan<br>
+      <strong>PARTIAL (青) = 一部使用</strong> — support_resistance_v2 など<br>
+      <strong>AUDIT_ONLY (黄) = 表示のみ</strong> — 波形認識, Wライン, フィボ,
+      Masterclass 19 パネル, Daily Roadmap<br>
+      <strong>NOT_CONNECTED (赤) = 未接続</strong> — ファンダ実データ, position sizing,
+      経済指標, 通貨ペア固有ファンダ, 下位足解剖<br>
+      HOLD ケースには 「入れそうに見えるかもしれません」 + 理由表示。<br>
+      BUY/SELL ケースには 「波形・フィボ・Masterclass は直接使っていません」 注意表示。
+    </p>
+  </div>
+
+  <div class="what-to-check" style="background:#fff8e1;border-color:#f9a825;">
+    <h2 style="color:#5d4037;">Source-pack 19 パネル + 3段表示 (observation-only)</h2>
+    <p style="font-size:13px;margin-bottom:0;">
+      各ケースに <strong>Masterclass + Source-pack 19 機能パネル</strong> が
+      <strong>3 段構成</strong> で表示されます:<br>
+      <strong>① 重要サマリ</strong> (今日このケースで見るべきこと)<br>
+      <strong>② 王道チェック</strong> (13 軸 グランドコンフルエンス: Dow / Line /
+      MA / Oscillator / Price Action / Pattern / RR / Invalidation / Macro /
+      <strong>Fibonacci / MTF / Roadmap / Symbol-macro</strong>)<br>
+      <strong>③ 詳細パネル</strong> (16 Masterclass + 3 Source-pack:
+      <strong>Fibonacci_Trading_Blueprint</strong> /
+      <strong>Daily_10k_FX_Roadmap</strong> /
+      <strong>USDJPY_Tactical_Briefing</strong>)<br>
+      チャート上には <strong>WFIB382 / WFIB500 / WFIB618 / WFIB1272 / WFIB1618</strong>
+      のフィボナッチ線が描かれます。<br>
+      <strong>すべて observation-only / used_in_decision = false</strong> で、
+      売買判断 (BUY / SELL / HOLD) には接続されていません。<br>
+      ポジションサイジング / 経済指標カレンダー / 通貨ペア固有ファンダ実データは
+      <strong>未接続 (UNKNOWN)</strong> として明示されます。
+    </p>
+  </div>
+
+  <div class="what-to-check">
+    <h2>この画面で確認すること</h2>
+    <p>
+      この画面は <strong>売買成績</strong> を見るものではありません。<br>
+      <strong>王道判断をシステムがどう再現しているか</strong> を、
+      人間の目で確認するための画面です。
+    </p>
+    <p><strong>確認すること:</strong></p>
+    <ol>
+      <li>サポート / レジスタンス帯 (緑/赤の帯) が、自然な位置にあるか</li>
+      <li>トレンドライン (青い線) が無理やり引かれていないか</li>
+      <li>損切り線 (stop / structure_stop) が「ここを割ったらシナリオ崩壊」と思える位置か</li>
+      <li>王道チェックの <strong>OK (PASS) / 注意 (WARN) / 見送り (BLOCK)</strong> の理由が納得できるか</li>
+      <li>現行ロジック (current_runtime) と王道v2 (royal_road_v2) の差分が分かるか</li>
+    </ol>
+    <p style="font-size:12px;color:#555;margin-bottom:0;">
+      おかしい線・無理やりな根拠・納得できない判断があれば「修正対象」です。
+      気づいた点は <code>feedback_template.json</code> に記入する想定です。
+    </p>
+  </div>
+
+  <h2>パターン部位チャートデモ (4 種)</h2>
+
+  <p style="font-size:13px;color:#444;margin-top:0;">
+    波形認識からの線 (WNL/WB1/WB2/WP1/WP2/WLS/WH/WRS/WSL/WTP) が
+    チャート上に出るかを 4 つの典型パターンで確認できます。
+    どれも合成 OHLC を使った決定論的デモ (バックテスト結果ではありません)。
+  </p>
+
+  <div class="demo-card demo-fixture">
+    <a href="./double_bottom_shape_demo_mobile.html">
+      ① ダブルボトムデモ (double_bottom)
+    </a>
+    <span class="label-fixture">合成パターン</span>
+    <p style="margin:6px 0 4px;font-size:13px;">
+      <strong>見る目的:</strong>
+      <code>DB1 / B1 / B2 / NL / BR / WSL / WTP</code> の線・ラベルが出るか。
+    </p>
+    <ul class="check-points">
+      <li>チャート上に紫の <code>WNL1 ネックライン</code> が水平に引かれている</li>
+      <li>赤の <code>WSL1</code> (波形損切り候補) と緑の <code>WTP1</code> (利確候補) が出る</li>
+      <li>「波形だけチャート」に <code>DB1</code> 家族マーカー + <code>B1/B2/NL</code> ラベル</li>
+      <li>タイトルが「判断: HOLD / 波形候補: ダブルボトム候補 / 参考線: ...」</li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-fixture">
+    <a href="./double_top_shape_demo_mobile.html">
+      ② ダブルトップデモ (double_top)
+    </a>
+    <span class="label-fixture">合成パターン</span>
+    <p style="margin:6px 0 4px;font-size:13px;">
+      <strong>見る目的:</strong>
+      <code>DT1 / P1 / P2 / NL / BR / WSL / WTP</code> の線・ラベルが出るか。
+    </p>
+    <ul class="check-points">
+      <li>P1 / P2 の白枠ラベル + WNL1 ネックライン (紫横線) が出る</li>
+      <li><code>WSL1</code> = P2 の上、<code>WTP1</code> = NL から下方向に投影</li>
+      <li>波形候補欄に <code>ダブルトップ候補</code></li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-fixture">
+    <a href="./head_and_shoulders_shape_demo_mobile.html">
+      ③ 三尊デモ (head_and_shoulders)
+    </a>
+    <span class="label-fixture">合成パターン</span>
+    <p style="margin:6px 0 4px;font-size:13px;">
+      <strong>見る目的:</strong>
+      <code>HS1 / LS / H / RS / NL / BR / WSL / WTP</code> の線・ラベルが出るか。
+    </p>
+    <ul class="check-points">
+      <li>左肩 (LS) / 頭 (H) / 右肩 (RS) のラベルが pivot 位置に出る</li>
+      <li>WNL1 ネックライン (左右の谷を結んだ位置)</li>
+      <li><code>WSL1</code> は右肩の上、<code>WTP1</code> は NL - (頭 - NL)</li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-fixture">
+    <a href="./inverse_head_and_shoulders_shape_demo_mobile.html">
+      ④ 逆三尊デモ (inverse_head_and_shoulders)
+    </a>
+    <span class="label-fixture">合成パターン</span>
+    <p style="margin:6px 0 4px;font-size:13px;">
+      <strong>見る目的:</strong>
+      <code>IHS1 / LS / H / RS / NL / BR / WSL / WTP</code> の線・ラベルが出るか。
+    </p>
+    <ul class="check-points">
+      <li>左肩 (LS) / 頭 (H、最も深い底) / 右肩 (RS) ラベル</li>
+      <li>WNL1 ネックライン (左右のピークを結んだ位置)</li>
+      <li><code>WSL1</code> は右肩の下、<code>WTP1</code> は NL + (NL - 頭)</li>
+    </ul>
+  </div>
+
+  <h2>その他のサンプル (3 種)</h2>
+
+  <div class="demo-card">
+    <a href="./normal_v2_report_mobile.html">
+      ⑤ 通常 v2 レポートサンプル (normal v2 report)
+    </a>
+    <p style="margin:6px 0 4px;font-size:13px;">
+      <strong>見る目的:</strong>
+      ランダムウォーク合成データで、波形認識が triangle/wedge/flag を拾えるか。
+    </p>
+    <ul class="check-points">
+      <li>サポレジ帯 (緑/赤) + 波形由来ライン (WUP/WLOW/WBR/WSL/WTP) が混在</li>
+      <li>線カウントサマリ表で「採用 / 不採用 / 波形由来」 の合計が見える</li>
+      <li>HOLD ケースでは「未ブレイク」を示す注意表示</li>
+    </ul>
+    <p style="margin:6px 0 0;font-size:12px;color:#555;">
+      ※ 合成 OHLC を用いたサンプル (live データではありません)。
+    </p>
+  </div>
+
+  <div class="demo-card demo-fixture">
+    <a href="./structure_stop_anchor_demo_mobile.html">
+      ⑥ 損切りデモ (structure stop anchor demo)
+    </a>
+    <span class="label-fixture">手作りフィクスチャ</span>
+    <p style="margin:6px 0 4px;font-size:13px;">
+      <strong>見る目的:</strong>
+      サポート帯と損切り線が合っているかを見る (波形認識を使わない既存系のデモ)。
+    </p>
+    <ul class="check-points">
+      <li>緑の帯がサポート帯</li>
+      <li><code>stop</code> / <code>structure_stop</code> の線が、その帯の下または近くにあるか</li>
+      <li>損切り根拠の説明に <code>sr_zone:support</code> と書かれているか</li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-fixture">
+    <a href="./current_vs_royal_diff_demo_mobile.html">
+      ⑦ 現行 vs 王道 差分デモ (current vs royal diff demo)
+    </a>
+    <span class="label-fixture">手作りフィクスチャ</span>
+    <p style="margin:6px 0 4px;font-size:13px;">
+      <strong>見る目的:</strong>
+      現行ロジックがBUYした場面を、王道v2がHOLDで止めた理由を見る。
+    </p>
+    <ul class="check-points">
+      <li>比較表で <code>現行ロジック = BUY</code> / <code>王道v2 = HOLD</code></li>
+      <li>差分タイプが <code>current_buy_royal_hold</code></li>
+      <li>ブロック理由 (block_reasons) が並んでいて、王道v2が止めた理由が納得できるか</li>
+    </ul>
+  </div>
+
+  <div class="footer">
+    <p>
+      schema: <code>visual_audit_mobile_v1</code><br>
+      売買ロジック本体は無変更です。これは表示・監査情報のみの追加成果物です。<br>
+      合成パターンデモ (① 〜 ④) と手作りフィクスチャ (⑥ ⑦) は
+      <code>demo_fixture_not_backtest_result</code> 扱いで、
+      実際のバックテスト結果ではありません。
+    </p>
+  </div>
+</body>
+</html>

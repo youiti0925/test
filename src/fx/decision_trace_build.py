@@ -30,8 +30,11 @@ from .decision_trace import (
     MacroContextSlice,
     MarketSlice,
     RULE_TAXONOMY,
+    RoyalRoadDecisionSlice,
+    RoyalRoadDecisionV2Slice,
     RuleCheck,
     TRACE_SCHEMA_VERSION,
+    TechnicalConfluenceSlice,
     TechnicalSlice,
     WaveformSlice,
     horizon_to_bars,
@@ -41,6 +44,10 @@ from .decision_trace import (
 from .indicators import Snapshot
 from .macro import MacroSnapshot
 from .patterns import PatternResult, analyse as analyse_patterns
+from .technical_confluence import (
+    build_technical_confluence,
+    empty_technical_confluence,
+)
 from .waveform_backtest import waveform_lookup
 from .waveform_library import WaveformSample
 from .waveform_matcher import compute_signature
@@ -1612,6 +1619,47 @@ def build_rule_checks_full(
     return tuple(checks)
 
 
+def _confluence_slice(
+    *,
+    df_window: pd.DataFrame,
+    snapshot: Snapshot | None,
+    pattern: PatternResult | None,
+    atr_value: float | None,
+    technical_only_action: str,
+    runtime_overrides: dict | None,
+) -> TechnicalConfluenceSlice:
+    """Build the TechnicalConfluenceSlice for one bar.
+
+    Returns an UNKNOWN-shaped slice when the input is too sparse for
+    the detector to do anything useful (warmup or ATR-unavailable bars).
+    Observation-only — the result is never read by decide_action.
+    """
+    if (
+        df_window is None or len(df_window) < 2
+        or atr_value is None or pattern is None or snapshot is None
+    ):
+        d = empty_technical_confluence()
+    else:
+        stop_mult = (
+            float(runtime_overrides.get("stop_atr_mult", 2.0))
+            if runtime_overrides else 2.0
+        )
+        tp_mult = (
+            float(runtime_overrides.get("tp_atr_mult", 3.0))
+            if runtime_overrides else 3.0
+        )
+        d = build_technical_confluence(
+            df_window=df_window,
+            snapshot=snapshot,
+            pattern=pattern,
+            atr_value=atr_value,
+            technical_only_action=technical_only_action,
+            stop_atr_mult=stop_mult,
+            tp_atr_mult=tp_mult,
+        )
+    return TechnicalConfluenceSlice.from_dict(d)
+
+
 def build_atr_unavailable_trace(
     *,
     run_id: str,
@@ -1729,6 +1777,11 @@ def build_atr_unavailable_trace(
         advisory={},
     )
 
+    # ATR-unavailable bars cannot compute any meaningful confluence
+    # observation; emit the schema-stable empty payload so consumers
+    # can rely on a fixed key set.
+    confluence = TechnicalConfluenceSlice.from_dict(empty_technical_confluence())
+
     return BarDecisionTrace(
         run_id=run_id,
         trace_schema_version=TRACE_SCHEMA_VERSION,
@@ -1751,6 +1804,7 @@ def build_atr_unavailable_trace(
             else long_term_trend_slice(df, i)
         ),
         macro_context=macro_context_slice(macro, ts),
+        technical_confluence=confluence,
     )
 
 
@@ -1793,6 +1847,11 @@ def build_full_trace(
     waveform_bias: dict | None = None,
     long_term_trend_override: LongTermTrendSlice | None = None,
     runtime_overrides: dict | None = None,
+    royal_road_decision=None,
+    royal_road_compare: dict | None = None,
+    royal_road_decision_v2=None,
+    royal_road_v2_compare_vs_current: dict | None = None,
+    royal_road_v2_compare_vs_v1: dict | None = None,
 ) -> BarDecisionTrace:
     """Full trace for a normally processed bar.
 
@@ -1866,6 +1925,32 @@ def build_full_trace(
 
     decision_s = decision_slice(decision, technical_only_action=tech)
 
+    confluence = _confluence_slice(
+        df_window=df.iloc[: i + 1],
+        snapshot=snap,
+        pattern=pattern,
+        atr_value=atr_value,
+        technical_only_action=tech,
+        runtime_overrides=runtime_overrides,
+    )
+
+    royal_slice: RoyalRoadDecisionSlice | None = None
+    if royal_road_decision is not None and royal_road_compare is not None:
+        royal_slice = RoyalRoadDecisionSlice.from_decision(
+            royal_decision=royal_road_decision,
+            comparison=royal_road_compare,
+        )
+    royal_v2_slice: RoyalRoadDecisionV2Slice | None = None
+    if (
+        royal_road_decision_v2 is not None
+        and royal_road_v2_compare_vs_current is not None
+    ):
+        royal_v2_slice = RoyalRoadDecisionV2Slice.from_decision(
+            v2_decision=royal_road_decision_v2,
+            comparison_vs_current=royal_road_v2_compare_vs_current,
+            comparison_vs_v1=royal_road_v2_compare_vs_v1,
+        )
+
     return BarDecisionTrace(
         run_id=run_id,
         trace_schema_version=TRACE_SCHEMA_VERSION,
@@ -1880,6 +1965,9 @@ def build_full_trace(
         future_outcome=None,
         long_term_trend=long_term,
         macro_context=macro_ctx,
+        technical_confluence=confluence,
+        royal_road_decision=royal_slice,
+        royal_road_decision_v2=royal_v2_slice,
     )
 
 
