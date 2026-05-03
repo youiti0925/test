@@ -1490,6 +1490,7 @@ def _build_candle_svg_xml(
     entry_status: str | None = None,
     entry_plan: dict | None = None,
     structural_lines: dict | None = None,
+    pattern_levels: dict | None = None,
 ) -> str | None:
     """Build the SVG candle-chart as an XML string.
 
@@ -1718,30 +1719,50 @@ def _build_candle_svg_xml(
         y0 = y_of(slope * i0 + intercept)
         y1 = y_of(slope * i1 + intercept)
         broken = bool(t.get("broken"))
-        opacity = "0.55" if broken else "0.9"
         tl_idx += 1
+        # Royal-road focus mode: T1 is primary (full opacity), T2/T3
+        # are secondary (muted) so the chart isn't crowded. Class
+        # name `trendline-primary` / `trendline-secondary` lets CSS
+        # toggle visibility per display mode.
+        is_primary = (tl_idx == 1)
+        primary_class = (
+            "trendline-primary" if is_primary
+            else "trendline-secondary"
+        )
+        if is_primary:
+            opacity = "0.55" if broken else "0.9"
+            stroke_w = "2.6"
+            label_opacity = "1.0"
+        else:
+            opacity = "0.18"
+            stroke_w = "1.2"
+            label_opacity = "0.35"
         tag = f"T{tl_idx}"
         parts.append(
-            f"<line class='trendline-selected trendline-selected-{tl_idx}' "
+            f"<line class='trendline-selected trendline-selected-{tl_idx}"
+            f" {primary_class}' "
             f"data-trendline-idx='{tl_idx}' "
             f"data-slope='{float(slope):.6e}' "
             f"x1='{x_of(i0):.1f}' "
             f"y1='{y0:.1f}' x2='{x_of(i1):.1f}' y2='{y1:.1f}' "
-            f"stroke='#1565c0' stroke-width='2.6' opacity='{opacity}'/>"
+            f"stroke='#1565c0' stroke-width='{stroke_w}' "
+            f"opacity='{opacity}'/>"
         )
         # Label at the right end of the segment (sized for mobile-scaled
         # SVG: rect width/height grow with the bumped font-size so labels
         # stay readable when the chart shrinks to phone width).
         parts.append(
-            f"<rect class='trendline-label-bg' "
+            f"<rect class='trendline-label-bg {primary_class}' "
             f"x='{x_of(i1) - 40:.1f}' y='{y1 - 14:.1f}' "
             f"width='38' height='28' fill='white' stroke='#1565c0' "
-            f"stroke-width='2' rx='4'/>"
+            f"stroke-width='2' rx='4' opacity='{label_opacity}'/>"
         )
         parts.append(
-            f"<text class='trendline-label' x='{x_of(i1) - 21:.1f}' "
+            f"<text class='trendline-label {primary_class}' "
+            f"x='{x_of(i1) - 21:.1f}' "
             f"y='{y1 + 7:.1f}' text-anchor='middle' fill='#1565c0' "
-            f"font-weight='bold' font-size='22'>{tag}</text>"
+            f"font-weight='bold' font-size='22' "
+            f"opacity='{label_opacity}'>{tag}</text>"
         )
     xt_idx = 0
     for rj in ov.get("trendlines_rejected", []):
@@ -1883,6 +1904,43 @@ def _build_candle_svg_xml(
     )
 
     # ---- wave-derived horizontal lines (observation-only) -------
+    # Royal-road focus mode: pre-compute grouped labels per role using
+    # the structural-lines snapshot so the chart shows ONE combined
+    # badge per price-level (e.g. "WNL / ENTRY / SNL1") instead of
+    # three stacked badges, and skip the duplicate horizontal
+    # structural overlay for the same kinds (SNL1 / SIL1 / STP1) so
+    # the chart isn't crowded.
+    sl_lines_for_grouping = list(
+        (structural_lines or {}).get("lines") or []
+    )
+    sl_kind_to_id = {}
+    for _ln in sl_lines_for_grouping:
+        _kind = str(_ln.get("kind") or "")
+        if _kind in (
+            "structural_neckline",
+            "structural_invalidation",
+            "structural_target",
+        ) and _kind not in sl_kind_to_id:
+            sl_kind_to_id[_kind] = str(_ln.get("id") or "")
+    grouped_label_map: dict[str, str] = {}
+    if "structural_neckline" in sl_kind_to_id:
+        grouped_label_map["entry_confirmation_line"] = (
+            "WNL / ENTRY / " + sl_kind_to_id["structural_neckline"]
+        )
+    else:
+        grouped_label_map["entry_confirmation_line"] = "WNL / ENTRY"
+    if "structural_invalidation" in sl_kind_to_id:
+        grouped_label_map["stop_candidate"] = (
+            "WSL / STOP / " + sl_kind_to_id["structural_invalidation"]
+        )
+    else:
+        grouped_label_map["stop_candidate"] = "WSL / STOP"
+    if "structural_target" in sl_kind_to_id:
+        grouped_label_map["target_candidate"] = (
+            "WTP / TP / " + sl_kind_to_id["structural_target"]
+        )
+    else:
+        grouped_label_map["target_candidate"] = "WTP / TP"
     if wave_derived_lines:
         parts.append(
             _wave_derived_lines_svg_fragment(
@@ -1891,6 +1949,7 @@ def _build_candle_svg_xml(
                 price_lo=price_lo, price_hi=price_hi,
                 margin_l=margin_l, margin_t=margin_t,
                 plot_w=plot_w, plot_h=plot_h,
+                grouped_label_map=grouped_label_map,
             )
         )
 
@@ -1923,6 +1982,8 @@ def _build_candle_svg_xml(
 
     # ---- wave skeleton overlay (observation-only) ---------------
     if wave_overlay:
+        _ep_for_wave = entry_plan or {}
+        _br_confirmed = bool(_ep_for_wave.get("breakout_confirmed"))
         parts.append(
             _wave_overlay_svg_fragment(
                 wave_overlay=wave_overlay,
@@ -1931,6 +1992,7 @@ def _build_candle_svg_xml(
                 price_lo=price_lo, price_hi=price_hi,
                 margin_l=margin_l, margin_t=margin_t,
                 plot_w=plot_w, plot_h=plot_h,
+                breakout_confirmed=_br_confirmed,
             )
         )
 
@@ -1969,14 +2031,16 @@ def _build_candle_svg_xml(
                 f"{_html_escape(text)}</text>"
             )
 
-    # ── Phase I follow-up: royal-road BREAK / RETEST / CONFIRM markers
-    # Drawn after the entry-status badge so they sit on top. Phase I
-    # does not yet pin these to specific bar indices — they are placed
-    # along the trigger line near the right edge so the user can see
-    # the procedure state at a glance, and each marker carries data-
-    # attributes pointing at the entry_plan source for downstream
-    # consumers.
+    # ── Royal-road BREAK / RETEST / CONFIRM markers ─────────────
+    # Anchored to actual chart structure (not pinned to the left
+    # edge): BREAK sits at BR (or right-side approx), RETEST sits
+    # between BR and the right edge, CONFIRM sits at the last
+    # visible bar. Each marker carries data-anchor-quality
+    # ("EXACT" when we can locate a real bar, "APPROX" when we fall
+    # back to a heuristic position) and data-anchor-part so the
+    # user / downstream consumers can audit the placement.
     ep_for_markers = entry_plan or {}
+    pattern_levels_for_markers = pattern_levels or {}
     if ep_for_markers:
         trigger_line_id = (
             ep_for_markers.get("trigger_line_id") or ""
@@ -1989,55 +2053,102 @@ def _build_candle_svg_xml(
             )
         except (TypeError, ValueError):
             trigger_y = None
-        # Place markers along the trigger line (or just under the
-        # entry-status badge if no price is available).
+        # BR pivot anchor (when the pattern_levels carries a BR with
+        # an index inside the visible window).
+        br_part = (pattern_levels_for_markers.get("parts") or {}).get("BR") or {}
+        br_idx_raw = br_part.get("index")
+        br_idx: int | None = None
+        try:
+            if br_idx_raw is not None:
+                br_idx = int(br_idx_raw)
+                if br_idx < 0 or br_idx >= n:
+                    br_idx = None
+        except (TypeError, ValueError):
+            br_idx = None
+
+        def _place(
+            anchor_idx: int | None,
+            fallback_idx: int,
+        ) -> tuple[float, str]:
+            if anchor_idx is not None:
+                return x_of(anchor_idx), "EXACT"
+            return x_of(fallback_idx), "APPROX"
+
+        # Y default: along the trigger line (or just below the badge
+        # if no price available).
         marker_y = (
             trigger_y if trigger_y is not None
             else (margin_t + 56.0)
         )
-        marker_x_break = margin_l + 12.0
-        marker_x_retest = margin_l + 110.0
-        marker_x_confirm = margin_l + 220.0
-        if bool(ep_for_markers.get("breakout_confirmed")):
-            parts.append(
-                "<g class='royal-road-markers royal-breakout'>"
-                "<rect class='royal-breakout-marker-bg' "
-                f"x='{marker_x_break:.1f}' "
-                f"y='{marker_y - 17:.1f}' width='80' height='28' "
-                "fill='#fff8e1' stroke='#ef6c00' "
-                "stroke-width='2' rx='4' opacity='0.95'/>"
-                "<text class='royal-breakout-marker' "
-                f"data-source='entry_plan' "
-                f"data-trigger-line-id='{_html_escape(trigger_line_id)}' "
-                f"x='{marker_x_break + 40:.1f}' "
-                f"y='{marker_y + 4:.1f}' text-anchor='middle' "
-                "fill='#bf360c' font-weight='bold' font-size='22'>"
-                "BREAK</text></g>"
-            )
-        if bool(ep_for_markers.get("retest_confirmed")):
-            parts.append(
-                "<g class='royal-road-markers royal-retest'>"
-                "<rect class='royal-retest-marker-bg' "
-                f"x='{marker_x_retest:.1f}' "
-                f"y='{marker_y - 17:.1f}' width='90' height='28' "
-                "fill='#e8f4ff' stroke='#1565c0' "
-                "stroke-width='2' rx='4' opacity='0.95'/>"
-                "<text class='royal-retest-marker' "
-                f"data-source='entry_plan' "
-                f"data-trigger-line-id='{_html_escape(trigger_line_id)}' "
-                f"x='{marker_x_retest + 45:.1f}' "
-                f"y='{marker_y + 4:.1f}' text-anchor='middle' "
-                "fill='#0d47a1' font-weight='bold' font-size='22'>"
-                "RETEST</text></g>"
-            )
+        last_idx = max(0, n - 1)
+        # Approx slots — RETEST / CONFIRM placed in the right half so
+        # they don't visually crowd the left edge.
+        approx_break = max(0, int(n * 0.6))
+        approx_retest = max(approx_break + 2, int(n * 0.78))
+        approx_confirm = last_idx
         confirmation_candle = (
             ep_for_markers.get("confirmation_candle") or ""
         )
+        if bool(ep_for_markers.get("breakout_confirmed")):
+            mx, mq = _place(br_idx, approx_break)
+            anchor_part = "BR" if br_idx is not None else "approx_right"
+            parts.append(
+                "<g class='royal-road-markers royal-breakout'>"
+                "<rect class='royal-breakout-marker-bg' "
+                f"x='{mx - 40:.1f}' "
+                f"y='{marker_y - 17:.1f}' width='80' height='28' "
+                "fill='#fff8e1' stroke='#ef6c00' "
+                "stroke-width='2' rx='4' opacity='0.95'/>"
+                "<text class='royal-breakout-marker"
+                + (" royal-procedure-marker-approx" if mq == "APPROX" else "")
+                + "' "
+                f"data-source='entry_plan' "
+                f"data-trigger-line-id='{_html_escape(trigger_line_id)}' "
+                f"data-anchor-quality='{mq}' "
+                f"data-anchor-part='{anchor_part}' "
+                f"x='{mx:.1f}' "
+                f"y='{marker_y + 4:.1f}' text-anchor='middle' "
+                "fill='#bf360c' font-weight='bold' font-size='22'>"
+                + ("BREAK" if mq == "EXACT" else "BREAK~")
+                + "</text></g>"
+            )
+        if bool(ep_for_markers.get("retest_confirmed")):
+            # RETEST anchors after BR (BR + a few bars) when BR is
+            # known; otherwise heuristic right-side slot.
+            ridx = br_idx + max(2, int(n * 0.05)) if br_idx is not None else None
+            if ridx is not None and ridx >= n:
+                ridx = None
+            mx, mq = _place(ridx, approx_retest)
+            anchor_part = (
+                "post_BR" if ridx is not None else "approx_right"
+            )
+            parts.append(
+                "<g class='royal-road-markers royal-retest'>"
+                "<rect class='royal-retest-marker-bg' "
+                f"x='{mx - 45:.1f}' "
+                f"y='{marker_y - 17:.1f}' width='90' height='28' "
+                "fill='#e8f4ff' stroke='#1565c0' "
+                "stroke-width='2' rx='4' opacity='0.95'/>"
+                "<text class='royal-retest-marker"
+                + (" royal-procedure-marker-approx" if mq == "APPROX" else "")
+                + "' "
+                f"data-source='entry_plan' "
+                f"data-trigger-line-id='{_html_escape(trigger_line_id)}' "
+                f"data-anchor-quality='{mq}' "
+                f"data-anchor-part='{anchor_part}' "
+                f"x='{mx:.1f}' "
+                f"y='{marker_y + 4:.1f}' text-anchor='middle' "
+                "fill='#0d47a1' font-weight='bold' font-size='22'>"
+                + ("RETEST" if mq == "EXACT" else "RETEST~")
+                + "</text></g>"
+            )
         if confirmation_candle:
+            mx, mq = _place(approx_confirm, approx_confirm)
+            # Last visible bar is always present, so EXACT here.
             parts.append(
                 "<g class='royal-road-markers royal-confirmation'>"
                 "<rect class='royal-confirmation-marker-bg' "
-                f"x='{marker_x_confirm:.1f}' "
+                f"x='{mx - 55:.1f}' "
                 f"y='{marker_y - 17:.1f}' width='110' height='28' "
                 "fill='#e8f5e9' stroke='#2e7d32' "
                 "stroke-width='2' rx='4' opacity='0.95'/>"
@@ -2045,7 +2156,9 @@ def _build_candle_svg_xml(
                 f"data-source='entry_plan' "
                 "data-confirmation-candle="
                 f"'{_html_escape(str(confirmation_candle))}' "
-                f"x='{marker_x_confirm + 55:.1f}' "
+                f"data-anchor-quality='EXACT' "
+                f"data-anchor-part='last_bar' "
+                f"x='{mx:.1f}' "
                 f"y='{marker_y + 4:.1f}' text-anchor='middle' "
                 "fill='#1b5e20' font-weight='bold' font-size='22'>"
                 "CONFIRM</text></g>"
@@ -2063,6 +2176,18 @@ def _build_candle_svg_xml(
         parts.append("<g class='structural-lines'>")
         for sl in sl_lines:
             kind = str(sl.get("kind") or "")
+            role = str(sl.get("role") or "")
+            # Royal-road focus mode: skip the duplicate horizontal
+            # render for SNL / SIL / STP — those are now rendered as
+            # a grouped label "WNL / ENTRY / SNL1" on the
+            # corresponding wave-derived line. The id / class / data
+            # attribute are still surfaced via a 0-stroke placeholder
+            # below so geometry-tracking consumers can still grep.
+            is_grouped_kind = kind in (
+                "structural_neckline",
+                "structural_invalidation",
+                "structural_target",
+            )
             cls_kind = (
                 "structural-neckline" if kind == "structural_neckline"
                 else "structural-invalidation-line"
@@ -2075,6 +2200,19 @@ def _build_candle_svg_xml(
                 if kind == "structural_support_resistance"
                 else "structural-channel"
             )
+            # Royal-road main structure line for DT P1↔P2 / DB B1↔B2
+            # — adds the user-spec'd `double-top-topline` /
+            # `royal-road-main-structure-line` classes for the test
+            # pin and a more prominent style.
+            extra_kind_classes: list[str] = []
+            if kind == "structural_trendline" and role in (
+                "top_structure_line", "bottom_structure_line",
+            ):
+                extra_kind_classes.append(
+                    "double-top-topline" if role == "top_structure_line"
+                    else "double-bottom-bottomline"
+                )
+                extra_kind_classes.append("royal-road-main-structure-line")
             stroke = (
                 "#7b1fa2" if kind == "structural_neckline"
                 else "#c62828" if kind == "structural_invalidation"
@@ -2084,16 +2222,35 @@ def _build_candle_svg_xml(
             )
             sl_id = str(sl.get("id") or "")
             source = str(sl.get("source") or "")
-            role = str(sl.get("role") or "")
+            anchor_parts = list(sl.get("anchor_parts") or [])
+            anchor_parts_attr = ",".join(str(a) for a in anchor_parts)
+            anchor_quality = (
+                "EXACT" if anchor_parts else "APPROX"
+            )
             align = str(sl.get("numeric_alignment") or "UNKNOWN").upper()
             data_attrs = (
                 f"data-structural-line-id='{_html_escape(sl_id)}' "
                 f"data-source='{_html_escape(source)}' "
                 f"data-role='{_html_escape(role)}' "
-                f"data-numeric-alignment='{_html_escape(align)}'"
+                f"data-numeric-alignment='{_html_escape(align)}' "
+                f"data-anchor-parts=\"{_html_escape(anchor_parts_attr)}\" "
+                f"data-anchor-quality='{anchor_quality}'"
             )
             price_raw = sl.get("price")
             slope_raw = sl.get("slope")
+            if is_grouped_kind:
+                # Emit a 0-length placeholder element carrying the id
+                # / class / data attributes so consumers grepping for
+                # data-structural-line-id="SNL1" still find it.
+                parts.append(
+                    "<line "
+                    f"class='structural-line {cls_kind} "
+                    "structural-line-grouped-placeholder' "
+                    + data_attrs
+                    + " x1='0' y1='0' x2='0' y2='0' "
+                    "stroke-opacity='0' fill-opacity='0'/>"
+                )
+                continue
             if price_raw is not None:
                 # Horizontal line at this price; render only when in
                 # the visible price band.
@@ -2145,23 +2302,58 @@ def _build_candle_svg_xml(
                     continue
                 xa = x_of(i1); xb = x_of(i2)
                 ya = y_of(p1); yb = y_of(p2)
+                # Royal-road main structure line: render thicker so
+                # the DT P1-P2 (or DB B1-B2) is the chart protagonist.
+                if "royal-road-main-structure-line" in extra_kind_classes:
+                    line_stroke_width = "3.0"
+                    line_dash = "0"
+                    line_opacity = "0.85"
+                else:
+                    line_stroke_width = "2.0"
+                    line_dash = "4,4"
+                    line_opacity = "0.7"
+                extra_cls_str = (
+                    " " + " ".join(extra_kind_classes)
+                    if extra_kind_classes else ""
+                )
                 parts.append(
                     "<line "
-                    f"class='structural-line {cls_kind}' "
+                    f"class='structural-line {cls_kind}{extra_cls_str}' "
                     + data_attrs
                     + f" x1='{xa:.1f}' y1='{ya:.1f}' "
                     f"x2='{xb:.1f}' y2='{yb:.1f}' "
-                    f"stroke='{stroke}' stroke-width='2.0' "
-                    "stroke-dasharray='4,4' opacity='0.7'/>"
+                    f"stroke='{stroke}' "
+                    f"stroke-width='{line_stroke_width}' "
+                    f"stroke-dasharray='{line_dash}' "
+                    f"opacity='{line_opacity}'/>"
                 )
+                # Royal-road main structure line uses the descriptive
+                # label "STL1 P1-P2" or "STL1 B1-B2" so the chart
+                # title says exactly which pivots the line connects;
+                # other diagonal lines keep the short id.
+                if "royal-road-main-structure-line" in extra_kind_classes:
+                    label_text = (
+                        f"{sl_id} P1-P2"
+                        if "double-top-topline" in extra_kind_classes
+                        else f"{sl_id} B1-B2"
+                    )
+                    label_class = (
+                        "structural-line-label structural-trendline-label "
+                        "royal-road-main-structure-label"
+                    )
+                else:
+                    label_text = sl_id
+                    label_class = (
+                        f"structural-line-label {cls_kind}"
+                    )
                 parts.append(
                     "<text "
-                    f"class='structural-line-label {cls_kind}' "
+                    f"class='{label_class}' "
                     + data_attrs
                     + f" x='{xb - 4:.1f}' y='{yb - 6:.1f}' "
                     "text-anchor='end' "
                     f"fill='{stroke}' font-weight='bold' "
-                    f"font-size='18'>{_html_escape(sl_id)}</text>"
+                    f"font-size='18'>{_html_escape(label_text)}</text>"
                 )
         parts.append("</g>")
 
@@ -2739,19 +2931,31 @@ def _wave_derived_lines_svg_fragment(
     price_lo: float, price_hi: float,
     margin_l: float, margin_t: float,
     plot_w: float, plot_h: float,
+    grouped_label_map: dict | None = None,
 ) -> str:
     """Build an SVG <g> overlay drawing wave-derived horizontal lines
     on top of the candle chart.
 
-    Mobile-first label policy (Phase G follow-up):
-      role=entry_confirmation_line → WNL + ENTRY (two stacked labels
-        sharing the same horizontal line, since trigger price = entry)
-      role=stop_candidate          → WSL + STOP
-      role=target_candidate        → WTP + TP
+    Royal-road focus mode (current default for mobile preview):
+      role=entry_confirmation_line → single combined badge
+        "WNL / ENTRY" + "/ SNL1" if a structural neckline exists
+      role=stop_candidate          → single combined badge
+        "WSL / STOP" + "/ SIL1" if structural invalidation exists
+      role=target_candidate        → single combined badge
+        "WTP / TP" + "/ STP1" if structural target exists
       role=breakout_line           → WBR (short id only, no separate label)
       role=pattern_part            → keep id as-is (WB1 / WP1 / ...)
       kind starts with "fibonacci_" → line drawn but NO chart label
         (label still in right panel's auto-line list)
+
+    When `grouped_label_map` is provided (per role), the role's
+    combined label is rendered as a single badge instead of stacked
+    individual badges. Class names on the line element keep wnl-line
+    / entry-line etc. so geometry-aware tests still count line
+    elements per class. The entry-confirmation line additionally
+    receives `royal-road-neckline neckline-line entry-trigger-line`
+    so the user sees the neckline as the protagonist.
+
     Every element carries `data-line-id="<id>"` so the right-panel
     hide-list can toggle visibility from the side without requiring
     the user to tap thin SVG lines on a phone.
@@ -2785,7 +2989,13 @@ def _wave_derived_lines_svg_fragment(
         extra_classes: list[str] = []
         if line_role == "entry_confirmation_line":
             labels = ["WNL", "ENTRY"]
-            extra_classes = ["wnl-line", "entry-line"]
+            extra_classes = [
+                "wnl-line", "entry-line",
+                # Royal-road focus mode — promote the neckline as the
+                # chart protagonist.
+                "royal-road-neckline", "neckline-line",
+                "entry-trigger-line",
+            ]
         elif line_role == "stop_candidate":
             labels = ["WSL", "STOP"]
             extra_classes = ["wsl-line", "stop-line"]
@@ -2805,6 +3015,30 @@ def _wave_derived_lines_svg_fragment(
             f"wave-derived-line wave-derived-{_html_escape(kind)}"
             + ("".join(" " + c for c in extra_classes) if extra_classes else "")
         )
+        # Royal-road focus mode: when a grouped label exists for this
+        # role (e.g. "WNL / ENTRY / SNL1"), render a single combined
+        # badge instead of N stacked ones — the mockup shows that the
+        # 3 stacked badges (WNL, ENTRY, SNL1) crowd each other on
+        # mobile, so we group them into one bigger label.
+        grouped_label = None
+        group_class = ""
+        if grouped_label_map:
+            grouped_label = grouped_label_map.get(line_role)
+            if line_role == "entry_confirmation_line":
+                group_class = (
+                    "price-label-group price-label-group-entry "
+                    "neckline-group-label"
+                )
+            elif line_role == "stop_candidate":
+                group_class = (
+                    "price-label-group price-label-group-stop "
+                    "stop-group-label"
+                )
+            elif line_role == "target_candidate":
+                group_class = (
+                    "price-label-group price-label-group-target "
+                    "target-group-label"
+                )
         out.append(
             f"<line class='{cls}' "
             f"data-line-id='{_html_escape(line_id)}' "
@@ -2833,29 +3067,58 @@ def _wave_derived_lines_svg_fragment(
                     f"height='{abs(y_bot - y_top):.1f}' "
                     f"fill='{style['color']}' opacity='0.10'/>"
                 )
-        # Render each visible label as a stacked badge along the right
-        # edge so labels don't overlap when WNL+ENTRY share a line.
-        # Sizes are inflated for mobile-scaled SVG: at 390 px viewport
-        # the SVG is ~0.33× scale, so 22 px viewBox text → ~7 px on
-        # screen. Matching label-rect dimensions keep the badges legible.
-        for n, label in enumerate(labels):
-            label_w = max(58, 14 * len(label) + 14)
-            label_x = margin_l + 4 + n * (label_w + 6)
+        # Render badges. Royal-road focus mode renders a single
+        # combined "WNL / ENTRY / SNL1" badge per role so the chart
+        # doesn't get crowded; legacy/audit_all mode falls back to N
+        # stacked badges.
+        if grouped_label and labels:
+            label_w = max(180, 14 * len(grouped_label) + 14)
+            label_x = margin_l + 4
+            data_labels = ",".join(labels) + (
+                ",SNL1" if line_role == "entry_confirmation_line"
+                and "SNL" in grouped_label else
+                (",SIL1" if line_role == "stop_candidate"
+                 and "SIL" in grouped_label else
+                 (",STP1" if line_role == "target_candidate"
+                  and "STP" in grouped_label else ""))
+            )
             out.append(
+                f"<g class='{group_class}' "
+                f"data-line-id='{_html_escape(line_id)}' "
+                f"data-line-role='{_html_escape(line_role)}' "
+                f"data-labels='{_html_escape(data_labels)}'>"
                 f"<rect class='wave-derived-line-label-bg' "
                 f"data-line-id='{_html_escape(line_id)}' "
                 f"x='{label_x:.1f}' y='{y - 14:.1f}' "
                 f"width='{label_w}' height='28' fill='white' "
                 f"stroke='{style['color']}' stroke-width='2.0' rx='4'/>"
-            )
-            out.append(
                 f"<text class='wave-derived-line-label' "
                 f"data-line-id='{_html_escape(line_id)}' "
                 f"x='{label_x + label_w / 2:.1f}' y='{y + 7:.1f}' "
                 f"text-anchor='middle' fill='{style['color']}' "
                 f"font-weight='bold' font-size='22'>"
-                f"{_html_escape(label)}</text>"
+                f"{_html_escape(grouped_label)}</text>"
+                f"</g>"
             )
+        else:
+            for n, label in enumerate(labels):
+                label_w = max(58, 14 * len(label) + 14)
+                label_x = margin_l + 4 + n * (label_w + 6)
+                out.append(
+                    f"<rect class='wave-derived-line-label-bg' "
+                    f"data-line-id='{_html_escape(line_id)}' "
+                    f"x='{label_x:.1f}' y='{y - 14:.1f}' "
+                    f"width='{label_w}' height='28' fill='white' "
+                    f"stroke='{style['color']}' stroke-width='2.0' rx='4'/>"
+                )
+                out.append(
+                    f"<text class='wave-derived-line-label' "
+                    f"data-line-id='{_html_escape(line_id)}' "
+                    f"x='{label_x + label_w / 2:.1f}' y='{y + 7:.1f}' "
+                    f"text-anchor='middle' fill='{style['color']}' "
+                    f"font-weight='bold' font-size='22'>"
+                    f"{_html_escape(label)}</text>"
+                )
     out.append("</g>")
     return "".join(out)
 
@@ -2869,11 +3132,24 @@ def _wave_overlay_svg_fragment(
     price_lo: float, price_hi: float,
     margin_l: float, margin_t: float,
     plot_w: float, plot_h: float,
+    breakout_confirmed: bool = True,
 ) -> str:
     """Build the SVG <g> overlay for the wave skeleton.
 
     All pivots whose ts is outside the visible window are skipped.
     No price / index outside the supplied chart bounds is referenced.
+
+    Royal-road focus mode:
+      - When the matched_parts dict contains the canonical sequence
+        (DT: P1 → NL → P2 → BR; DB: B1 → NL → B2 → BR), an additional
+        ``<polyline class='wave-skeleton-line royal-road-wave-line'>``
+        is emitted that explicitly visits those pivots in royal-road
+        order so the user can read DT / DB structure at a glance.
+      - When ``breakout_confirmed=False`` and the matched_parts
+        contains BR, the BR label is rendered as ``BR?`` with class
+        ``wave-part-label-projected`` and ``data-projected='true'``,
+        so a WAIT_BREAKOUT case never visually claims the breakout
+        has already happened.
     """
     skel = wave_overlay.get("skeleton") or {}
     pivots = skel.get("pivots") or []
@@ -2966,6 +3242,10 @@ def _wave_overlay_svg_fragment(
 
     neckline_price: float | None = None
     neckline_label = "NL"
+    # Track per-part anchor coords so we can draw a royal-road
+    # wave-line polyline P1 → NL → P2 → BR (DT) or B1 → NL → B2 → BR
+    # (DB) in canonical procedure order.
+    part_to_xy: dict[str, tuple[float, float]] = {}
     for part_name, src_idx in matched_parts.items():
         if src_idx is None:
             continue
@@ -2981,10 +3261,25 @@ def _wave_overlay_svg_fragment(
         if not short_label:
             # Skip unmapped parts (do not emit ugly fallbacks like "lowe").
             continue
+        # Royal-road focus mode: "BR" only counts as confirmed when
+        # entry_plan.breakout_confirmed is True. When the breakout
+        # hasn't happened yet we render "BR?" with a projected class
+        # so the chart never visually claims the BR is final.
+        is_projected_br = (
+            short_label == "BR" and not breakout_confirmed
+        )
+        rendered_label = "BR?" if is_projected_br else short_label
+        part_class_extra = (
+            " wave-part-label-projected" if is_projected_br else ""
+        )
+        projected_attrs = (
+            " data-projected='true' data-reason='breakout_not_confirmed'"
+            if is_projected_br else ""
+        )
         # Background rect + text so labels stay readable over candles.
         # Mobile-scaled sizing — at 390 px the rect is ~0.33× so the
         # 28-px viewBox height shows as ~9 px on screen.
-        text_w = max(34, 14 * len(short_label) + 14)
+        text_w = max(34, 14 * len(rendered_label) + 14)
         text_h = 28
         # Place above the pivot for high pivots, below for lows.
         is_high = p.get("kind") == "H"
@@ -2994,22 +3289,24 @@ def _wave_overlay_svg_fragment(
         except (TypeError, ValueError):
             piv_price_for_label = 0.0
         out.append(
-            f"<rect class='wave-part-label-bg' "
+            f"<rect class='wave-part-label-bg{part_class_extra}' "
             f"data-part='{_html_escape(short_label)}' "
-            f"data-price='{piv_price_for_label:.6f}' "
+            f"data-price='{piv_price_for_label:.6f}'"
+            f"{projected_attrs} "
             f"x='{x - text_w / 2:.1f}' "
             f"y='{ty:.1f}' width='{text_w}' height='{text_h}' "
             f"fill='white' stroke='#0d47a1' stroke-width='2.0' "
             f"rx='4' ry='4'/>"
         )
         out.append(
-            f"<text class='wave-part-label' "
+            f"<text class='wave-part-label{part_class_extra}' "
             f"data-part='{_html_escape(short_label)}' "
-            f"data-price='{piv_price_for_label:.6f}' "
+            f"data-price='{piv_price_for_label:.6f}'"
+            f"{projected_attrs} "
             f"x='{x:.1f}' "
             f"y='{ty + text_h - 8:.1f}' text-anchor='middle' "
             f"fill='#0d47a1' font-weight='bold' font-size='22'>"
-            f"{_html_escape(short_label)}</text>"
+            f"{_html_escape(rendered_label)}</text>"
         )
         if "neckline" in part_name and neckline_price is None:
             try:
@@ -3017,6 +3314,35 @@ def _wave_overlay_svg_fragment(
                 neckline_label = short_label
             except (TypeError, ValueError):
                 pass
+        # Record the (x, y) for canonical part labels so we can
+        # build the royal-road wave-line polyline below.
+        part_to_xy[short_label] = (x, y)
+
+    # ── Royal-road wave-line polyline (Phase I follow-up) ──────────
+    # DT: P1 → NL → P2 → BR. DB: B1 → NL → B2 → BR. The line is
+    # drawn ON TOP of the canvas-pivot polyline so the user can read
+    # the canonical procedure order at a glance. Each visited part
+    # carries data-rr-step so consumers can grep the sequence.
+    if "BR" in part_to_xy:
+        canonical_seq: list[str] = []
+        if "P1" in part_to_xy and "NL" in part_to_xy and "P2" in part_to_xy:
+            canonical_seq = ["P1", "NL", "P2", "BR"]
+        elif "B1" in part_to_xy and "NL" in part_to_xy and "B2" in part_to_xy:
+            canonical_seq = ["B1", "NL", "B2", "BR"]
+        if canonical_seq:
+            poly_pts_rr = " ".join(
+                f"{part_to_xy[step][0]:.1f},{part_to_xy[step][1]:.1f}"
+                for step in canonical_seq
+            )
+            seq_attr = ",".join(canonical_seq)
+            out.append(
+                f"<polyline class='wave-skeleton-line royal-road-wave-line' "
+                f"data-rr-sequence='{_html_escape(seq_attr)}' "
+                f"points='{poly_pts_rr}' "
+                "fill='none' stroke='#0d47a1' stroke-width='4.5' "
+                "stroke-linecap='round' stroke-linejoin='round' "
+                "stroke-dasharray='8,4' opacity='0.6'/>"
+            )
 
     # 4. Neckline horizontal line (if a neckline part was matched)
     if neckline_price is not None and price_lo <= neckline_price <= price_hi:
@@ -3687,6 +4013,75 @@ img.thumb { width: 220px; height: auto; border: 1px solid #ddd; }
 .structural-line-conflict { color: #c62828; font-weight: bold; }
 .structural-line-none     { color: #6a6a6a; font-weight: bold; }
 .structural-line-unknown  { color: #6a6a6a; font-weight: bold; }
+/* Royal-road focus chart layout */
+.royal-road-focus-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: 16px;
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .royal-road-focus-layout {
+    grid-template-columns: 1fr;
+  }
+}
+.royal-road-main-chart-card {
+  background: #fff;
+  border: 1px solid #d8e0ef;
+  border-radius: 14px;
+  overflow: hidden;
+}
+.royal-road-compact-panel {
+  background: #fff;
+  border: 1px solid #c8d8f0;
+  border-radius: 14px;
+  padding: 14px;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+.royal-road-compact-panel h4 {
+  margin: 0 0 8px;
+  color: #0d47a1;
+  font-size: 14px;
+}
+.royal-road-compact-checklist {
+  display: grid;
+  grid-template-columns: 6em 1fr;
+  row-gap: 4px;
+  column-gap: 8px;
+  font-size: 12px;
+}
+.royal-road-compact-checklist dt {
+  color: #555;
+  font-weight: bold;
+  margin: 0;
+}
+.royal-road-compact-checklist dd {
+  margin: 0;
+  color: #14202c;
+}
+.royal-road-compact-result {
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: #f0f8f0;
+  border-left: 4px solid #2e7d32;
+  border-radius: 4px;
+  font-size: 12px;
+}
+.royal-road-detail-checklist { margin-top: 8px; }
+.royal-road-detail-checklist > summary {
+  cursor: pointer;
+  color: #1565c0;
+  font-size: 12px;
+  padding: 4px 0;
+}
+/* Royal-road focus chart strokes */
+.royal-road-main-structure-line { /* stroke / opacity set inline */ }
+.double-top-topline { /* alias for the user spec */ }
+.royal-road-wave-line { /* polyline visiting P1/B1 → NL → P2/B2 → BR */ }
+.wave-part-label-projected { opacity: 0.6; }
+.wave-part-label-projected text { font-style: italic; }
+.royal-procedure-marker-approx text { font-style: italic; }
 /* Phase I follow-up — royal-road procedure checklist panel */
 .g5-royal-road-procedure-panel { font-size: 12px; }
 .g5-royal-road-procedure-panel .royal-road-procedure-summary {
@@ -6782,15 +7177,36 @@ def _render_g5_structural_lines_html(snapshot: dict) -> str:
 
 def _render_g5_royal_road_procedure_html(
     checklist: dict,
+    structural_lines: dict | None = None,
+    entry_plan: dict | None = None,
 ) -> str:
     """Phase I follow-up — royal-road procedure checklist panel.
 
     Renders the 14-step procedure checklist in canonical royal-road
     order so the user can audit *why* the selected entry candidate
     is READY / WAIT / HOLD. Observation-only.
+
+    Mockup-aligned layout:
+      ┌── 王道手順チェック ─────────────────────┐
+      │ 環境認識: …                             │
+      │ ダウ:    …                              │
+      │ 波形:    …                              │
+      │ ネックライン: …                         │
+      │ トレンドライン: …                       │
+      │ ブレイク: …  リターンムーブ: …          │
+      │ 確認足:   …  RR: …                      │
+      │ 補助線:   …                             │
+      │ 結論:    …                              │
+      ├── 詳細14項目を見る (折りたたみ) ─────────┤
+      │ (existing 14-row table)                 │
+      └─────────────────────────────────────────┘
     """
     cl = checklist or {}
     steps = list(cl.get("steps") or [])
+    sl_payload = structural_lines or {}
+    sl_lines = list(sl_payload.get("lines") or [])
+    sl_counts = dict(sl_payload.get("counts") or {})
+    ep = entry_plan or {}
 
     if not steps:
         return (
@@ -6881,6 +7297,152 @@ def _render_g5_royal_road_procedure_html(
         + "</table>"
     )
 
+    # ── Compact panel (mockup-aligned summary view) ──────────────
+    # Build a sentence-style compact overview of the procedure so
+    # the right-hand column reads cleanly on mobile. The full
+    # 14-row table moves into a <details> below for users who want
+    # the audit trail.
+    by_key = {str(s.get("key") or ""): s for s in steps}
+
+    def _step_evidence(key: str) -> dict:
+        return dict((by_key.get(key) or {}).get("evidence") or {})
+
+    def _step_status(key: str) -> str:
+        return str((by_key.get(key) or {}).get("status") or "UNKNOWN")
+
+    # Environment / Dow / Pattern lines.
+    env_status = _step_status("environment")
+    env_text = (
+        "イベント危険なし" if env_status == "PASS"
+        else "イベント直前 (注意)" if env_status == "WARN"
+        else "イベント中 (BLOCK)" if env_status == "BLOCK"
+        else "—"
+    )
+    dow_ev = _step_evidence("dow_structure")
+    dow_text = str(dow_ev.get("dow_trend") or "—")
+    pat_ev = _step_evidence("wave_pattern")
+    pattern_text = (
+        str(pat_ev.get("pattern_kind") or "—")
+        if pat_ev.get("available") else "未認識"
+    )
+    # Neckline (wave_lines + structural neckline).
+    wl_ev = _step_evidence("wave_lines")
+    neckline_text = (
+        "明確 (WNL/WSL/WTP)"
+        if wl_ev.get("has_wnl")
+        and wl_ev.get("has_wsl")
+        and wl_ev.get("has_wtp")
+        else "不足"
+    )
+    # Trendline (numeric vs structural).
+    tl_ev = _step_evidence("trendline_context")
+    n_count = int(tl_ev.get("numeric_selected_count", 0) or 0)
+    s_count = int(tl_ev.get("structural_trendline_count", 0) or 0)
+    conflict_count = int(tl_ev.get("numeric_conflict_count", 0) or 0)
+    structural_top_id = ""
+    for ln in sl_lines:
+        if (
+            str(ln.get("kind") or "") == "structural_trendline"
+            and str(ln.get("role") or "") in (
+                "top_structure_line", "bottom_structure_line",
+            )
+        ):
+            structural_top_id = str(ln.get("id") or "")
+            break
+    if structural_top_id:
+        anchor_role = next(
+            (
+                str(ln.get("role"))
+                for ln in sl_lines
+                if str(ln.get("id") or "") == structural_top_id
+            ),
+            "",
+        )
+        anchor_pivots = (
+            "P1-P2" if anchor_role == "top_structure_line"
+            else "B1-B2"
+        )
+        tl_text = (
+            f"{structural_top_id} ({anchor_pivots})"
+            + (f" + numeric T1×{n_count}" if n_count else "")
+        )
+    elif s_count:
+        tl_text = f"構造ライン ×{s_count}"
+    elif n_count:
+        tl_text = f"numeric ×{n_count} (構造なし)"
+    else:
+        tl_text = "なし (要確認)"
+    if conflict_count:
+        tl_text += " ※ CONFLICT"
+    # Royal-road procedure status lines.
+    br_status = _step_status("breakout_confirmed")
+    rt_status = _step_status("retest_confirmed")
+    cc_status = _step_status("confirmation_candle")
+    rr_status = _step_status("rr_ok")
+    rr_ev = _step_evidence("rr_ok")
+    rr_text = (
+        f"RR={rr_ev.get('rr'):.2f}" if isinstance(rr_ev.get("rr"), (int, float))
+        else "—"
+    )
+
+    def _yn(s: str) -> str:
+        return (
+            "確認済み" if s == "PASS"
+            else "未確認" if s in ("WAIT", "BLOCK")
+            else "—"
+        )
+    # Confirmation candle text — surface the actual candle name.
+    cc_ev = _step_evidence("confirmation_candle")
+    cc_text = (
+        str(cc_ev.get("confirmation_candle") or "")
+        if cc_status == "PASS" else _yn(cc_status)
+    )
+    if not cc_text:
+        cc_text = _yn(cc_status)
+
+    # Conclusion line (mirrors the full summary but tighter).
+    conclusion = str(cl.get("summary_ja") or "")
+    side_for_conclusion = side
+    if final_status == "READY" and side_for_conclusion in ("BUY", "SELL"):
+        conclusion = (
+            "ネックラインブレイク + リターンムーブ + 確認足 + RR成立で "
+            f"{side_for_conclusion} READY"
+        )
+
+    compact_panel_html = (
+        "<div class='royal-road-compact-panel'>"
+        "<h4>王道手順チェック (要約)</h4>"
+        "<dl class='royal-road-compact-checklist'>"
+        f"<dt>環境認識</dt><dd>{_html_escape(env_text)}</dd>"
+        f"<dt>ダウ</dt><dd>{_html_escape(dow_text)}</dd>"
+        f"<dt>波形</dt><dd>{_html_escape(pattern_text)}</dd>"
+        f"<dt>ネックライン</dt><dd>{_html_escape(neckline_text)}</dd>"
+        f"<dt>トレンドライン</dt><dd>{_html_escape(tl_text)}</dd>"
+        f"<dt>ブレイク</dt><dd>{_html_escape(_yn(br_status))}</dd>"
+        f"<dt>リターンムーブ</dt>"
+        f"<dd>{_html_escape(_yn(rt_status))}</dd>"
+        f"<dt>確認足</dt><dd>{_html_escape(cc_text)}</dd>"
+        f"<dt>RR</dt><dd>{_html_escape(rr_text)} "
+        f"({_html_escape(rr_status)})</dd>"
+        f"<dt>補助線</dt>"
+        f"<dd>numeric T×{n_count} / structural STL×{s_count}"
+        + (f" / CONFLICT×{conflict_count}" if conflict_count else "")
+        + "</dd>"
+        "</dl>"
+        f"<div class='royal-road-compact-result'>"
+        f"<b>結論:</b> {_html_escape(conclusion)}"
+        "</div>"
+        "</div>"
+    )
+
+    detail_html = (
+        "<details class='royal-road-detail-checklist'>"
+        "<summary>詳細14項目を見る</summary>"
+        + summary_html
+        + table_html
+        + "</details>"
+    )
+
     return (
         "<div class='g5-row g5-royal-road-procedure-panel' "
         "data-royal-road-procedure-schema="
@@ -6889,8 +7451,8 @@ def _render_g5_royal_road_procedure_html(
         f"data-royal-road-p0-pass='{int(p0_pass)}' "
         f"data-royal-road-final-status='{_html_escape(final_status)}'>"
         "<h4>7. 王道手順チェック</h4>"
-        + summary_html
-        + table_html
+        + compact_panel_html
+        + detail_html
         + "</div>"
     )
 
@@ -7343,7 +7905,9 @@ def _render_g5_right_panel_html(
         v2.get("royal_road_procedure_checklist") or {}
     )
     royal_road_panel_html = _render_g5_royal_road_procedure_html(
-        royal_road_checklist
+        royal_road_checklist,
+        structural_lines=v2.get("structural_lines") or {},
+        entry_plan=v2.get("entry_plan") or {},
     )
 
     # Row 8 — 構造ライン (Phase I follow-up: wave-context lines,
@@ -7572,8 +8136,10 @@ def _mobile_case_section_html(
         section_id=section_id,
     )
     phase_g_chart_with_panel = (
-        "<div class='g5-chart-row'>"
-        "<div class='g5-chart-cell'>" + chart_html + "</div>"
+        "<div class='g5-chart-row royal-road-focus-layout'>"
+        "<div class='g5-chart-cell royal-road-main-chart-card'>"
+        + chart_html
+        + "</div>"
         + phase_g_right_panel
         + "</div>"
     )
@@ -7894,6 +8460,9 @@ def render_visual_audit_mobile_single_file(
                     entry_plan=_ep_for_status,
                     structural_lines=(
                         _v2_for_status.get("structural_lines") or {}
+                    ),
+                    pattern_levels=(
+                        _v2_for_status.get("pattern_levels") or {}
                     ),
                 )
             except Exception:  # noqa: BLE001

@@ -125,12 +125,22 @@ def test_main_svg_contains_structural_line_classes(built_htmls):
     assert "data-structural-line-id" in svg
 
 
-def test_main_svg_renders_snl_label(built_htmls):
+def test_main_svg_surfaces_snl1_in_grouped_label(built_htmls):
+    """In royal-road focus mode, SNL1 lives inside the grouped
+    neckline badge "WNL / ENTRY / SNL1" rather than a separate
+    `<text>SNL1</text>` element. The id must still be grep-able
+    via the data-structural-line-id attribute on the placeholder
+    line element so consumers (audits, scripts) can correlate the
+    neckline to the structural-lines payload."""
     html = built_htmls["double_top_integrated_sell_demo"]
     svg = _extract_main_svg(html)
-    assert ">SNL1<" in svg, (
-        "structural-neckline label SNL1 missing from main SVG"
+    assert "WNL / ENTRY / SNL1" in svg, (
+        "grouped neckline label 'WNL / ENTRY / SNL1' missing"
     )
+    assert (
+        "data-structural-line-id='SNL1'" in svg
+        or "data-structural-line-id=\"SNL1\"" in svg
+    ), "SNL1 id placeholder element missing from main SVG"
 
 
 def test_main_svg_distinguishes_numeric_t_labels_from_structural(
