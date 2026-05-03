@@ -1198,6 +1198,12 @@ def build_visual_audit_payload(
         # at a glance what actually drove the final action vs what is
         # purely observation. Observation-only.
         "decision_bridge": decision_bridge,
+        # Phase G — fundamental_sidebar / user_chart_annotations are
+        # surfaced top-level so the chart SVG renderer + right-info
+        # panel can read them without digging through the v2 advisory.
+        # Both are observation-only.
+        "fundamental_sidebar": (v2 or {}).get("fundamental_sidebar"),
+        "user_chart_annotations": (v2 or {}).get("user_chart_annotations"),
         # Full v2 payload preserved so the audit is self-contained
         # (no need to read the JSONL trace separately).
         "royal_road_decision_v2": v2,
@@ -1467,6 +1473,8 @@ def _build_candle_svg_xml(
     title: str,
     wave_overlay: dict | None = None,
     wave_derived_lines: list[dict] | None = None,
+    events_for_chart: list[dict] | None = None,
+    user_annotations: list[dict] | None = None,
 ) -> str | None:
     """Build the SVG candle-chart as an XML string.
 
@@ -1795,6 +1803,33 @@ def _build_candle_svg_xml(
         parts.append(
             _wave_derived_lines_svg_fragment(
                 wave_derived_lines=wave_derived_lines,
+                y_of=y_of,
+                price_lo=price_lo, price_hi=price_hi,
+                margin_l=margin_l, margin_t=margin_t,
+                plot_w=plot_w, plot_h=plot_h,
+            )
+        )
+
+    # ---- event-risk bands (Phase G) -----------------------------
+    # Each event is rendered as: vertical line at event timestamp +
+    # red/orange translucent rectangle covering ± window_hours, plus
+    # a label tag. Only events within the visible window are drawn.
+    if events_for_chart:
+        parts.append(
+            _event_bands_svg_fragment(
+                events=events_for_chart,
+                visible_index=list(visible.index),
+                x_of=x_of,
+                margin_t=margin_t, plot_h=plot_h, plot_w=plot_w,
+                bar_w=bar_w, margin_l=margin_l,
+            )
+        )
+
+    # ---- user manual annotations (Phase G, observation-only) ----
+    if user_annotations:
+        parts.append(
+            _user_annotations_svg_fragment(
+                annotations=user_annotations,
                 y_of=y_of,
                 price_lo=price_lo, price_hi=price_hi,
                 margin_l=margin_l, margin_t=margin_t,
@@ -2158,6 +2193,173 @@ _WAVE_LINE_STYLE: Final[dict] = {
     "fibonacci_retracement": {"color": "#00838f", "dash": "3,3", "width": 1.2},
     "fibonacci_extension":   {"color": "#00695c", "dash": "3,3", "width": 1.2},
 }
+
+
+def _event_bands_svg_fragment(
+    *,
+    events: list[dict] | None,
+    visible_index: list,
+    x_of,
+    margin_t: float, plot_h: float, plot_w: float,
+    bar_w: float, margin_l: float,
+) -> str:
+    """Phase G — render high-impact economic events as vertical
+    bands on the chart.
+
+    Each event becomes:
+      - A red/orange translucent rectangle covering ± window_hours
+      - A dashed vertical line at the event timestamp itself
+      - A label tag (FOMC / BOJ / CPI / NFP / etc.)
+
+    Events whose centre falls outside the visible window are skipped.
+    The event dict is the per-event shape produced by
+    `fundamental_sidebar.build_fundamental_sidebar` (status / when /
+    minutes_until / window_hours / kind / impact / title).
+    """
+    if not events or not visible_index:
+        return ""
+    try:
+        first_ts = pd.Timestamp(visible_index[0])
+        last_ts = pd.Timestamp(visible_index[-1])
+    except Exception:  # noqa: BLE001
+        return ""
+    n = len(visible_index)
+    if n < 2:
+        return ""
+    span_seconds = (last_ts - first_ts).total_seconds()
+    if span_seconds <= 0:
+        return ""
+
+    def _index_to_x(ts: pd.Timestamp) -> float | None:
+        delta = (ts - first_ts).total_seconds()
+        # Allow events slightly outside the window to still anchor at edge
+        frac = delta / span_seconds
+        # Clamp to [-0.05, 1.05] so off-screen events don't render
+        if frac < -0.05 or frac > 1.05:
+            return None
+        # Map to chart x: bar i centre at margin_l + (i + 0.5) * bar_w
+        i_float = frac * (n - 1)
+        return margin_l + (i_float + 0.5) * bar_w
+
+    out: list[str] = ["<g class='event-bands'>"]
+    for ev in events:
+        when_str = ev.get("when")
+        if not when_str:
+            continue
+        try:
+            when_ts = pd.Timestamp(when_str)
+        except Exception:  # noqa: BLE001
+            continue
+        window_h = float(ev.get("window_hours") or 0.0)
+        status = (ev.get("status") or "").upper()
+        if status == "BLOCK":
+            color = "#c62828"
+            stroke = "#b71c1c"
+            opacity = "0.18"
+        elif status == "WARNING":
+            color = "#f9a825"
+            stroke = "#e65100"
+            opacity = "0.12"
+        else:
+            color = "#90a4ae"
+            stroke = "#546e7a"
+            opacity = "0.08"
+
+        x_center = _index_to_x(when_ts)
+        if x_center is None:
+            continue
+        # Window rectangle: x_center ± (window_h / span_h) * plot_w
+        if window_h > 0 and span_seconds > 0:
+            half_w_px = (window_h * 3600.0 / span_seconds) * plot_w
+            x_left = max(margin_l, x_center - half_w_px)
+            x_right = min(margin_l + plot_w, x_center + half_w_px)
+            rect_w = max(0.0, x_right - x_left)
+            if rect_w > 0:
+                out.append(
+                    f"<rect class='event-window event-{status.lower()}' "
+                    f"x='{x_left:.1f}' y='{margin_t:.1f}' "
+                    f"width='{rect_w:.1f}' height='{plot_h:.1f}' "
+                    f"fill='{color}' opacity='{opacity}' />"
+                )
+        # Vertical centre line (dashed)
+        out.append(
+            f"<line class='event-center event-{status.lower()}' "
+            f"x1='{x_center:.1f}' x2='{x_center:.1f}' "
+            f"y1='{margin_t:.1f}' y2='{margin_t + plot_h:.1f}' "
+            f"stroke='{stroke}' stroke-width='1.4' "
+            f"stroke-dasharray='4,3' opacity='0.85' />"
+        )
+        # Label tag at top of chart
+        kind = ev.get("kind") or ev.get("impact") or "EVENT"
+        title_text = (ev.get("title") or "")[:24]
+        label = f"{kind}"
+        if title_text and title_text != kind:
+            label = f"{kind} ({title_text})"
+        out.append(
+            f"<text class='event-label event-{status.lower()}' "
+            f"x='{x_center + 3:.1f}' y='{margin_t + 12:.1f}' "
+            f"fill='{stroke}' font-size='10' font-weight='bold'>"
+            f"{_html_escape(label)}</text>"
+        )
+    out.append("</g>")
+    return "".join(out)
+
+
+def _user_annotations_svg_fragment(
+    *,
+    annotations: list[dict] | None,
+    y_of,
+    price_lo: float, price_hi: float,
+    margin_l: float, margin_t: float,
+    plot_w: float, plot_h: float,
+) -> str:
+    """Phase G — render user-supplied chart annotations (manual lines).
+
+    Only ACTIVE annotations are drawn. Each is rendered with
+    distinctive styling (dashed orange) so the user can tell their
+    own lines apart from the automatic wave-derived lines.
+
+    REJECTED_BY_USER annotations are intentionally NOT drawn (the
+    user's act of rejecting a line means they don't want to see it).
+    """
+    if not annotations:
+        return ""
+    out: list[str] = ["<g class='user-annotations'>"]
+    for ann in annotations:
+        if (ann.get("status") or "ACTIVE") != "ACTIVE":
+            continue
+        kind = (ann.get("kind") or "").lower()
+        # Horizontal-line types: support / resistance / neckline / stop / target
+        # take the first point's price and draw across the chart.
+        points = ann.get("points") or []
+        if not points:
+            continue
+        first = points[0]
+        price = first.get("price")
+        if price is None:
+            continue
+        try:
+            y = y_of(float(price))
+        except Exception:  # noqa: BLE001
+            continue
+        out.append(
+            f"<line class='user-line user-{kind}' "
+            f"x1='{margin_l:.1f}' x2='{margin_l + plot_w:.1f}' "
+            f"y1='{y:.1f}' y2='{y:.1f}' "
+            f"stroke='#d84315' stroke-width='1.4' "
+            f"stroke-dasharray='6,4' opacity='0.85' />"
+        )
+        ann_id = ann.get("id") or ""
+        label = ann.get("label") or ann_id
+        if label:
+            out.append(
+                f"<text class='user-line-label' "
+                f"x='{margin_l + 4:.1f}' y='{y - 2:.1f}' "
+                f"fill='#d84315' font-size='10'>"
+                f"{_html_escape(str(label)[:32])}</text>"
+            )
+    out.append("</g>")
+    return "".join(out)
 
 
 def _wave_derived_lines_svg_fragment(
@@ -5361,6 +5563,17 @@ def render_visual_audit_mobile_single_file(
         if df is not None and len(df) > 0:
             try:
                 end_ts = pd.Timestamp(payload["parent_bar_ts"])
+                # Phase G — pull event bands + user annotations from
+                # payload (when the integrated profile populated them
+                # via fundamental_sidebar / user_chart_annotations).
+                fs_payload = payload.get("fundamental_sidebar") or {}
+                events_for_chart = (
+                    list(fs_payload.get("blocking_events") or [])
+                    + list(fs_payload.get("warning_events") or [])
+                )
+                user_annotations_payload = (
+                    payload.get("user_chart_annotations") or {}
+                ).get("annotations") or []
                 svg_xml = _build_candle_svg_xml(
                     df=df, end_ts=end_ts,
                     n_bars=int(payload.get("bars_used_in_render") or 0),
@@ -5368,6 +5581,8 @@ def render_visual_audit_mobile_single_file(
                     title=svg_user_title,
                     wave_overlay=wave_overlay,
                     wave_derived_lines=wd_lines,
+                    events_for_chart=events_for_chart or None,
+                    user_annotations=user_annotations_payload or None,
                 )
             except Exception:  # noqa: BLE001
                 svg_xml = None
