@@ -1616,6 +1616,10 @@ def _build_candle_svg_xml(
         f"<text x='{margin_l}' y='18' fill='#222' font-weight='bold'>"
         f"{_html_escape(title)}</text>"
     )
+    # Selected SR zones — rect + label (S1/S2/.../R1/R2/...) so
+    # geometry-aware tests can count zones by class and verify labels.
+    sup_n = 0
+    res_n = 0
     for lvl in ov.get("level_zones_selected", []):
         zlow = lvl.get("zone_low"); zhigh = lvl.get("zone_high")
         if zlow is None or zhigh is None:
@@ -1628,20 +1632,50 @@ def _build_candle_svg_xml(
         )
         y_top = y_of(float(zhigh))
         y_bot = y_of(float(zlow))
+        zone_subclass = (
+            "support-zone" if kind == "support"
+            else "resistance-zone" if kind == "resistance"
+            else "sr-zone"
+        )
         parts.append(
-            f"<rect class='sr-selected sr-{kind}' "
+            f"<rect class='sr-selected sr-zone-selected sr-{kind} {zone_subclass}' "
+            f"data-zone-kind='{_html_escape(str(kind))}' "
+            f"data-price-low='{float(zlow):.6f}' "
+            f"data-price-high='{float(zhigh):.6f}' "
             f"x='{margin_l}' y='{min(y_top, y_bot):.1f}' "
             f"width='{plot_w}' height='{abs(y_bot - y_top):.1f}' "
             f"fill='{color}' opacity='0.18'/>"
         )
+        # S1 / S2 / ... or R1 / R2 / ... label tag at left edge.
+        if kind == "support":
+            sup_n += 1
+            tag = f"S{sup_n}"
+        elif kind == "resistance":
+            res_n += 1
+            tag = f"R{res_n}"
+        else:
+            tag = "SR"
+        ty = (y_top + y_bot) / 2
+        parts.append(
+            f"<rect class='sr-zone-label-bg' "
+            f"x='{margin_l + 4}' y='{ty - 8:.1f}' width='28' height='16' "
+            f"fill='white' stroke='{color}' stroke-width='1' rx='3'/>"
+        )
+        parts.append(
+            f"<text class='sr-zone-label' x='{margin_l + 18}' y='{ty + 4:.1f}' "
+            f"text-anchor='middle' fill='{color}' font-weight='bold' "
+            f"font-size='11'>{tag}</text>"
+        )
+    rej_n = 0
     for lvl in ov.get("level_zones_rejected", []):
         zlow = lvl.get("zone_low"); zhigh = lvl.get("zone_high")
         if zlow is None or zhigh is None:
             continue
         y_top = y_of(float(zhigh))
         y_bot = y_of(float(zlow))
+        rej_n += 1
         parts.append(
-            f"<rect class='sr-rejected' "
+            f"<rect class='sr-rejected sr-zone-rejected' "
             f"x='{margin_l}' y='{min(y_top, y_bot):.1f}' "
             f"width='{plot_w}' height='{abs(y_bot - y_top):.1f}' "
             f"fill='#888' opacity='0.08'/>"
@@ -1665,6 +1699,10 @@ def _build_candle_svg_xml(
             f"width='{body_w:.1f}' height='{body_h:.1f}' "
             f"fill='{color}'/>"
         )
+    # Trendlines selected — line + T1/T2/T3 labels at the right edge
+    # so geometry-aware tests can count both the line geometry and
+    # the human-facing labels.
+    tl_idx = 0
     for t in ov.get("trendlines_selected", []):
         slope = t.get("slope"); intercept = t.get("intercept")
         anchors = t.get("anchor_indices") or []
@@ -1679,11 +1717,29 @@ def _build_candle_svg_xml(
         y1 = y_of(slope * i1 + intercept)
         broken = bool(t.get("broken"))
         opacity = "0.55" if broken else "0.9"
+        tl_idx += 1
+        tag = f"T{tl_idx}"
         parts.append(
-            f"<line class='trendline-selected' x1='{x_of(i0):.1f}' "
+            f"<line class='trendline-selected trendline-selected-{tl_idx}' "
+            f"data-trendline-idx='{tl_idx}' "
+            f"data-slope='{float(slope):.6e}' "
+            f"x1='{x_of(i0):.1f}' "
             f"y1='{y0:.1f}' x2='{x_of(i1):.1f}' y2='{y1:.1f}' "
             f"stroke='#1565c0' stroke-width='1.4' opacity='{opacity}'/>"
         )
+        # Label at the right end of the segment
+        parts.append(
+            f"<rect class='trendline-label-bg' "
+            f"x='{x_of(i1) - 24:.1f}' y='{y1 - 8:.1f}' "
+            f"width='22' height='16' fill='white' stroke='#1565c0' "
+            f"stroke-width='1' rx='3'/>"
+        )
+        parts.append(
+            f"<text class='trendline-label' x='{x_of(i1) - 13:.1f}' "
+            f"y='{y1 + 4:.1f}' text-anchor='middle' fill='#1565c0' "
+            f"font-weight='bold' font-size='11'>{tag}</text>"
+        )
+    xt_idx = 0
     for rj in ov.get("trendlines_rejected", []):
         tdict = rj.get("trendline") or {}
         slope = tdict.get("slope"); intercept = tdict.get("intercept")
@@ -1697,11 +1753,21 @@ def _build_candle_svg_xml(
             continue
         y0 = y_of(slope * i0 + intercept)
         y1 = y_of(slope * i1 + intercept)
+        xt_idx += 1
         parts.append(
-            f"<line class='trendline-rejected' x1='{x_of(i0):.1f}' "
+            f"<line class='trendline-rejected trendline-rejected-{xt_idx}' "
+            f"data-trendline-rej-idx='{xt_idx}' "
+            f"x1='{x_of(i0):.1f}' "
             f"y1='{y0:.1f}' x2='{x_of(i1):.1f}' y2='{y1:.1f}' "
             f"stroke='#888' stroke-width='0.7' opacity='0.5' "
             f"stroke-dasharray='3,3'/>"
+        )
+        # Tiny XT label so the user can see rejected ones exist
+        parts.append(
+            f"<text class='trendline-rejected-label' "
+            f"x='{x_of(i1) - 4:.1f}' y='{y1 + 4:.1f}' "
+            f"text-anchor='end' fill='#888' font-size='9'>"
+            f"XT{xt_idx}</text>"
         )
     for p in ov.get("patterns_selected", []):
         side = p.get("side_bias")
@@ -1898,6 +1964,26 @@ def _build_candle_svg_xml(
                 f"font-weight='bold' font-size='12'>"
                 f"{_html_escape(text)}</text>"
             )
+
+    # 0-line warnings — surface "no trendlines" / "no SR" inside the
+    # chart so the user knows the system genuinely found 0, not that
+    # the renderer dropped them.
+    n_sel_tl = len((overlays or {}).get("trendlines_selected") or [])
+    n_sel_sr = len((overlays or {}).get("level_zones_selected") or [])
+    if n_sel_tl == 0:
+        parts.append(
+            f"<text class='no-detection-warning no-trendlines' "
+            f"x='{margin_l + 6:.1f}' y='{margin_t + plot_h - 24:.1f}' "
+            f"fill='#bf360c' font-size='10' font-weight='bold' "
+            f"opacity='0.85'>トレンドライン検出: 0本</text>"
+        )
+    if n_sel_sr == 0:
+        parts.append(
+            f"<text class='no-detection-warning no-sr' "
+            f"x='{margin_l + 6:.1f}' y='{margin_t + plot_h - 10:.1f}' "
+            f"fill='#bf360c' font-size='10' font-weight='bold' "
+            f"opacity='0.85'>サポレジ検出: 0本</text>"
+        )
 
     parts.append("</svg>\n")
     return "".join(parts)
@@ -2489,24 +2575,40 @@ def _wave_derived_lines_svg_fragment(
         })
         line_id = line.get("id", "")
         line_role = line.get("role", "")
-        # Build the visible label set per role.
+        # Build the visible label set per role + role-specific extra
+        # CSS classes so geometry-aware tests can count lines by class
+        # (e.g. wnl-line / wsl-line / wtp-line / entry-line / stop-line
+        # / tp-line). Each W role spawns BOTH a W class and an action
+        # class on the same horizontal line element.
         labels: list[str] = []
+        extra_classes: list[str] = []
         if line_role == "entry_confirmation_line":
             labels = ["WNL", "ENTRY"]
+            extra_classes = ["wnl-line", "entry-line"]
         elif line_role == "stop_candidate":
             labels = ["WSL", "STOP"]
+            extra_classes = ["wsl-line", "stop-line"]
         elif line_role == "target_candidate":
             labels = ["WTP", "TP"]
+            extra_classes = ["wtp-line", "tp-line"]
         elif line_role == "breakout_line":
             labels = ["WBR"]
+            extra_classes = ["wbr-line"]
         elif line_role == "pattern_part" and not kind.startswith(
             "fibonacci_"
         ) and line_id:
             labels = [line_id]
+            extra_classes = ["wave-pattern-part-line"]
         # else (fibonacci_*, unknown roles) → line only, no chart label
+        cls = (
+            f"wave-derived-line wave-derived-{_html_escape(kind)}"
+            + ("".join(" " + c for c in extra_classes) if extra_classes else "")
+        )
         out.append(
-            f"<line class='wave-derived-line wave-derived-{_html_escape(kind)}' "
+            f"<line class='{cls}' "
             f"data-line-id='{_html_escape(line_id)}' "
+            f"data-line-role='{_html_escape(line_role)}' "
+            f"data-price='{price:.6f}' "
             f"x1='{margin_l:.1f}' y1='{y:.1f}' "
             f"x2='{margin_l + plot_w:.1f}' y2='{y:.1f}' "
             f"stroke='{style['color']}' stroke-width='{style['width']}' "
@@ -2617,11 +2719,23 @@ def _wave_overlay_svg_fragment(
         f"stroke-linecap='round' stroke-linejoin='round' opacity='0.85'/>"
     )
 
-    # 2. Pivot dots
+    # 2. Pivot dots — carry data-* so geometry-aware tests can verify
+    # they map to real bar indices and pivot prices, not fixed coords.
     for x, y, p in points_xy:
         kind_marker = p.get("kind", "")
+        try:
+            piv_price = float(p.get("price"))
+        except (TypeError, ValueError):
+            piv_price = 0.0
+        try:
+            piv_idx = int(p.get("index"))
+        except (TypeError, ValueError):
+            piv_idx = -1
         out.append(
-            f"<circle class='wave-pivot-dot' cx='{x:.1f}' cy='{y:.1f}' "
+            f"<circle class='wave-pivot-dot' "
+            f"data-price='{piv_price:.6f}' data-idx='{piv_idx}' "
+            f"data-pivot-kind='{_html_escape(kind_marker)}' "
+            f"cx='{x:.1f}' cy='{y:.1f}' "
             f"r='4' fill='#0d47a1' stroke='white' stroke-width='1.2'/>"
         )
         if kind_marker:
@@ -2632,7 +2746,8 @@ def _wave_overlay_svg_fragment(
             )
 
     # 3. Pattern part labels — map matched_parts to pivots and emit
-    #    "B1 (1回目の底)" style boxed labels.
+    #    "B1 (1回目の底)" style boxed labels with data-part attribute
+    #    for geometry-aware tests.
     family_marker_map = _PATTERN_FAMILY_MARKER
     label_map = _PATTERN_PART_LABELS
 
@@ -2668,14 +2783,24 @@ def _wave_overlay_svg_fragment(
         # Place above the pivot for high pivots, below for lows.
         is_high = p.get("kind") == "H"
         ty = (y - 18) if is_high else (y + 6)
+        try:
+            piv_price_for_label = float(p.get("price"))
+        except (TypeError, ValueError):
+            piv_price_for_label = 0.0
         out.append(
-            f"<rect class='wave-part-label-bg' x='{x - text_w / 2:.1f}' "
+            f"<rect class='wave-part-label-bg' "
+            f"data-part='{_html_escape(short_label)}' "
+            f"data-price='{piv_price_for_label:.6f}' "
+            f"x='{x - text_w / 2:.1f}' "
             f"y='{ty:.1f}' width='{text_w}' height='{text_h}' "
             f"fill='white' stroke='#0d47a1' stroke-width='1.2' "
             f"rx='3' ry='3'/>"
         )
         out.append(
-            f"<text class='wave-part-label' x='{x:.1f}' "
+            f"<text class='wave-part-label' "
+            f"data-part='{_html_escape(short_label)}' "
+            f"data-price='{piv_price_for_label:.6f}' "
+            f"x='{x:.1f}' "
             f"y='{ty + text_h - 5:.1f}' text-anchor='middle' "
             f"fill='#0d47a1' font-weight='bold' font-size='11'>"
             f"{_html_escape(short_label)}</text>"
@@ -5741,44 +5866,98 @@ def _select_wave_overlay(
     """Pick the best per-scale skeleton + matched parts for chart
     overlay. Returns None when no candidate is available.
 
-    Selection rule:
-      1. Prefer wave_shape_review.best_pattern (which already has a
-         shape_score >= CANDIDATE threshold).
-      2. Use that match's `scale` to look up the scale's wave_skeleton
-         in royal_road_decision_v2.multi_scale_chart.
-      3. Use best_pattern.matched_parts as the part-name → pivot.index
-         mapping for label rendering.
-      4. Phase G follow-up: when wave_shape_review is empty but
-         pattern_level_derivation produced a pattern_levels dict with
-         parts (B1/B2/P1/P2/LS/H/RS/NL/BR), synthesise a wave_overlay
-         from pattern_levels so the chart still shows a visible
-         polyline + part labels. Without this fallback the integrated
-         profile renders only the WFIB lines (because wave_shape_review
-         is often empty in the engine path) and the user can no longer
-         see the recognised pattern on the chart.
+    Selection priority (Phase F/G follow-up #3):
+      1. multi_scale_chart skeletons — use the richest scale that has
+         pivots (medium > short > long > micro). Match parts back from
+         pattern_levels.parts when available.
+      2. wave_shape_review.best_pattern — use its referenced scale's
+         skeleton from multi_scale_chart.scales.
+      3. pattern_levels.parts fallback — synthesise a 2-to-N pivot
+         skeleton from the canonical part dict. Marked as fallback
+         in the returned dict so the renderer can warn the user.
     """
+    v2 = payload.get("royal_road_decision_v2") or {}
+    multi = v2.get("multi_scale_chart") or {}
+    scales_dict = multi.get("scales") or {}
+    pl = v2.get("pattern_levels") or {}
+    pl_parts = pl.get("parts") or {}
+    pl_kind = pl.get("pattern_kind") or ""
+    pl_side = (pl.get("side") or "").upper()
+
+    # Helper: build matched_parts from pattern_levels.parts by snapping
+    # each canonical part's df index to the nearest skeleton pivot.
+    def _matched_from_pl(skel_pivots: list[dict]) -> dict[str, int]:
+        if not pl_parts or not skel_pivots:
+            return {}
+        out: dict[str, int] = {}
+        for label, p in pl_parts.items():
+            if not isinstance(p, dict):
+                continue
+            try:
+                target_idx = int(p["index"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            best_p = min(
+                skel_pivots,
+                key=lambda piv: abs(int(piv.get("index") or 0) - target_idx),
+                default=None,
+            )
+            if best_p is not None:
+                out[label] = int(best_p.get("index") or target_idx)
+        return out
+
+    # When wave_shape_review supplies a best_pattern that names a
+    # specific scale, prefer THAT scale (it carries matched_parts).
+    # Otherwise pick the richest available scale by priority order.
     review = payload.get("wave_shape_review") or {}
     best = review.get("best_pattern") or {}
-    if best:
-        scale = best.get("scale")
-        v2 = payload.get("royal_road_decision_v2") or {}
-        multi = v2.get("multi_scale_chart") or {}
-        scales = multi.get("scales") or {}
-        skel = (scales.get(scale) or {}).get("wave_skeleton") or {}
-        if skel.get("pivots"):
-            return {
-                "skeleton": skel,
-                "matched_parts": best.get("matched_parts") or {},
-                "kind": best.get("kind") or "",
-                "human_label": best.get("human_label") or "",
-                "status": best.get("status") or "",
-                "side_bias": best.get("side_bias") or "",
-                "shape_score": best.get("shape_score"),
-            }
-    # Fallback: synthesise from pattern_levels.
-    v2 = payload.get("royal_road_decision_v2") or {}
-    pl = v2.get("pattern_levels") or {}
-    parts = pl.get("parts") or {}
+    best_scale = best.get("scale") or ""
+    best_kind = best.get("kind") or ""
+    best_matched = best.get("matched_parts") or {}
+
+    # Path 1 — multi_scale_chart, preferring best_pattern.scale first
+    scale_priority = []
+    if best_scale and best_scale in scales_dict:
+        scale_priority.append(best_scale)
+    for sc in ("medium", "short", "long", "micro"):
+        if sc not in scale_priority:
+            scale_priority.append(sc)
+    for sc in scale_priority:
+        scale_blob = scales_dict.get(sc) or {}
+        skel = scale_blob.get("wave_skeleton") or {}
+        pivots_list = skel.get("pivots") or []
+        if not pivots_list:
+            continue
+        # Kind precedence: best_pattern.kind > pl.pattern_kind
+        kind_for_overlay = best_kind or pl_kind
+        # When best_pattern is the source of truth (its scale matches),
+        # use its matched_parts; otherwise snap pattern_levels parts to
+        # the scale's pivots.
+        if sc == best_scale and best_matched:
+            matched_for_overlay = dict(best_matched)
+        else:
+            matched_for_overlay = _matched_from_pl(pivots_list)
+        return {
+            "skeleton": skel,
+            "matched_parts": matched_for_overlay,
+            "kind": kind_for_overlay,
+            "human_label": (
+                best.get("human_label")
+                or _PATTERN_KIND_HUMAN_JA.get(kind_for_overlay, kind_for_overlay)
+                or kind_for_overlay
+            ),
+            "status": best.get("status") or pl.get("status") or "",
+            "side_bias": (best.get("side_bias") or pl_side or ""),
+            "shape_score": best.get("shape_score"),
+            "fallback_used": False,
+            "source": f"multi_scale_chart.scales.{sc}",
+        }
+
+    # Path 2 was merged into Path 1 above (best_pattern.scale is now
+    # tried first when present). Path 3 (pattern_levels.parts synth)
+    # remains below.
+    # Path 3 (last resort) — synthesise from pattern_levels.parts.
+    parts = pl_parts
     if not parts or df is None or len(df) == 0:
         return None
     # Build a synthetic skeleton + matched_parts from pattern_levels.
@@ -5852,6 +6031,8 @@ def _select_wave_overlay(
         "status": pl.get("status") or "",
         "side_bias": pl_side,
         "shape_score": None,
+        "fallback_used": True,
+        "source": "pattern_levels.parts (synthesised)",
     }
 
 
@@ -6391,6 +6572,42 @@ def _render_g5_right_panel_html(
         wave_derived_lines=wd_lines, section_id=section_id,
     )
 
+    # Row 6b — 検出統計 (Phase F/G follow-up #7)
+    # Surface trendline / SR detection counts so the user knows when
+    # the auto detector found 0 — never silently empty.
+    sr_v2 = v2.get("support_resistance_v2") or {}
+    tl_v2 = v2.get("trendline_context") or {}
+    sel_sr_n = len(sr_v2.get("selected_level_zones_top5") or [])
+    rej_sr_n = len(sr_v2.get("rejected_level_zones") or [])
+    sel_tl_n = len(tl_v2.get("selected_trendlines_top3") or [])
+    rej_tl_n = len(tl_v2.get("rejected_trendlines") or [])
+    detection_warn_html = ""
+    if sel_tl_n == 0:
+        detection_warn_html += (
+            "<p class='small' style='color:#bf360c;'>"
+            "⚠ トレンドライン検出: 0本 — 自動線引きが人間のトレンドラインを"
+            "十分に再現できていない可能性があります。"
+            "</p>"
+        )
+    if sel_sr_n == 0:
+        detection_warn_html += (
+            "<p class='small' style='color:#bf360c;'>"
+            "⚠ サポレジ検出: 0本 — 自動線引きが人間のサポレジを"
+            "十分に再現できていない可能性があります。"
+            "</p>"
+        )
+    detection_stats_html = (
+        "<div class='g5-row g5-detection-stats'>"
+        "<h4>6b. 検出統計 (auto-detector counts)</h4>"
+        "<table class='g5-tbl'>"
+        "<tr><th>項目</th><th>selected</th><th>rejected</th></tr>"
+        f"<tr><td>support_resistance</td><td>{sel_sr_n}</td><td>{rej_sr_n}</td></tr>"
+        f"<tr><td>trendlines        </td><td>{sel_tl_n}</td><td>{rej_tl_n}</td></tr>"
+        "</table>"
+        + detection_warn_html
+        + "</div>"
+    )
+
     # Row 7 — 手動線操作 (interactive, static-HTML)
     sym = payload.get("symbol") or ""
     tf = (payload.get("interval") or payload.get("timeframe") or "1h")
@@ -6450,6 +6667,7 @@ def _render_g5_right_panel_html(
         + missing_html
         + unconnected_fund_html
         + auto_line_list_html
+        + detection_stats_html
         + annotations_html
         + "</aside>"
     )
@@ -6625,6 +6843,66 @@ def _mobile_case_section_html(
         + "</section>"
         if wave_only_html else ""
     )
+
+    # Phase F/G follow-up #11 — 可視化デバッグ count table.
+    # Count actual SVG geometry elements (not text tokens) so the
+    # user — and SVG-scoped tests — can verify what the chart really
+    # contains. Counts are derived from svg_xml in-place using simple
+    # substring matches; if svg_xml is None (df missing) we skip.
+    def _count_class_in_svg(svg: str, css_class: str) -> int:
+        return len(re.findall(
+            rf"<[^>]*class=['\"][^'\"]*\b{re.escape(css_class)}\b",
+            svg,
+        ))
+
+    debug_table_html = ""
+    if svg_xml:
+        c_skel = _count_class_in_svg(svg_xml, "wave-skeleton-line")
+        c_dot  = _count_class_in_svg(svg_xml, "wave-pivot-dot")
+        c_part = _count_class_in_svg(svg_xml, "wave-part-label-bg")
+        c_wnl  = _count_class_in_svg(svg_xml, "wnl-line")
+        c_wsl  = _count_class_in_svg(svg_xml, "wsl-line")
+        c_wtp  = _count_class_in_svg(svg_xml, "wtp-line")
+        c_entry= _count_class_in_svg(svg_xml, "entry-line")
+        c_stop = _count_class_in_svg(svg_xml, "stop-line")
+        c_tp   = _count_class_in_svg(svg_xml, "tp-line")
+        c_tl_s = _count_class_in_svg(svg_xml, "trendline-selected")
+        c_tl_r = _count_class_in_svg(svg_xml, "trendline-rejected")
+        c_sr_s = _count_class_in_svg(svg_xml, "sr-zone-selected")
+        c_sr_r = _count_class_in_svg(svg_xml, "sr-zone-rejected")
+        c_evt  = _count_class_in_svg(svg_xml, "event-window")
+        wo_src = (wave_overlay or {}).get("source") or "—"
+        wo_fb  = (wave_overlay or {}).get("fallback_used")
+        fb_note = (
+            "<p class='small' style='color:#bf360c;'>"
+            "⚠ 波形 skeleton は pattern_levels から合成した 4 点フォールバック "
+            "(multi_scale_chart に richer skeleton がない)。"
+            "</p>" if wo_fb else ""
+        )
+        debug_table_html = (
+            "<details class='gx-detail-block gx-debug-counts' open>"
+            "<summary>可視化デバッグ (chart 内 SVG 要素カウント)</summary>"
+            + fb_note
+            + "<table class='g5-tbl'>"
+            "<tr><th>要素</th><th>main SVG 内本数</th></tr>"
+            f"<tr><td>wave-skeleton-line (polyline)</td><td>{c_skel}</td></tr>"
+            f"<tr><td>wave-pivot-dot   (circle)  </td><td>{c_dot}</td></tr>"
+            f"<tr><td>wave-part-label-bg          </td><td>{c_part}</td></tr>"
+            f"<tr><td>wnl-line                    </td><td>{c_wnl}</td></tr>"
+            f"<tr><td>wsl-line                    </td><td>{c_wsl}</td></tr>"
+            f"<tr><td>wtp-line                    </td><td>{c_wtp}</td></tr>"
+            f"<tr><td>entry-line                  </td><td>{c_entry}</td></tr>"
+            f"<tr><td>stop-line                   </td><td>{c_stop}</td></tr>"
+            f"<tr><td>tp-line                     </td><td>{c_tp}</td></tr>"
+            f"<tr><td>trendline-selected (line)   </td><td>{c_tl_s}</td></tr>"
+            f"<tr><td>trendline-rejected (line)   </td><td>{c_tl_r}</td></tr>"
+            f"<tr><td>sr-zone-selected (rect)     </td><td>{c_sr_s}</td></tr>"
+            f"<tr><td>sr-zone-rejected (rect)     </td><td>{c_sr_r}</td></tr>"
+            f"<tr><td>event-window (rect)         </td><td>{c_evt}</td></tr>"
+            "</table>"
+            f"<p class='small'>wave overlay source: <code>{_html_escape(wo_src)}</code></p>"
+            "</details>"
+        )
     detail_sections_html = (
         "<details class='gx-detail-block'>"
         "<summary>判断橋 (bridge — どの根拠でこの結論になったか)</summary>"
@@ -6696,6 +6974,10 @@ def _mobile_case_section_html(
         + top_decision_card_html
         + (legend_html if legend_html else "")
         + phase_g_chart_with_panel
+        # Phase F/G follow-up #11 — visualisation debug counts directly
+        # under the chart so the user can verify geometry, not just
+        # text labels.
+        + debug_table_html
         # Wave-only chart sits BETWEEN the main chart+panel row and the
         # collapsible detail blocks. Phase F/G is a wave-shape system,
         # so the recognised pattern's skeleton + part labels must stay

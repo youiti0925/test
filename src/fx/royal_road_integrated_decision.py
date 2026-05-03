@@ -44,7 +44,10 @@ from typing import Final
 import pandas as pd
 
 from .chart_patterns import detect_patterns
-from .chart_reconstruction import SCALES as RECON_SCALES
+from .chart_reconstruction import (
+    SCALES as RECON_SCALES,
+    reconstruct_chart_multi_scale,
+)
 from .decision_engine import Decision, MIN_RISK_REWARD, _hold
 from .macro_alignment import compute_macro_alignment
 from .masterclass_candlestick import build_candlestick_anatomy_review
@@ -58,6 +61,7 @@ from .patterns import PatternResult
 from .risk_gate import RiskState, evaluate as evaluate_gate
 from .stop_modes import DEFAULT_STOP_MODE, plan_stop
 from .support_resistance import detect_levels
+from .trendlines import detect_trendlines
 from .wave_derived_lines import build_wave_derived_lines
 from .waveform_encoder import encode_wave_skeleton
 
@@ -1000,6 +1004,24 @@ def _build_panels_from_df(
     near_support = bool(sr_snapshot.near_strong_support)
     near_resistance = bool(sr_snapshot.near_strong_resistance)
 
+    # Trendlines + multi-scale chart skeletons (Phase F/G follow-up):
+    # the integrated profile previously stubbed these to {} which left
+    # the audit chart with no T1/T2/T3 lines and a 4-pivot fallback
+    # skeleton. Compute them here so the visual_audit overlays + the
+    # wave-overlay selector can use the real v2 data.
+    try:
+        trendline_ctx = detect_trendlines(
+            df_window, atr_value=atr_value, last_close=last_close,
+        )
+    except Exception:  # noqa: BLE001
+        trendline_ctx = None
+    try:
+        multi_scale_chart = reconstruct_chart_multi_scale(
+            df_window, atr_value=atr_value, last_close=last_close,
+        )
+    except Exception:  # noqa: BLE001
+        multi_scale_chart = None
+
     # ── Wave skeleton + shape review + wave-derived lines ────────
     # Mirrors what visual_audit's chart_reconstruction.py does so the
     # integrated decision sees the same wave structure when called
@@ -1362,6 +1384,18 @@ def _build_panels_from_df(
         "symbol_macro_briefing_review": pre.get("symbol_macro_briefing_review"),
         "_macro_score": float(macro_snap.macro_score),
         "_macro_strong_against": macro_snap.macro_strong_against,
+        # Phase F/G follow-up: surface the v2-equivalent SR / TL /
+        # multi-scale chart so the visual_audit overlay layer can
+        # actually draw them. Without these the integrated profile's
+        # chart had no T1/T2/T3 lines, no S1/R1 zones, and only a
+        # 4-pivot fallback skeleton.
+        "support_resistance_v2": (
+            sr_snapshot.to_dict() if sr_snapshot is not None else {}
+        ),
+        "trendline_context": (
+            trendline_ctx.to_dict() if trendline_ctx is not None else {}
+        ),
+        "multi_scale_chart": multi_scale_chart or {},
     }
 
 
@@ -1417,12 +1451,12 @@ def decide_royal_road_v2_integrated(
             label="HOLD_RISK_GATE",
             reason_ja=f"リスクゲートで HOLD: {','.join(codes)}",
         )
-        # Phase G follow-up: when the gate block is event-driven,
-        # synthesise a fundamental_sidebar + a WAIT_EVENT_CLEAR
-        # entry_plan so the audit/HTML still tells the user *why*
-        # they can't enter (rather than just "HOLD_RISK_GATE: code").
-        # This makes the WAIT_EVENT_CLEAR state visible end-to-end
-        # through the engine path, not only via the integrated flow.
+        # Phase F/G follow-up: when the gate block is event-driven,
+        # build the FULL panel set (pattern_levels / wave_derived_lines
+        # / entry_plan / SR / TL / multi_scale_chart) BEFORE returning
+        # HOLD. This way the chart still shows the would-have-been
+        # technical setup with the WAIT_EVENT_CLEAR badge — without
+        # this the WAIT_EVENT_CLEAR preview was completely empty.
         gate_advisory = {
             "profile": PROFILE_NAME_V2_INTEGRATED,
             "mode": canonical_mode,
@@ -1433,7 +1467,76 @@ def decide_royal_road_v2_integrated(
             "event" in c.lower() or "high_impact" in c.lower()
             for c in codes
         )
-        if rs_events:
+        if is_event_block and df_window is not None and len(df_window) > 0:
+            try:
+                gate_panels = _build_panels_from_df(
+                    df_window=df_window,
+                    atr_value=atr_value,
+                    last_close=last_close,
+                    higher_timeframe_trend=higher_timeframe_trend,
+                    symbol=symbol,
+                    macro_context=macro_context,
+                    stop_mode=stop_mode,
+                    stop_atr_mult=stop_atr_mult,
+                    tp_atr_mult=tp_atr_mult,
+                    pre_supplied=audit_panels,
+                    now=base_bar_close_ts,
+                    risk_state=risk_state,
+                )
+            except Exception:  # noqa: BLE001
+                gate_panels = None
+            if gate_panels is not None:
+                # Pull the entry_plan that _build_panels_from_df already
+                # downgraded (it runs downgrade_for_event_risk when
+                # fundamental_sidebar.event_risk_status == BLOCK), and
+                # carry the original entry_status for transparency.
+                ep_for_chart = gate_panels.get("entry_plan") or {}
+                if (ep_for_chart.get("entry_status")
+                        != "WAIT_EVENT_CLEAR"):
+                    # Force the downgrade in case the sidebar reports
+                    # WARNING (the gate already ruled BLOCK).
+                    blocking_first = (
+                        (gate_panels.get("fundamental_sidebar") or {}
+                         ).get("blocking_events") or [{}]
+                    )[0] or {}
+                    ep_for_chart = downgrade_for_event_risk(
+                        ep_for_chart,
+                        event_risk_status="BLOCK",
+                        blocking_event_title=blocking_first.get("title"),
+                        blocking_event_window_h=blocking_first.get("window_hours"),
+                        blocking_event_minutes_until=blocking_first.get("minutes_until"),
+                    ) or ep_for_chart
+                gate_advisory["fundamental_sidebar"] = (
+                    gate_panels.get("fundamental_sidebar") or {}
+                )
+                gate_advisory["entry_plan"] = ep_for_chart
+                gate_advisory["pattern_levels"] = (
+                    gate_panels.get("pattern_levels") or {}
+                )
+                gate_advisory["wave_derived_lines"] = (
+                    gate_panels.get("wave_derived_lines") or []
+                )
+                gate_advisory["wave_shape_review"] = (
+                    gate_panels.get("wave_shape_review") or {}
+                )
+                gate_advisory["breakout_quality_gate"] = (
+                    gate_panels.get("breakout_quality_gate") or {}
+                )
+                gate_advisory["support_resistance_v2"] = (
+                    gate_panels.get("support_resistance_v2") or {}
+                )
+                gate_advisory["trendline_context"] = (
+                    gate_panels.get("trendline_context") or {}
+                )
+                gate_advisory["chart_pattern_v2"] = (
+                    gate_panels.get("chart_pattern_review") or {}
+                )
+                gate_advisory["multi_scale_chart"] = (
+                    gate_panels.get("multi_scale_chart") or {}
+                )
+        elif rs_events:
+            # Non-event-driven block but events present — just surface
+            # the sidebar so the user sees event context.
             gate_now = (
                 getattr(risk_state, "now", None) or base_bar_close_ts
             )
@@ -1441,44 +1544,15 @@ def decide_royal_road_v2_integrated(
                 gate_now_dt = gate_now.to_pydatetime()
             else:
                 gate_now_dt = gate_now
-            gate_sidebar = build_fundamental_sidebar(
+            gate_advisory["fundamental_sidebar"] = build_fundamental_sidebar(
                 symbol=symbol,
                 now=gate_now_dt,
                 events=rs_events,
                 macro_alignment=None,
                 macro_context=macro_context,
                 final_action="HOLD",
-                entry_status="WAIT_EVENT_CLEAR" if is_event_block else None,
+                entry_status=None,
             )
-            gate_advisory["fundamental_sidebar"] = gate_sidebar
-            if is_event_block:
-                blocking = (gate_sidebar.get("blocking_events") or [{}])
-                first = blocking[0] if blocking else {}
-                gate_advisory["entry_plan"] = {
-                    "schema_version": "entry_plan_v1",
-                    "side": "NEUTRAL",
-                    "entry_type": "none",
-                    "entry_status": "WAIT_EVENT_CLEAR",
-                    "trigger_line_id": None,
-                    "trigger_line_price": None,
-                    "entry_price": None,
-                    "stop_price": None,
-                    "target_price": None,
-                    "target_extended_price": None,
-                    "rr": None,
-                    "breakout_confirmed": False,
-                    "retest_confirmed": False,
-                    "confirmation_candle": "",
-                    "reason_ja": (
-                        f"{first.get('title') or '高インパクトイベント'} "
-                        "が HOLD ウィンドウ内にあるためエントリー禁止です。"
-                    ),
-                    "what_to_wait_for_ja": (
-                        f"{first.get('title') or 'イベント'} の通過を待つ。"
-                    ),
-                    "block_reasons": ["event_risk_block_window"],
-                    "downgraded_from_ready_by_event_risk": True,
-                }
         return _hold(
             reason="risk gate blocked",
             blocked_by=codes,
@@ -1698,10 +1772,14 @@ def decide_royal_road_v2_integrated(
         "evidence_axes": {
             ax.axis: ax.to_dict() for ax in axes
         },
-        "support_resistance_v2": {},
-        "trendline_context": {},
-        "chart_pattern_v2": panels.get("chart_pattern_review") or {},
-        "lower_tf_trigger": {},
+        # Phase F/G follow-up: surface the v2-equivalent SR / TL /
+        # multi-scale chart from panels so visual_audit overlays
+        # actually have something to draw. Falls back to {} only when
+        # the upstream generator threw.
+        "support_resistance_v2": panels.get("support_resistance_v2") or {},
+        "trendline_context":     panels.get("trendline_context")     or {},
+        "chart_pattern_v2":      panels.get("chart_pattern_review")  or {},
+        "lower_tf_trigger":      {},
         "macro_alignment": {
             "macro_score": panels.get("_macro_score") or 0.0,
             "macro_strong_against": panels.get("_macro_strong_against") or "UNKNOWN",
@@ -1709,7 +1787,7 @@ def decide_royal_road_v2_integrated(
         "setup_candidates": [],
         "best_setup": None,
         "reconstruction_quality": {"total_reconstruction_score": float(integrated.confidence)},
-        "multi_scale_chart": {},
+        "multi_scale_chart":     panels.get("multi_scale_chart")     or {},
     }
 
     chain.extend([f"side_bias:{side_bias}", f"action:{action}"])
