@@ -3192,6 +3192,205 @@ img.thumb { width: 220px; height: auto; border: 1px solid #ddd; }
 .wave-only-wrap { margin: 8px 0; max-width: 100%; overflow-x: auto; }
 .wave-only-chart { display: block; max-width: 100%; height: auto;
   border: 1px solid #c5d2eb; border-radius: 4px; background: #fbfcff; }
+/* Phase G — chart + right-info panel layout */
+.g5-chart-row { display: flex; gap: 12px; margin: 6px 0; }
+.g5-chart-cell { flex: 2 1 60%; min-width: 0; }
+.g5-info-panel { flex: 1 1 35%; min-width: 260px; max-width: 380px;
+  background: #f6f9fc; border: 1px solid #b6c4d6; border-radius: 6px;
+  padding: 8px 10px; font-size: 12px; }
+.g5-info-panel .g5-row { background: white; border-radius: 4px;
+  padding: 6px 8px; margin: 6px 0; border-left: 3px solid #607d8b; }
+.g5-info-panel h4 { color: #37474f; margin: 0 0 4px; font-size: 13px; }
+.g5-info-panel .small { color: #666; font-size: 11px; margin: 2px 0; }
+.g5-info-panel .g5-tbl { font-size: 11px; width: 100%;
+  border-collapse: collapse; }
+.g5-info-panel .g5-tbl th { text-align: left; padding: 1px 4px;
+  background: #eceff1; font-weight: 600; }
+.g5-info-panel .g5-tbl td { padding: 1px 4px; }
+.g5-info-panel .g5-event-list, .g5-info-panel .g5-missing-list,
+.g5-info-panel .g5-anno-list { padding-left: 16px; margin: 3px 0;
+  font-size: 11px; }
+.g5-info-panel .g5-action { font-weight: bold; }
+.g5-info-panel .g5-action-BUY { color: #2e7d32; }
+.g5-info-panel .g5-action-SELL { color: #c62828; }
+.g5-info-panel .g5-action-HOLD { color: #5d4037; }
+.g5-info-panel .g5-state-ready { color: #2e7d32; font-weight: bold; }
+.g5-info-panel .g5-state-wait-breakout,
+.g5-info-panel .g5-state-wait-retest,
+.g5-info-panel .g5-state-wait-event-clear {
+  color: #f9a825; font-weight: bold; }
+.g5-info-panel .g5-state-hold { color: #c62828; font-weight: bold; }
+.g5-info-panel .g5-er-block { color: #c62828; font-weight: bold; }
+.g5-info-panel .g5-er-warning { color: #f9a825; font-weight: bold; }
+.g5-info-panel .g5-er-clear { color: #2e7d32; font-weight: bold; }
+.g5-info-panel .g5-er-unknown { color: #888; font-weight: bold; }
+.g5-info-panel .g5-anno-controls { font-size: 11px; }
+.g5-info-panel .g5-anno-controls input[type='number'] { width: 90px; }
+.g5-info-panel .g5-anno-controls input[type='text'] { width: 120px; }
+.g5-info-panel .g5-anno-controls button { padding: 2px 6px;
+  font-size: 11px; cursor: pointer; }
+@media (max-width: 720px) {
+  .g5-chart-row { flex-direction: column; }
+  .g5-chart-cell, .g5-info-panel { flex: 1 1 100%; max-width: 100%; }
+}
+/* Phase G — event-band overlay (chart SVG) */
+svg .event-window.event-block { /* set by inline attrs; kept for reference */ }
+svg .event-label { font-family: -apple-system, sans-serif; }
+svg .user-line { pointer-events: stroke; cursor: pointer; }
+svg .user-line-label { font-family: -apple-system, sans-serif; }
+"""
+
+
+_PHASE_G_INTERACTIVE_JS: str = """\
+<script>
+// Phase G — static-HTML manual annotation controls. Pure browser
+// localStorage; no network calls. Future Streamlit/FastAPI port can
+// reuse the same JSON schema.
+(function(){
+  function lsKey(sectionId, symbol, timeframe){
+    return 'gx_user_chart_annotations__' + sectionId + '__' + symbol + '__' + timeframe;
+  }
+  function loadAnnotations(sectionId, symbol, timeframe){
+    try {
+      var s = localStorage.getItem(lsKey(sectionId, symbol, timeframe));
+      if (!s) return [];
+      var d = JSON.parse(s);
+      return Array.isArray(d.annotations) ? d.annotations : [];
+    } catch (e) { return []; }
+  }
+  function saveAnnotations(sectionId, symbol, timeframe, anns){
+    var payload = {
+      schema_version: 'user_chart_annotations_v1',
+      symbol: symbol, timeframe: timeframe,
+      manual_line_policy: 'display_only',
+      annotations: anns
+    };
+    try {
+      localStorage.setItem(lsKey(sectionId, symbol, timeframe), JSON.stringify(payload));
+    } catch (e) {}
+  }
+  function renderList(sectionId, symbol, timeframe){
+    var ul = document.querySelector(
+      ".g5-anno-list[data-section-id='" + sectionId + "']");
+    if (!ul) return;
+    var anns = loadAnnotations(sectionId, symbol, timeframe);
+    ul.innerHTML = '';
+    anns.forEach(function(a, i){
+      var li = document.createElement('li');
+      var p = (a.points && a.points[0] && a.points[0].price) || '';
+      li.innerHTML = '<b>' + (a.kind || '?') + '</b>' +
+        ' @ ' + p + ' [' + (a.label || a.id) + '] ' +
+        '(' + (a.source || 'USER') + '/' + (a.status || 'ACTIVE') + ') ';
+      var del = document.createElement('button');
+      del.type = 'button';
+      del.textContent = '削除';
+      del.style.fontSize = '10px';
+      del.addEventListener('click', function(){
+        anns.splice(i, 1);
+        saveAnnotations(sectionId, symbol, timeframe, anns);
+        renderList(sectionId, symbol, timeframe);
+      });
+      li.appendChild(del);
+      ul.appendChild(li);
+    });
+  }
+  function exportAnnotations(sectionId, symbol, timeframe){
+    var payload = {
+      schema_version: 'user_chart_annotations_v1',
+      symbol: symbol, timeframe: timeframe,
+      manual_line_policy: 'display_only',
+      annotations: loadAnnotations(sectionId, symbol, timeframe)
+    };
+    var blob = new Blob(
+      [JSON.stringify(payload, null, 2)],
+      {type: 'application/json'}
+    );
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'annotations__' + symbol + '__' + sectionId + '.json';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 100);
+  }
+  document.addEventListener('click', function(ev){
+    var btn = ev.target;
+    if (btn.classList && btn.classList.contains('g5-anno-add')) {
+      var sectionId = btn.getAttribute('data-section-id');
+      var symbol = btn.getAttribute('data-symbol');
+      var timeframe = btn.getAttribute('data-timeframe');
+      var row = btn.closest('.g5-anno-controls');
+      if (!row) return;
+      var kind = (row.querySelector('.g5-anno-kind') || {}).value || 'note';
+      var price = parseFloat((row.querySelector('.g5-anno-price') || {}).value);
+      var label = (row.querySelector('.g5-anno-label') || {}).value || '';
+      if (isNaN(price)) {
+        alert('price を入力してください');
+        return;
+      }
+      var anns = loadAnnotations(sectionId, symbol, timeframe);
+      var id = 'USER_' + kind.toUpperCase() + '_' + (anns.length + 1).toString().padStart(3, '0');
+      var nowIso = new Date().toISOString();
+      anns.push({
+        id: id, kind: kind, source: 'USER', status: 'ACTIVE',
+        points: [{ts: nowIso, price: price}],
+        label: label || id,
+        created_at: nowIso, updated_at: nowIso,
+        used_in_decision: false,
+        reject_reason_ja: null
+      });
+      saveAnnotations(sectionId, symbol, timeframe, anns);
+      renderList(sectionId, symbol, timeframe);
+    } else if (btn.classList && btn.classList.contains('g5-anno-export')) {
+      var sectionId = btn.getAttribute('data-section-id');
+      var addBtn = document.querySelector(
+        ".g5-anno-add[data-section-id='" + sectionId + "']");
+      if (!addBtn) return;
+      var symbol = addBtn.getAttribute('data-symbol');
+      var timeframe = addBtn.getAttribute('data-timeframe');
+      exportAnnotations(sectionId, symbol, timeframe);
+    }
+  });
+  // Click on auto wave-derived line → record REJECTED_BY_USER
+  document.addEventListener('click', function(ev){
+    var t = ev.target;
+    if (!t.classList) return;
+    // Match any wave-derived line drawn by visual_audit
+    if (!t.matches('line.wave-line') && !t.matches('line.wave-derived')) return;
+    var sec = t.closest('section.case-section');
+    if (!sec) return;
+    var sectionId = sec.id;
+    var addBtn = sec.querySelector('.g5-anno-add');
+    if (!addBtn) return;
+    var symbol = addBtn.getAttribute('data-symbol');
+    var timeframe = addBtn.getAttribute('data-timeframe');
+    var lineId = t.getAttribute('data-line-id') || ('AUTO_LINE_' + Date.now());
+    if (!confirm('この自動線 (' + lineId + ') を REJECTED_BY_USER に記録しますか?')) return;
+    var anns = loadAnnotations(sectionId, symbol, timeframe);
+    var nowIso = new Date().toISOString();
+    anns.push({
+      id: lineId, kind: 'neckline', source: 'REJECTED_BY_USER',
+      status: 'REJECTED_BY_USER', points: [],
+      label: lineId, created_at: nowIso, updated_at: nowIso,
+      used_in_decision: false,
+      reject_reason_ja: 'ユーザーが SVG 上でクリック却下'
+    });
+    saveAnnotations(sectionId, symbol, timeframe, anns);
+    renderList(sectionId, symbol, timeframe);
+    t.style.opacity = '0.2';
+  });
+  // On load, render any existing annotations
+  document.addEventListener('DOMContentLoaded', function(){
+    document.querySelectorAll('.g5-anno-add').forEach(function(btn){
+      var sectionId = btn.getAttribute('data-section-id');
+      var symbol = btn.getAttribute('data-symbol');
+      var timeframe = btn.getAttribute('data-timeframe');
+      renderList(sectionId, symbol, timeframe);
+    });
+  });
+})();
+</script>
 """
 
 
@@ -5316,6 +5515,241 @@ def _select_wave_overlay(payload: dict) -> dict | None:
     }
 
 
+def _render_g5_right_panel_html(
+    *,
+    payload: dict,
+    v2: dict,
+    entry_summary: dict,
+    section_id: str,
+) -> str:
+    """Phase G.5 — right info panel that sits beside the chart.
+
+    Six rows per spec:
+      1. 現在の状態 (entry_status / final action)
+      2. エントリープラン (entry / stop / target / RR)
+      3. ファンダ・イベント (next event + macro drivers + risk status)
+      4. 王道根拠 (axis summary)
+      5. 未接続 / 注意 (missing data + cautions)
+      6. 手動線操作 (manual annotation controls — interactive)
+    """
+    fs = payload.get("fundamental_sidebar") or {}
+    integrated = v2.get("integrated_decision") or {}
+    entry_plan = v2.get("entry_plan") or {}
+    bq_gate = v2.get("breakout_quality_gate") or {}
+    pattern_levels = v2.get("pattern_levels") or {}
+
+    # Row 1 — 現在の状態
+    final_action = v2.get("action") or "—"
+    entry_status = entry_plan.get("entry_status") or "—"
+    state_class = (
+        "g5-state-" + str(entry_status).lower().replace("_", "-")
+    )
+    state_html = (
+        "<div class='g5-row'><h4>1. 現在の状態</h4>"
+        f"<p><b>final_action:</b> "
+        f"<span class='g5-action g5-action-{_html_escape(final_action)}'>"
+        f"{_html_escape(final_action)}</span></p>"
+        f"<p><b>entry_status:</b> "
+        f"<span class='{state_class}'>{_html_escape(entry_status)}</span></p>"
+        f"<p class='small'>"
+        f"{_html_escape((entry_plan.get('reason_ja') or '')[:120])}</p>"
+        "</div>"
+    )
+
+    # Row 2 — エントリープラン
+    def _f(v) -> str:
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):.5f}"
+        except Exception:  # noqa: BLE001
+            return str(v)
+
+    def _f_rr(v) -> str:
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):.2f}"
+        except Exception:  # noqa: BLE001
+            return str(v)
+
+    plan_html = (
+        "<div class='g5-row'><h4>2. エントリープラン</h4>"
+        "<table class='g5-tbl'>"
+        f"<tr><th>side</th><td>{_html_escape(entry_plan.get('side') or '—')}</td></tr>"
+        f"<tr><th>entry</th><td>{_f(entry_plan.get('entry_price'))}</td></tr>"
+        f"<tr><th>stop</th><td>{_f(entry_plan.get('stop_price'))}</td></tr>"
+        f"<tr><th>target</th><td>{_f(entry_plan.get('target_price'))}</td></tr>"
+        f"<tr><th>RR</th><td>{_f_rr(entry_plan.get('rr'))}</td></tr>"
+        f"<tr><th>trigger</th><td>{_html_escape(entry_plan.get('trigger_line_id') or '—')}"
+        f" @ {_f(entry_plan.get('trigger_line_price'))}</td></tr>"
+        "</table></div>"
+    )
+
+    # Row 3 — ファンダ・イベント
+    erstatus = fs.get("event_risk_status") or "UNKNOWN"
+    er_class = "g5-er-" + str(erstatus).lower()
+    nearby = fs.get("nearby_events") or []
+    blocking = fs.get("blocking_events") or []
+    next_event_lines: list[str] = []
+    for ev in (blocking + [e for e in nearby if e not in blocking])[:4]:
+        when = ev.get("when") or ""
+        kind = ev.get("kind") or ev.get("impact") or "?"
+        title = ev.get("title") or ""
+        mins = ev.get("minutes_until")
+        timing = ""
+        if mins is not None:
+            timing = (
+                f"{int(mins) // 60}h {int(mins) % 60}m後"
+                if mins >= 0 else
+                f"{abs(int(mins)) // 60}h {abs(int(mins)) % 60}m前"
+            )
+        st = (ev.get("status") or "").upper()
+        st_class = "g5-er-" + st.lower()
+        next_event_lines.append(
+            f"<li><span class='{st_class}'>{_html_escape(st or '—')}</span>"
+            f" <b>{_html_escape(kind)}</b> "
+            f"{_html_escape(title)} ({_html_escape(timing)}, "
+            f"±{ev.get('window_hours', 0):.0f}h)</li>"
+        )
+    drivers_rows = "".join(
+        f"<tr><th>{_html_escape(d.get('label_ja') or d.get('name') or '?')}</th>"
+        f"<td>{_html_escape(str(d.get('value') or '—'))}</td></tr>"
+        for d in (fs.get("macro_drivers") or [])[:6]
+    )
+    fund_html = (
+        "<div class='g5-row'><h4>3. ファンダ・イベント</h4>"
+        f"<p><b>event_risk_status:</b> "
+        f"<span class='{er_class}'>{_html_escape(erstatus)}</span></p>"
+        + (
+            "<p><b>次のイベント:</b></p><ul class='g5-event-list'>"
+            + "".join(next_event_lines) + "</ul>"
+            if next_event_lines else
+            "<p class='small'>(直近のイベントは検出されません)</p>"
+        )
+        + (
+            "<table class='g5-tbl g5-driver-tbl'>" + drivers_rows + "</table>"
+            if drivers_rows else
+            "<p class='small'>マクロドライバ未接続</p>"
+        )
+        + f"<p class='small'>"
+        f"{_html_escape((fs.get('right_panel_summary_ja') or '')[:140])}</p>"
+        + "</div>"
+    )
+
+    # Row 4 — 王道根拠 (P0 axes summary)
+    axes = integrated.get("axes") or []
+    p0_names = ("wave_pattern", "wave_lines", "dow_structure", "invalidation_rr")
+    p0_html_parts: list[str] = []
+    for ax_name in p0_names:
+        ax = next((a for a in axes if a.get("axis") == ax_name), None)
+        if ax is None:
+            continue
+        st = (ax.get("status") or "—").upper()
+        st_cls = f"phase-f-{st.lower()}"
+        side = ax.get("side") or "—"
+        p0_html_parts.append(
+            f"<tr><th>{_html_escape(ax_name)}</th>"
+            f"<td><span class='{st_cls}'>{_html_escape(st)}</span></td>"
+            f"<td>{_html_escape(side)}</td></tr>"
+        )
+    bq_status = bq_gate.get("status") or "—"
+    bq_cls = f"phase-f-{str(bq_status).lower()}"
+    royal_html = (
+        "<div class='g5-row'><h4>4. 王道根拠 (P0)</h4>"
+        + (
+            f"<table class='g5-tbl'>"
+            f"<tr><th>axis</th><th>status</th><th>side</th></tr>"
+            + "".join(p0_html_parts) + "</table>"
+            if p0_html_parts else "<p class='small'>(P0 軸未構築)</p>"
+        )
+        + f"<p><b>breakout品質:</b> "
+        f"<span class='{bq_cls}'>{_html_escape(bq_status)}</span></p>"
+        + "</div>"
+    )
+
+    # Row 5 — 未接続 / 注意
+    missing = fs.get("missing_data") or []
+    missing_lines = "".join(
+        f"<li><b>{_html_escape(m.get('label_ja') or m.get('name') or '?')}</b>: "
+        f"{_html_escape(m.get('status') or '未接続')}</li>"
+        for m in missing
+    )
+    cautions_v2 = v2.get("cautions") or []
+    cautions_lines = "".join(
+        f"<li>{_html_escape(c)}</li>" for c in cautions_v2[:6]
+    )
+    missing_html = (
+        "<div class='g5-row'><h4>5. 未接続 / 注意</h4>"
+        + (
+            f"<p><b>未接続データ:</b></p><ul class='g5-missing-list'>"
+            + missing_lines + "</ul>"
+            if missing_lines else
+            "<p class='small'>(未接続データなし)</p>"
+        )
+        + (
+            f"<p><b>cautions:</b></p><ul>" + cautions_lines + "</ul>"
+            if cautions_lines else ""
+        )
+        + "</div>"
+    )
+
+    # Row 6 — 手動線操作 (interactive, static-HTML)
+    sym = payload.get("symbol") or ""
+    tf = (payload.get("interval") or payload.get("timeframe") or "1h")
+    annotations_html = (
+        "<div class='g5-row g5-anno-row'>"
+        "<h4>6. 手動線操作</h4>"
+        "<p class='small'>"
+        "manual_line_policy = <b>display_only</b> (初期値、安全側)。"
+        "ここで追加した線は表示のみ。BUY/SELL 判断には影響しません。"
+        "</p>"
+        "<div class='g5-anno-controls'>"
+        "<label>kind: <select class='g5-anno-kind'>"
+        "<option value='support'>support</option>"
+        "<option value='resistance'>resistance</option>"
+        "<option value='neckline'>neckline</option>"
+        "<option value='trendline'>trendline</option>"
+        "<option value='stop'>stop</option>"
+        "<option value='target'>target</option>"
+        "<option value='note'>note</option>"
+        "</select></label>"
+        " <label>price: <input type='number' step='0.00001' "
+        "class='g5-anno-price' placeholder='150.10' /></label>"
+        " <label>label: <input type='text' "
+        "class='g5-anno-label' placeholder='自分で引いた…' /></label>"
+        " <button type='button' class='g5-anno-add'"
+        f" data-section-id='{_html_escape(section_id)}'"
+        f" data-symbol='{_html_escape(sym)}'"
+        f" data-timeframe='{_html_escape(tf)}'"
+        ">追加</button>"
+        " <button type='button' class='g5-anno-export'"
+        f" data-section-id='{_html_escape(section_id)}'"
+        ">annotations.json をダウンロード</button>"
+        "</div>"
+        "<p class='small'>localStorage に保存されます。"
+        "リロード後も残ります。サーバ送信なし。</p>"
+        f"<ul class='g5-anno-list' data-section-id='{_html_escape(section_id)}'>"
+        "</ul>"
+        "<p class='small'><i>"
+        "自動線を非表示にしたい場合: チャート上の線をクリック → "
+        "REJECTED_BY_USER 状態で記録(物理削除ではなく履歴保持)。"
+        "</i></p>"
+        "</div>"
+    )
+
+    return (
+        "<aside class='g5-info-panel'>"
+        + state_html
+        + plan_html
+        + fund_html
+        + royal_html
+        + missing_html
+        + annotations_html
+        + "</aside>"
+    )
+
+
 def _mobile_case_section_html(
     *,
     section_id: str,
@@ -5447,6 +5881,18 @@ def _mobile_case_section_html(
         entry_summary=entry_summary,
     )
 
+    # Phase G — right info panel + manual annotation controls
+    phase_g_right_panel = _render_g5_right_panel_html(
+        payload=payload, v2=v2, entry_summary=entry_summary,
+        section_id=section_id,
+    )
+    phase_g_chart_with_panel = (
+        "<div class='g5-chart-row'>"
+        "<div class='g5-chart-cell'>" + chart_html + "</div>"
+        + phase_g_right_panel
+        + "</div>"
+    )
+
     return (
         f"<section class='case-section' id='{_html_escape(section_id)}'>"
         f"<h2>{title}</h2>"
@@ -5454,7 +5900,7 @@ def _mobile_case_section_html(
         + decision_bridge_html
         + (legend_html if legend_html else "")
         + "<h3>chart</h3>"
-        + chart_html
+        + phase_g_chart_with_panel
         + (
             f"<h3>{_html_escape(wave_only_heading)}</h3>"
             + wave_only_html
@@ -5650,6 +6096,7 @@ def render_visual_audit_mobile_single_file(
         + f"<p>schema={MOBILE_SCHEMA_VERSION} cases={len(sections)}</p>"
         + case_list_html
         + "".join(sections)
+        + _PHASE_G_INTERACTIVE_JS
         + "</body></html>"
     )
     out_path.write_text(body)

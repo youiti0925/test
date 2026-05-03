@@ -179,8 +179,9 @@ def test_mobile_html_no_user_visible_dev_leak(tmp_path: Path):
     html = out_path.read_text(encoding="utf-8")
     # Strip <pre>...</pre> debug blocks (raw JSON allowed there)
     body = re.sub(r"<pre[^>]*>.*?</pre>", "", html, flags=re.DOTALL)
-    # Strip <script>/<style> just in case
+    # Strip <script>/<style> blocks — JS / CSS are not user-rendered text
     body = re.sub(r"<style[^>]*>.*?</style>", "", body, flags=re.DOTALL)
+    body = re.sub(r"<script[^>]*>.*?</script>", "", body, flags=re.DOTALL)
     # Now check for leaks
     assert "best=" not in body, "user-visible body leaks 'best='"
     assert "quality=" not in body, "user-visible body leaks 'quality='"

@@ -119,6 +119,7 @@ def test_integrated_html_no_user_visible_dev_leak(
     html = (integrated_html_dir / f"{name}_mobile.html").read_text("utf-8")
     body = re.sub(r"<pre[^>]*>.*?</pre>", "", html, flags=re.DOTALL)
     body = re.sub(r"<style[^>]*>.*?</style>", "", body, flags=re.DOTALL)
+    body = re.sub(r"<script[^>]*>.*?</script>", "", body, flags=re.DOTALL)
     assert "best=" not in body, f"{name}: leaks 'best=' to user HTML"
     assert "quality=" not in body, f"{name}: leaks 'quality=' to user HTML"
     assert not re.search(r"score=-?\d+\.\d{3}", body), (
