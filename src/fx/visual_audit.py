@@ -3477,6 +3477,25 @@ img.thumb { width: 220px; height: auto; border: 1px solid #ddd; }
 .g5-info-panel .g5-anno-controls input[type='text'] { width: 120px; }
 .g5-info-panel .g5-anno-controls button { padding: 2px 6px;
   font-size: 11px; cursor: pointer; }
+/* Phase I-1/I-2 — entry candidate observation panel */
+.g5-entry-candidates-panel { font-size: 12px; }
+.g5-entry-candidates-panel .entry-candidate-selected {
+  border-left: 4px solid #1565c0; padding: 4px 8px; margin: 4px 0;
+  background: #f5faff; }
+.g5-entry-candidates-panel .entry-candidate-list {
+  margin-top: 6px; }
+.g5-entry-candidates-panel .entry-candidate-detail td {
+  color: #555; padding-left: 12px; }
+.g5-entry-candidates-panel .entry-candidate-ready {
+  color: #2e7d32; font-weight: bold; }
+.g5-entry-candidates-panel .entry-candidate-wait {
+  color: #ef6c00; font-weight: bold; }
+.g5-entry-candidates-panel .entry-candidate-wait-event {
+  color: #c62828; font-weight: bold; }
+.g5-entry-candidates-panel .entry-candidate-watch {
+  color: #f9a825; font-weight: bold; }
+.g5-entry-candidates-panel .entry-candidate-hold {
+  color: #6a6a6a; font-weight: bold; }
 @media (max-width: 720px) {
   .g5-chart-row { flex-direction: column; }
   .g5-chart-cell, .g5-info-panel { flex: 1 1 100%; max-width: 100%; }
@@ -6378,6 +6397,175 @@ def _render_g5_unconnected_fundamentals_html(
     )
 
 
+def _render_g5_entry_candidates_html(
+    *,
+    selected: dict,
+    candidates: list,
+) -> str:
+    """Phase I-1/I-2 — entry-candidate observation panel.
+
+    Renders the `selected_entry_candidate` block plus the full
+    `entry_candidates` list with status / score / block_reasons /
+    cautions, so the user can audit which entry method was picked
+    and why the others were rejected. Phase I never overrides
+    entry_plan_v1 — this is a pure observation view.
+    """
+    sel = selected or {}
+    cands = list(candidates or [])
+
+    def _f(v) -> str:
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):.5f}"
+        except Exception:  # noqa: BLE001
+            return str(v)
+
+    def _f_rr(v) -> str:
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):.2f}"
+        except Exception:  # noqa: BLE001
+            return str(v)
+
+    def _f_score(v) -> str:
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):.1f}"
+        except Exception:  # noqa: BLE001
+            return str(v)
+
+    def _status_class(status: str) -> str:
+        s = (status or "").upper()
+        if s == "READY":
+            return "entry-candidate-ready"
+        if s == "WAIT_EVENT_CLEAR":
+            return "entry-candidate-wait-event"
+        if s in ("WAIT_RETEST", "WAIT_BREAKOUT", "WAIT_TRIGGER"):
+            return "entry-candidate-wait"
+        if s == "WATCH":
+            return "entry-candidate-watch"
+        return "entry-candidate-hold"
+
+    if not sel and not cands:
+        return (
+            "<div class='g5-row g5-entry-candidates-panel' "
+            "data-entry-candidate-schema='entry_candidate_v1' "
+            "data-entry-candidates-count='0'>"
+            "<h4>7. エントリー候補</h4>"
+            "<p class='small'>"
+            "(entry_candidates / selected_entry_candidate なし — "
+            "Phase I observation layer is dormant for this case.)"
+            "</p></div>"
+        )
+
+    sel_status = sel.get("status") or "—"
+    sel_html = (
+        "<div class='entry-candidate-selected "
+        + _status_class(sel_status)
+        + "'>"
+        "<b>採用候補</b>"
+        "<table class='g5-tbl'>"
+        f"<tr><th>entry_type</th><td>"
+        f"{_html_escape(sel.get('entry_type') or '—')}</td></tr>"
+        f"<tr><th>status</th><td>"
+        f"<span class='{_status_class(sel_status)}'>"
+        f"{_html_escape(sel_status)}</span></td></tr>"
+        f"<tr><th>side</th><td>"
+        f"{_html_escape(sel.get('side') or '—')}</td></tr>"
+        f"<tr><th>ENTRY</th><td>{_f(sel.get('entry_price'))}</td></tr>"
+        f"<tr><th>STOP</th><td>{_f(sel.get('stop_price'))}</td></tr>"
+        f"<tr><th>TP</th><td>{_f(sel.get('target_price'))}</td></tr>"
+        f"<tr><th>RR</th><td>{_f_rr(sel.get('rr'))}</td></tr>"
+        f"<tr><th>final_score</th>"
+        f"<td>{_f_score(sel.get('final_score'))}</td></tr>"
+        "</table>"
+    )
+    sel_reasons = sel.get("reasons_ja") or []
+    if sel_reasons:
+        sel_html += "<p class='small'><b>採用理由:</b></p><ul class='small'>"
+        for r in sel_reasons[:6]:
+            sel_html += f"<li>{_html_escape(str(r))}</li>"
+        sel_html += "</ul>"
+    sel_blocks = sel.get("block_reasons") or []
+    if sel_blocks:
+        sel_html += (
+            "<p class='small' style='color:#bf360c;'>"
+            "<b>採用候補のブロック理由:</b></p><ul class='small'>"
+        )
+        for b in sel_blocks[:6]:
+            sel_html += f"<li>{_html_escape(str(b))}</li>"
+        sel_html += "</ul>"
+    sel_html += "</div>"
+
+    # Candidate inventory (selected + all evaluated candidates).
+    list_rows = ""
+    for c in cands:
+        c_status = c.get("status") or "—"
+        is_selected = (
+            c.get("entry_type") == sel.get("entry_type")
+            and c.get("status") == sel.get("status")
+        )
+        marker = "★" if is_selected else "・"
+        list_rows += (
+            "<tr class='" + _status_class(c_status) + "'>"
+            f"<td>{marker}</td>"
+            f"<td>{_html_escape(c.get('entry_type') or '—')}</td>"
+            f"<td><span class='{_status_class(c_status)}'>"
+            f"{_html_escape(c_status)}</span></td>"
+            f"<td>{_html_escape(c.get('side') or '—')}</td>"
+            f"<td>{_f_rr(c.get('rr'))}</td>"
+            f"<td>{_f_score(c.get('final_score'))}</td>"
+            "</tr>"
+        )
+        # Surface block_reasons / cautions inline so the user can see
+        # at a glance why a candidate was rejected.
+        c_blocks = c.get("block_reasons") or []
+        c_cautions = c.get("cautions") or []
+        if c_blocks or c_cautions:
+            detail = ""
+            if c_blocks:
+                detail += "<b>block:</b> " + _html_escape(
+                    ", ".join(str(b) for b in c_blocks[:4])
+                )
+            if c_cautions:
+                if detail:
+                    detail += " / "
+                detail += "<b>caution:</b> " + _html_escape(
+                    ", ".join(str(b) for b in c_cautions[:4])
+                )
+            list_rows += (
+                "<tr class='entry-candidate-detail'>"
+                f"<td></td><td colspan='5' class='small'>{detail}</td>"
+                "</tr>"
+            )
+
+    list_html = (
+        "<div class='entry-candidate-list'>"
+        "<b>候補一覧</b>"
+        "<table class='g5-tbl'>"
+        "<tr><th></th><th>entry_type</th><th>status</th>"
+        "<th>side</th><th>RR</th><th>score</th></tr>"
+        + list_rows
+        + "</table></div>"
+    )
+
+    sel_schema = sel.get("schema_version") or "entry_candidate_v1"
+    sel_type = sel.get("entry_type") or ""
+    return (
+        "<div class='g5-row g5-entry-candidates-panel' "
+        f"data-entry-candidate-schema='{_html_escape(sel_schema)}' "
+        f"data-entry-candidates-count='{len(cands)}' "
+        f"data-selected-entry-candidate-type='{_html_escape(sel_type)}'>"
+        "<h4>7. エントリー候補</h4>"
+        + sel_html
+        + list_html
+        + "</div>"
+    )
+
+
 def _render_g5_right_panel_html(
     *,
     payload: dict,
@@ -6387,13 +6575,15 @@ def _render_g5_right_panel_html(
 ) -> str:
     """Phase G.5 — right info panel that sits beside the chart.
 
-    Six rows per spec:
+    Eight rows per spec:
       1. 現在の状態 (entry_status / final action)
       2. エントリープラン (entry / stop / target / RR)
       3. ファンダ・イベント (next event + macro drivers + risk status)
       4. 王道根拠 (axis summary)
       5. 未接続 / 注意 (missing data + cautions)
-      6. 手動線操作 (manual annotation controls — interactive)
+      6. 自動線一覧 / 6b. 検出統計
+      7. エントリー候補 (Phase I-1/I-2 observation panel)
+      8. 手動線操作 (manual annotation controls — interactive)
     """
     fs = payload.get("fundamental_sidebar") or {}
     integrated = v2.get("integrated_decision") or {}
@@ -6616,12 +6806,18 @@ def _render_g5_right_panel_html(
         + "</div>"
     )
 
-    # Row 7 — 手動線操作 (interactive, static-HTML)
+    # Row 7 — エントリー候補 (Phase I-1/I-2 observation panel).
+    entry_candidates_html = _render_g5_entry_candidates_html(
+        selected=v2.get("selected_entry_candidate") or {},
+        candidates=v2.get("entry_candidates") or [],
+    )
+
+    # Row 8 — 手動線操作 (interactive, static-HTML)
     sym = payload.get("symbol") or ""
     tf = (payload.get("interval") or payload.get("timeframe") or "1h")
     annotations_html = (
         "<div class='g5-row g5-anno-row'>"
-        "<h4>7. 手動線操作</h4>"
+        "<h4>8. 手動線操作</h4>"
         "<p class='small'>"
         "manual_line_policy = <b>display_only</b> (初期値、安全側)。"
         "ここで追加した線は表示のみ。BUY/SELL 判断には影響しません。"
@@ -6676,6 +6872,7 @@ def _render_g5_right_panel_html(
         + unconnected_fund_html
         + auto_line_list_html
         + detection_stats_html
+        + entry_candidates_html
         + annotations_html
         + "</aside>"
     )

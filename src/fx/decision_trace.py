@@ -809,6 +809,11 @@ class RoyalRoadDecisionV2Slice:
     fundamental_sidebar: dict | None = None
     wave_shape_review: dict | None = None
     wave_derived_lines: list = field(default_factory=list)
+    # Phase I-1/I-2: entry-candidate observation layer (integrated
+    # profile only). Empty defaults preserve byte-identical traces
+    # for legacy v2 / v1 / current_runtime callers.
+    entry_candidates: list = field(default_factory=list)
+    selected_entry_candidate: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -873,6 +878,9 @@ class RoyalRoadDecisionV2Slice:
                 if self.wave_shape_review is not None else None
             ),
             "wave_derived_lines": list(self.wave_derived_lines),
+            # Phase I-1/I-2 entry-candidate observation layer.
+            "entry_candidates": list(self.entry_candidates),
+            "selected_entry_candidate": dict(self.selected_entry_candidate),
         }
 
     @classmethod
@@ -923,6 +931,11 @@ class RoyalRoadDecisionV2Slice:
             fundamental_sidebar=adv.get("fundamental_sidebar"),
             wave_shape_review=adv.get("wave_shape_review"),
             wave_derived_lines=list(adv.get("wave_derived_lines") or []),
+            # Phase I-1/I-2 entry-candidate observation layer.
+            entry_candidates=list(adv.get("entry_candidates") or []),
+            selected_entry_candidate=dict(
+                adv.get("selected_entry_candidate") or {}
+            ),
         )
 
 

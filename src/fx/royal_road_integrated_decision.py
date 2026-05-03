@@ -49,6 +49,12 @@ from .chart_reconstruction import (
     reconstruct_chart_multi_scale,
 )
 from .decision_engine import Decision, MIN_RISK_REWARD, _hold
+from .entry_candidates import (
+    EntryMethodContext,
+    build_entry_candidates_from_existing_plan,
+    select_best_entry_candidate,
+    selected_candidate_to_entry_plan,
+)
 from .macro_alignment import compute_macro_alignment
 from .masterclass_candlestick import build_candlestick_anatomy_review
 from .masterclass_dow import build_dow_structure_review
@@ -1360,6 +1366,55 @@ def _build_panels_from_df(
             blocking_event_minutes_until=first.get("minutes_until"),
         )
 
+    # ── Phase I-1/I-2: entry-candidate observation layer ─────────
+    # Build entry candidates from the existing entry_plan. For now this
+    # only produces a single "neckline_retest" candidate so the schema
+    # / payload / visual_audit panel exist without changing the live
+    # decision. selected_candidate_to_entry_plan() is intentionally
+    # additive — it never overwrites the original entry_plan core
+    # fields.
+    entry_ctx = EntryMethodContext(
+        symbol=symbol or "",
+        timeframe="unknown",
+        df_window=df_window,
+        atr_value=atr_value,
+        last_close=last_close,
+        current_ts=now,
+        pattern_levels=pattern_levels or {},
+        wave_derived_lines=wave_derived or [],
+        breakout_quality_gate=breakout_quality_gate or {},
+        fundamental_sidebar=fundamental_sidebar or {},
+        support_resistance_v2=(
+            sr_snapshot.to_dict() if sr_snapshot is not None else {}
+        ),
+        trendline_context=(
+            trendline_ctx.to_dict() if trendline_ctx is not None else {}
+        ),
+        dow_structure_review=dow or {},
+        ma_context_review=ma_panel or {},
+        candlestick_anatomy_review=candle or {},
+        entry_settings={
+            "min_rr_default": 2.0,
+            "min_rr_scalping": 1.2,
+            "max_entry_distance_atr": 0.8,
+            "max_stop_distance_atr": 1.2,
+            "allow_direct_breakout": False,
+            "allow_range_bounce_ready": False,
+            "allow_false_breakout_ready": False,
+        },
+    )
+    entry_candidates = build_entry_candidates_from_existing_plan(
+        entry_plan=entry_plan,
+        ctx=entry_ctx,
+    )
+    selected_entry_candidate = select_best_entry_candidate(entry_candidates)
+    # Merge selector metadata into entry_plan without overwriting any
+    # core entry_plan_v1 field (Phase I must not change action gating).
+    entry_plan = selected_candidate_to_entry_plan(
+        selected_entry_candidate,
+        original_entry_plan=entry_plan,
+    )
+
     return {
         "chart_pattern_review": chart_pattern,
         "wave_shape_review": wave_shape_review,
@@ -1396,6 +1451,9 @@ def _build_panels_from_df(
             trendline_ctx.to_dict() if trendline_ctx is not None else {}
         ),
         "multi_scale_chart": multi_scale_chart or {},
+        # Phase I-1/I-2 — entry candidate observation layer.
+        "entry_candidates": [c.to_dict() for c in entry_candidates],
+        "selected_entry_candidate": selected_entry_candidate.to_dict(),
     }
 
 
@@ -1533,6 +1591,15 @@ def decide_royal_road_v2_integrated(
                 )
                 gate_advisory["multi_scale_chart"] = (
                     gate_panels.get("multi_scale_chart") or {}
+                )
+                # Phase I-1/I-2 — surface entry-candidate panel even
+                # when the risk gate forces an early HOLD, so the user
+                # can still see the would-have-been entry plan.
+                gate_advisory["entry_candidates"] = (
+                    gate_panels.get("entry_candidates") or []
+                )
+                gate_advisory["selected_entry_candidate"] = (
+                    gate_panels.get("selected_entry_candidate") or {}
                 )
         elif rs_events:
             # Non-event-driven block but events present — just surface
@@ -1788,6 +1855,9 @@ def decide_royal_road_v2_integrated(
         "best_setup": None,
         "reconstruction_quality": {"total_reconstruction_score": float(integrated.confidence)},
         "multi_scale_chart":     panels.get("multi_scale_chart")     or {},
+        # Phase I-1/I-2 — entry candidate observation layer.
+        "entry_candidates":          panels.get("entry_candidates") or [],
+        "selected_entry_candidate":  panels.get("selected_entry_candidate") or {},
     }
 
     chain.extend([f"side_bias:{side_bias}", f"action:{action}"])
