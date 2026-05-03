@@ -385,6 +385,9 @@ def main() -> int:
                  "double_bottom_integrated_buy_demo",
                  "double_top_integrated_sell_demo",
                  "forming_pattern_integrated_hold_demo",
+                 "wait_breakout_demo",
+                 "wait_retest_demo",
+                 "wait_event_clear_demo",
                  "all"),
         default="all",
         help="Which sample mode to generate. 'all' runs every demo "
@@ -1044,6 +1047,117 @@ def _build_forming_pattern_integrated_hold_demo_mobile(*, out_path: Path) -> dic
     )
 
 
+def _double_bottom_pre_breakout_ohlcv(n: int = 320, seed: int = 11) -> pd.DataFrame:
+    """DB curve truncated BEFORE the neckline breakout — pattern is
+    visible (B1 / NL / B2) but the trigger has not fired yet, so the
+    integrated profile reports entry_status=WAIT_BREAKOUT."""
+    knots = [
+        (0.00, 0.70),  # prior high
+        (0.20, 0.05),  # B1
+        (0.55, 0.55),  # NL
+        (0.85, 0.10),  # B2
+        (1.00, 0.42),  # rising back toward NL but NOT through it
+    ]
+    return _ohlc_from_curve(_piecewise_curve(knots, n), seed=seed)
+
+
+def _double_bottom_post_breakout_pre_retest_ohlcv(
+    n: int = 320, seed: int = 11,
+) -> pd.DataFrame:
+    """DB curve cropped AFTER the neckline breakout but BEFORE the
+    retest pullback completes / a confirming bullish bar forms.
+    The integrated profile reports entry_status=WAIT_RETEST."""
+    knots = [
+        (0.00, 0.70),
+        (0.18, 0.05),  # B1
+        (0.45, 0.55),  # NL
+        (0.70, 0.10),  # B2
+        (0.92, 0.62),  # break above NL
+        (1.00, 0.58),  # immediate, shallow pullback (retest pending)
+    ]
+    return _ohlc_from_curve(_piecewise_curve(knots, n), seed=seed)
+
+
+def _build_wait_breakout_demo_mobile(*, out_path: Path) -> dict:
+    """Pattern recognised but breakout not yet — WAIT_BREAKOUT."""
+    df = _double_bottom_pre_breakout_ohlcv()
+    sym = "EURUSD=X"
+    res = run_engine_backtest(
+        df, sym, interval="1h", warmup=30,
+        decision_profile="royal_road_decision_v2_integrated",
+        integrated_mode="integrated_balanced",
+    )
+    return render_visual_audit_mobile_single_file(
+        traces=res.decision_traces,
+        df_by_symbol={sym: df},
+        out_path=out_path,
+        max_cases=3,
+        title="visual_audit_mobile_v1 — WAIT_BREAKOUT demo",
+        demo_fixture_banner=(
+            "ダブルボトムらしい形が見えてきたものの、まだネックライン (WNL) を"
+            "上抜けしていない局面のデモ。entry_plan は WAIT_BREAKOUT、"
+            "最終アクションは HOLD。"
+        ),
+    )
+
+
+def _build_wait_retest_demo_mobile(*, out_path: Path) -> dict:
+    """Breakout fired, retest pending — WAIT_RETEST."""
+    df = _double_bottom_post_breakout_pre_retest_ohlcv()
+    sym = "EURUSD=X"
+    res = run_engine_backtest(
+        df, sym, interval="1h", warmup=30,
+        decision_profile="royal_road_decision_v2_integrated",
+        integrated_mode="integrated_balanced",
+    )
+    return render_visual_audit_mobile_single_file(
+        traces=res.decision_traces,
+        df_by_symbol={sym: df},
+        out_path=out_path,
+        max_cases=3,
+        title="visual_audit_mobile_v1 — WAIT_RETEST demo",
+        demo_fixture_banner=(
+            "ネックライン (WNL) を一度抜けたあと、戻し (リターンムーブ) と"
+            "確定足を待っている局面のデモ。entry_plan は WAIT_RETEST、"
+            "最終アクションは HOLD。"
+        ),
+    )
+
+
+def _build_wait_event_clear_demo_mobile(*, out_path: Path) -> dict:
+    """READY setup but a high-impact macro event sits inside the
+    blocking window → WAIT_EVENT_CLEAR (action HOLD)."""
+    from datetime import timedelta
+    from src.fx.calendar import Event
+
+    df = _double_bottom_with_retest_ohlcv()
+    sym = "EURUSD=X"
+    last_ts = df.index[-1].to_pydatetime()
+    fomc = Event(
+        when=last_ts + timedelta(hours=4),
+        currency="USD", title="FOMC Statement",
+        impact="high", kind="FOMC",
+    )
+    res = run_engine_backtest(
+        df, sym, interval="1h", warmup=30,
+        decision_profile="royal_road_decision_v2_integrated",
+        integrated_mode="integrated_balanced",
+        events=(fomc,),
+    )
+    return render_visual_audit_mobile_single_file(
+        traces=res.decision_traces,
+        df_by_symbol={sym: df},
+        out_path=out_path,
+        max_cases=3,
+        title="visual_audit_mobile_v1 — WAIT_EVENT_CLEAR demo",
+        demo_fixture_banner=(
+            "READY 条件は揃っているが、4 時間後に FOMC が控えているため"
+            "イベントリスク回避で WAIT_EVENT_CLEAR にダウングレードする"
+            "ケースのデモ。最終アクションは HOLD。"
+        ),
+    )
+
+
 _INTEGRATED_DEMO_BUILDERS = {
     "normal_integrated_balanced_report":
         lambda out_path: _build_normal_integrated_mobile(
@@ -1059,6 +1173,12 @@ _INTEGRATED_DEMO_BUILDERS = {
         _build_double_top_integrated_sell_demo_mobile,
     "forming_pattern_integrated_hold_demo":
         _build_forming_pattern_integrated_hold_demo_mobile,
+    "wait_breakout_demo":
+        _build_wait_breakout_demo_mobile,
+    "wait_retest_demo":
+        _build_wait_retest_demo_mobile,
+    "wait_event_clear_demo":
+        _build_wait_event_clear_demo_mobile,
 }
 
 
