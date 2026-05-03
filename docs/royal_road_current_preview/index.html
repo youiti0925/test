@@ -118,55 +118,64 @@
   </style>
 </head>
 <body>
-  <h1>現在の王道判断プレビュー (Phase F / G + 改修版)</h1>
+  <h1>現在の王道判断プレビュー (Phase F / G + 波形可視化復旧版)</h1>
   <p class="meta">
     ブランチ: <code>artifact/visual-audit-mobile-preview</code><br>
-    生成元 commit: <code>2f349e1</code> (<code>feat/royal-road-complete-v2</code>)<br>
+    生成元 commit: <code>d46e47e</code> (<code>feat/royal-road-complete-v2</code>)<br>
     プロファイル: <code>royal_road_decision_v2_integrated</code>
   </p>
 
   <div class="changelog">
-    <h2>今回の改修ポイント (前回プレビューからの変更点)</h2>
+    <h2>今回の改修ポイント (波形可視化復旧)</h2>
+    <p>前回プレビューでメインチャートから消えていた波形構造を復旧しました。</p>
     <ol>
-      <li><b>各ケースの最上段</b>に「状態 / 結論 / ENTRY / STOP / TP / RR / 次に待つ条件」だけを集約した
-        <b>compact 判断カード</b> を追加。詳細パネルは下に <code>&lt;details&gt;</code> で折りたたみ。</li>
-      <li><b>チャート上の文字</b>は <code>WNL</code> / <code>STOP</code> / <code>TP</code> / <code>EVENT</code> のみ。
-        <code>WB1</code> / <code>WB2</code> / <code>WBR</code> / <code>WPH</code> / <code>WFIB*</code> 等の補助線は
-        線だけ描画して、ラベルは右側パネルに集約。</li>
-      <li>右側パネルに <b>5b. 未接続ファンダ</b> を追加。
-        <code>DXY</code> / <code>米金利 (10y)</code> / <code>ニュース</code> / <code>経済カレンダー</code> を
-        赤(未接続) / 緑(接続済) で常時表示。</li>
-      <li>右側パネルに <b>6. 自動線一覧 (タップで非表示切替)</b> を追加。スマホで
-        細い SVG 線を直接タップしなくても、ボタンで on/off できる。</li>
-      <li>右側パネルの <b>7. 手動線操作</b> に
-        「<b>このブラウザ内 (localStorage) だけに保存。別端末との共有・正式保存には
-        annotations.json のダウンロードが必要</b>」の警告を高コントラストで表示。</li>
-      <li><code>pattern_levels</code> の <b>STOP / TP が W ライン由来でなく
-        skeleton から補完された</b> 場合、判断カード直下に橙色の警告
-        (<code>level_source = skeleton_fallback</code>) を表示。</li>
-      <li>波形 → pattern_levels → entry_plan → integrated action の
-        <b>間接決定経路</b> を <code>wave_derived_lines.py</code> docstring と
-        画面表示で明示。</li>
+      <li><b>メインチャート SVG</b> に <code>data-testid="main-candle-chart"</code> を付与。
+        その中に必ず以下が描画されます:
+        <ul>
+          <li>波形ファミリー名: <code>DB1</code> / <code>DT1</code> / <code>HS1</code> / <code>IHS1</code></li>
+          <li>波形部位ラベル: <code>B1</code> / <code>B2</code> / <code>P1</code> / <code>P2</code> /
+            <code>LS</code> / <code>H</code> / <code>RS</code> / <code>NL</code> / <code>BR</code></li>
+          <li>W ライン: <code>WNL</code> / <code>WSL</code> / <code>WTP</code></li>
+          <li>アクション: <code>ENTRY</code> / <code>STOP</code> / <code>TP</code></li>
+          <li>状態バッジ: <code>READY</code> / <code>WAIT BREAKOUT</code> /
+            <code>WAIT RETEST</code> / <code>WAIT EVENT</code> / <code>HOLD</code></li>
+          <li>イベント帯ラベル: <code>EVENT &lt;kind&gt;</code></li>
+        </ul>
+      </li>
+      <li><b>波形専用チャート</b>: <code>data-testid="wave-only-chart"</code> 付き SVG を
+        <code>&lt;section class="wave-only-section"&gt;</code> で復活
+        (もう <code>&lt;details&gt;</code> で折りたたまれていません)。</li>
+      <li><b>右側パネル</b>に新セクション <code>g5-pattern-parts-panel</code>「波形部位」追加。
+        パターン名・状態・各部位 (B1/B2/P1/P2/LS/H/RS/NL/BR) と W ライン (WNL/WSL/WTP) の
+        価格を一覧表示。チャート上のラベルと数字を突き合わせられます。</li>
+      <li><b>チャートタイトル</b>: 波形候補が先頭、参考線は <code>WNL → WSL → WTP → WBR
+        → 波形部位 → WFIB</code> の順。WFIB が主役にならないようにしました。</li>
+      <li><b>WFIB ラベル</b>: 線は描画したまま、チャート上の文字を抑制。
+        右側パネル「自動線一覧」と「波形由来の線」表で確認できます。</li>
+      <li><b>STOP / TP fallback</b> の橙色警告 / <b>5b. 未接続ファンダ</b> /
+        <b>6. 自動線一覧</b> / <b>7. 手動線操作 localStorage 警告</b> は前回ラウンドのまま継続。</li>
     </ol>
   </div>
 
   <div class="what-to-check">
-    <h2>このプレビューでユーザーに確認してほしいこと</h2>
+    <h2>このプレビューでユーザーに確認してほしいこと (P0)</h2>
     <ol>
-      <li>各ケースの一番上に <b>状態 / 結論 / ENTRY / STOP / TP / RR / 次に待つ条件</b> が
-        まとまって読めるか (チャートを見る前にそれだけで判断できるか)</li>
-      <li>チャート上に余計な記号 (<code>WB1/WB2/WBR/WPH/WFIB*</code>) が
-        ないか — あるのは <code>WNL/STOP/TP/EVENT</code> だけのはず</li>
-      <li>右側パネルの <b>5b. 未接続ファンダ</b> が DXY/米金利/ニュース/経済カレンダー の状態を
-        赤/緑で見せているか</li>
-      <li>右側パネルの <b>6. 自動線一覧</b> から [非表示] ボタンでチャート上の線を
-        消せるか (スマホでもタップしやすいか)</li>
-      <li>右側パネルの <b>7. 手動線操作</b> に「ブラウザ内のみ保存」の警告が
-        ハッキリ見えるか</li>
-      <li>WAIT_RETEST のケースで <b>「まだ入らない理由」</b>
-        (戻り (リターンムーブ) 待ち / 確定足待ち) が読めるか</li>
-      <li>WAIT_EVENT_CLEAR のケースで <b>赤い縦バンド</b> + 右パネルに
-        <b>FOMC + BLOCK</b> 表示が出ているか</li>
+      <li><b>メインチャート SVG 内</b> に DB1 / B1 / B2 / NL / BR / WNL / WSL / WTP /
+        ENTRY / STOP / TP が見えるか (ダブルボトムケース)</li>
+      <li><b>メインチャート SVG 内</b> に DT1 / P1 / P2 / NL / BR / WNL / WSL / WTP /
+        ENTRY / STOP / TP が見えるか (ダブルトップケース)</li>
+      <li>WAIT_BREAKOUT ケースで <b>「WAIT BREAKOUT」</b> の橙色バッジが
+        メインチャート右上に出ているか</li>
+      <li>WAIT_RETEST ケースで <b>「WAIT RETEST」</b> の橙色バッジが
+        メインチャート右上に出ているか</li>
+      <li>WAIT_EVENT_CLEAR ケースでイベント帯に <b>「EVENT FOMC」</b> ラベル +
+        右上に <b>「WAIT EVENT」</b> の赤いバッジが出ているか</li>
+      <li>波形専用チャート (<b>波形専用チャート: ...</b> 見出し)
+        に skeleton 線 + 部位ラベルが描かれているか</li>
+      <li>右側パネルに <b>波形部位</b> セクションが出て、
+        各部位 (B1/B2/...) の価格表が読めるか</li>
+      <li>チャートタイトルが「判断: BUY / 波形候補: ダブルボトム ...」と読めるか
+        (WFIB 主役になっていないか)</li>
       <li>STOP / TP が skeleton から補完されたケースで <b>橙色の補完警告</b> が
         判断カード直下に出ているか</li>
     </ol>
