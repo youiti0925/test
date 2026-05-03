@@ -1593,7 +1593,7 @@ def _build_candle_svg_xml(
         f"<svg xmlns='http://www.w3.org/2000/svg' "
         f"data-testid='main-candle-chart' "
         f"viewBox='0 0 {W} {H}' width='{W}' height='{H}' "
-        f"font-family='-apple-system, sans-serif' font-size='11'>"
+        f"font-family='-apple-system, sans-serif' font-size='22'>"
     )
     parts.append(f"<rect x='0' y='0' width='{W}' height='{H}' fill='#fdfdfd'/>")
     parts.append(
@@ -1644,7 +1644,7 @@ def _build_candle_svg_xml(
             f"data-price-high='{float(zhigh):.6f}' "
             f"x='{margin_l}' y='{min(y_top, y_bot):.1f}' "
             f"width='{plot_w}' height='{abs(y_bot - y_top):.1f}' "
-            f"fill='{color}' opacity='0.18'/>"
+            f"fill='{color}' opacity='0.24'/>"
         )
         # S1 / S2 / ... or R1 / R2 / ... label tag at left edge.
         if kind == "support":
@@ -1658,13 +1658,13 @@ def _build_candle_svg_xml(
         ty = (y_top + y_bot) / 2
         parts.append(
             f"<rect class='sr-zone-label-bg' "
-            f"x='{margin_l + 4}' y='{ty - 8:.1f}' width='28' height='16' "
-            f"fill='white' stroke='{color}' stroke-width='1' rx='3'/>"
+            f"x='{margin_l + 4}' y='{ty - 14:.1f}' width='44' height='28' "
+            f"fill='white' stroke='{color}' stroke-width='2' rx='4'/>"
         )
         parts.append(
-            f"<text class='sr-zone-label' x='{margin_l + 18}' y='{ty + 4:.1f}' "
+            f"<text class='sr-zone-label' x='{margin_l + 26}' y='{ty + 7:.1f}' "
             f"text-anchor='middle' fill='{color}' font-weight='bold' "
-            f"font-size='11'>{tag}</text>"
+            f"font-size='22'>{tag}</text>"
         )
     rej_n = 0
     for lvl in ov.get("level_zones_rejected", []):
@@ -1687,7 +1687,7 @@ def _build_candle_svg_xml(
         parts.append(
             f"<line class='wick' x1='{xi:.1f}' y1='{y_h:.1f}' "
             f"x2='{xi:.1f}' y2='{y_l:.1f}' stroke='#222' "
-            f"stroke-width='0.6'/>"
+            f"stroke-width='1.2'/>"
         )
         bull = closes[i] >= opens[i]
         color = "#2e7d32" if bull else "#c62828"
@@ -1725,19 +1725,21 @@ def _build_candle_svg_xml(
             f"data-slope='{float(slope):.6e}' "
             f"x1='{x_of(i0):.1f}' "
             f"y1='{y0:.1f}' x2='{x_of(i1):.1f}' y2='{y1:.1f}' "
-            f"stroke='#1565c0' stroke-width='1.4' opacity='{opacity}'/>"
+            f"stroke='#1565c0' stroke-width='2.6' opacity='{opacity}'/>"
         )
-        # Label at the right end of the segment
+        # Label at the right end of the segment (sized for mobile-scaled
+        # SVG: rect width/height grow with the bumped font-size so labels
+        # stay readable when the chart shrinks to phone width).
         parts.append(
             f"<rect class='trendline-label-bg' "
-            f"x='{x_of(i1) - 24:.1f}' y='{y1 - 8:.1f}' "
-            f"width='22' height='16' fill='white' stroke='#1565c0' "
-            f"stroke-width='1' rx='3'/>"
+            f"x='{x_of(i1) - 40:.1f}' y='{y1 - 14:.1f}' "
+            f"width='38' height='28' fill='white' stroke='#1565c0' "
+            f"stroke-width='2' rx='4'/>"
         )
         parts.append(
-            f"<text class='trendline-label' x='{x_of(i1) - 13:.1f}' "
-            f"y='{y1 + 4:.1f}' text-anchor='middle' fill='#1565c0' "
-            f"font-weight='bold' font-size='11'>{tag}</text>"
+            f"<text class='trendline-label' x='{x_of(i1) - 21:.1f}' "
+            f"y='{y1 + 7:.1f}' text-anchor='middle' fill='#1565c0' "
+            f"font-weight='bold' font-size='22'>{tag}</text>"
         )
     xt_idx = 0
     for rj in ov.get("trendlines_rejected", []):
@@ -1759,14 +1761,14 @@ def _build_candle_svg_xml(
             f"data-trendline-rej-idx='{xt_idx}' "
             f"x1='{x_of(i0):.1f}' "
             f"y1='{y0:.1f}' x2='{x_of(i1):.1f}' y2='{y1:.1f}' "
-            f"stroke='#888' stroke-width='0.7' opacity='0.5' "
+            f"stroke='#888' stroke-width='1.4' opacity='0.5' "
             f"stroke-dasharray='3,3'/>"
         )
         # Tiny XT label so the user can see rejected ones exist
         parts.append(
             f"<text class='trendline-rejected-label' "
-            f"x='{x_of(i1) - 4:.1f}' y='{y1 + 4:.1f}' "
-            f"text-anchor='end' fill='#888' font-size='9'>"
+            f"x='{x_of(i1) - 4:.1f}' y='{y1 + 6:.1f}' "
+            f"text-anchor='end' fill='#888' font-size='18'>"
             f"XT{xt_idx}</text>"
         )
     for p in ov.get("patterns_selected", []):
@@ -1783,7 +1785,7 @@ def _build_candle_svg_xml(
                 f"<line class='pattern-neckline' "
                 f"x1='{margin_l}' y1='{yv:.1f}' "
                 f"x2='{margin_l + plot_w}' y2='{yv:.1f}' "
-                f"stroke='{color}' stroke-width='1.0' "
+                f"stroke='{color}' stroke-width='2.0' "
                 f"stroke-dasharray='6,3' opacity='0.8'/>"
             )
         for line_key in ("upper_line", "lower_line"):
@@ -1806,7 +1808,7 @@ def _build_candle_svg_xml(
                     f"<line class='pattern-{line_key}' "
                     f"x1='{x_of(i0):.1f}' y1='{y0:.1f}' "
                     f"x2='{x_of(i1):.1f}' y2='{y1:.1f}' "
-                    f"stroke='{color}' stroke-width='1.0' "
+                    f"stroke='{color}' stroke-width='2.0' "
                     f"stroke-dasharray='6,3' opacity='0.8'/>"
                 )
             else:
@@ -1818,7 +1820,7 @@ def _build_candle_svg_xml(
                     f"<line class='pattern-{line_key}' "
                     f"x1='{margin_l}' y1='{yv:.1f}' "
                     f"x2='{margin_l + plot_w}' y2='{yv:.1f}' "
-                    f"stroke='{color}' stroke-width='1.0' "
+                    f"stroke='{color}' stroke-width='2.0' "
                     f"stroke-dasharray='6,3' opacity='0.8'/>"
                 )
     ltf = ov.get("lower_tf_trigger")
@@ -1851,7 +1853,7 @@ def _build_candle_svg_xml(
             f"<line class='{label.replace('_','-')}-line' "
             f"x1='{margin_l}' y1='{yv:.1f}' "
             f"x2='{margin_l + plot_w}' y2='{yv:.1f}' "
-            f"stroke='{color}' stroke-width='1.2' "
+            f"stroke='{color}' stroke-width='2.4' "
             f"stroke-dasharray='4,2' opacity='0.75'/>"
         )
         parts.append(
@@ -1948,20 +1950,20 @@ def _build_candle_svg_xml(
         badge = badge_text_map.get(es)
         if badge is not None:
             text, fill = badge
-            badge_w = max(80, 9 * len(text) + 16)
+            badge_w = max(140, 16 * len(text) + 28)
             bx = margin_l + plot_w - badge_w - 8
             by = margin_t + 8
             parts.append(
                 f"<rect class='entry-status-badge-bg' "
                 f"x='{bx:.1f}' y='{by:.1f}' "
-                f"width='{badge_w}' height='22' "
-                f"fill='{fill}' opacity='0.92' rx='4'/>"
+                f"width='{badge_w}' height='34' "
+                f"fill='{fill}' opacity='0.92' rx='5'/>"
             )
             parts.append(
                 f"<text class='entry-status-badge' "
-                f"x='{bx + badge_w / 2:.1f}' y='{by + 16:.1f}' "
+                f"x='{bx + badge_w / 2:.1f}' y='{by + 24:.1f}' "
                 f"text-anchor='middle' fill='white' "
-                f"font-weight='bold' font-size='12'>"
+                f"font-weight='bold' font-size='24'>"
                 f"{_html_escape(text)}</text>"
             )
 
@@ -1974,14 +1976,14 @@ def _build_candle_svg_xml(
         parts.append(
             f"<text class='no-detection-warning no-trendlines' "
             f"x='{margin_l + 6:.1f}' y='{margin_t + plot_h - 24:.1f}' "
-            f"fill='#bf360c' font-size='10' font-weight='bold' "
+            f"fill='#bf360c' font-size='20' font-weight='bold' "
             f"opacity='0.85'>トレンドライン検出: 0本</text>"
         )
     if n_sel_sr == 0:
         parts.append(
             f"<text class='no-detection-warning no-sr' "
             f"x='{margin_l + 6:.1f}' y='{margin_t + plot_h - 10:.1f}' "
-            f"fill='#bf360c' font-size='10' font-weight='bold' "
+            f"fill='#bf360c' font-size='20' font-weight='bold' "
             f"opacity='0.85'>サポレジ検出: 0本</text>"
         )
 
@@ -2128,7 +2130,7 @@ def _build_wave_only_svg(
         f"<svg xmlns='http://www.w3.org/2000/svg' "
         f"data-testid='wave-only-chart' class='wave-only-chart' "
         f"viewBox='0 0 {W} {H}' width='{W}' height='{H}' "
-        f"font-family='-apple-system, sans-serif' font-size='11'>"
+        f"font-family='-apple-system, sans-serif' font-size='22'>"
     )
     parts.append(
         f"<rect x='0' y='0' width='{W}' height='{H}' fill='#fbfcff'/>"
@@ -2210,23 +2212,24 @@ def _build_wave_only_svg(
             f"stroke-dasharray='{style['dash']}' opacity='0.85'/>"
         )
         if compact_label is not None:
-            # Right-edge label — only for the 3 essentials per mobile policy
-            label_w = max(36, 10 * len(compact_label) + 8)
+            # Right-edge label — only for the 3 essentials per mobile policy.
+            # Sized for the mobile-scaled SVG (~0.33× at 390 px).
+            label_w = max(58, 14 * len(compact_label) + 14)
             parts.append(
                 f"<rect class='wave-derived-line-label-bg' "
                 f"data-line-id='{_html_escape(line_id)}' "
                 f"x='{margin_l + plot_w - label_w - 4:.1f}' "
-                f"y='{yv - 9:.1f}' width='{label_w}' height='18' "
+                f"y='{yv - 14:.1f}' width='{label_w}' height='28' "
                 f"fill='white' stroke='{style['color']}' "
-                f"stroke-width='1.2' rx='3'/>"
+                f"stroke-width='2.0' rx='4'/>"
             )
             parts.append(
                 f"<text class='wave-derived-line-label' "
                 f"data-line-id='{_html_escape(line_id)}' "
                 f"x='{margin_l + plot_w - label_w / 2 - 4:.1f}' "
-                f"y='{yv + 4:.1f}' text-anchor='middle' "
+                f"y='{yv + 7:.1f}' text-anchor='middle' "
                 f"fill='{style['color']}' font-weight='bold' "
-                f"font-size='11'>{_html_escape(compact_label)}</text>"
+                f"font-size='22'>{_html_escape(compact_label)}</text>"
             )
 
     # 1. Skeleton polyline
@@ -2236,7 +2239,7 @@ def _build_wave_only_svg(
     )
     parts.append(
         f"<polyline class='wave-skeleton-line' points='{poly_pts}' "
-        f"fill='none' stroke='#0d47a1' stroke-width='3.2' "
+        f"fill='none' stroke='#0d47a1' stroke-width='4.8' "
         f"stroke-linecap='round' stroke-linejoin='round'/>"
     )
 
@@ -2246,7 +2249,7 @@ def _build_wave_only_svg(
         y = y_of(float(p.get("price", 0.0)))
         parts.append(
             f"<circle class='wave-pivot-dot' cx='{x:.1f}' cy='{y:.1f}' "
-            f"r='5' fill='#0d47a1' stroke='white' stroke-width='1.4'/>"
+            f"r='8' fill='#0d47a1' stroke='white' stroke-width='2.4'/>"
         )
 
     # 3. Matched part labels
@@ -2276,17 +2279,17 @@ def _build_wave_only_svg(
         x = x_of(int(piv.get("index")))
         y = y_of(float(piv.get("price")))
         is_high = piv.get("kind") == "H"
-        ty = (y - 22) if is_high else (y + 6)
-        text_w = max(22, 10 * len(short) + 8)
+        ty = (y - 32) if is_high else (y + 8)
+        text_w = max(34, 14 * len(short) + 14)
         parts.append(
             f"<rect class='wave-part-label-bg' x='{x - text_w / 2:.1f}' "
-            f"y='{ty:.1f}' width='{text_w}' height='18' fill='white' "
-            f"stroke='#0d47a1' stroke-width='1.2' rx='3'/>"
+            f"y='{ty:.1f}' width='{text_w}' height='28' fill='white' "
+            f"stroke='#0d47a1' stroke-width='2.0' rx='4'/>"
         )
         parts.append(
             f"<text class='wave-part-label' x='{x:.1f}' "
-            f"y='{ty + 13:.1f}' text-anchor='middle' fill='#0d47a1' "
-            f"font-weight='bold' font-size='11'>{_html_escape(short)}</text>"
+            f"y='{ty + 20:.1f}' text-anchor='middle' fill='#0d47a1' "
+            f"font-weight='bold' font-size='22'>{_html_escape(short)}</text>"
         )
         if "neckline" in part_name and neckline_price is None:
             try:
@@ -2300,12 +2303,12 @@ def _build_wave_only_svg(
         parts.append(
             f"<line class='wave-neckline' x1='{margin_l}' "
             f"y1='{ny:.1f}' x2='{margin_l + plot_w}' y2='{ny:.1f}' "
-            f"stroke='#7b1fa2' stroke-width='2.0' stroke-dasharray='6,4' "
+            f"stroke='#7b1fa2' stroke-width='3.6' stroke-dasharray='6,4' "
             f"opacity='0.85'/>"
         )
         parts.append(
             f"<text x='{margin_l + 6}' y='{ny - 4:.1f}' fill='#7b1fa2' "
-            f"font-weight='bold' font-size='11'>"
+            f"font-weight='bold' font-size='22'>"
             f"{_html_escape(neckline_label)} ネックライン</text>"
         )
 
@@ -2316,7 +2319,7 @@ def _build_wave_only_svg(
     )
     parts.append(
         f"<text x='{margin_l}' y='16' fill='#0d47a1' font-weight='bold' "
-        f"font-size='13'>{_html_escape(title_str)}</text>"
+        f"font-size='26'>{_html_escape(title_str)}</text>"
     )
 
     # 5. Status banner at bottom (e.g. 「未ブレイク (forming)」)
@@ -2329,14 +2332,14 @@ def _build_wave_only_svg(
     }.get(status or "", status or "")
     if status_label_ja:
         parts.append(
-            f"<rect x='{margin_l}' y='{margin_t + plot_h + 6}' "
-            f"width='{plot_w}' height='22' fill='#fff8e1' "
-            f"stroke='#f9a825' stroke-width='1'/>"
+            f"<rect x='{margin_l}' y='{margin_t + plot_h + 4}' "
+            f"width='{plot_w}' height='34' fill='#fff8e1' "
+            f"stroke='#f9a825' stroke-width='1.6'/>"
         )
         parts.append(
             f"<text x='{margin_l + plot_w / 2}' "
-            f"y='{margin_t + plot_h + 21}' text-anchor='middle' "
-            f"fill='#5d4037' font-weight='bold' font-size='12'>"
+            f"y='{margin_t + plot_h + 26}' text-anchor='middle' "
+            f"fill='#5d4037' font-weight='bold' font-size='24'>"
             f"{_html_escape(status_label_ja)} "
             f"({_html_escape(side_bias or '')})</text>"
         )
@@ -2346,18 +2349,18 @@ def _build_wave_only_svg(
 
 
 _WAVE_LINE_STYLE: Final[dict] = {
-    "neckline":              {"color": "#7b1fa2", "dash": "6,4", "width": 2.0},
-    "pivot_low":             {"color": "#0d47a1", "dash": "0",   "width": 1.4},
-    "pivot_high":            {"color": "#0d47a1", "dash": "0",   "width": 1.4},
-    "shoulder":              {"color": "#0d47a1", "dash": "0",   "width": 1.4},
-    "head":                  {"color": "#0d47a1", "dash": "0",   "width": 1.6},
-    "pattern_invalidation":  {"color": "#c62828", "dash": "5,3", "width": 2.0},
-    "pattern_target":        {"color": "#2e7d32", "dash": "5,3", "width": 2.0},
-    "pattern_upper":         {"color": "#ef6c00", "dash": "4,3", "width": 1.6},
-    "pattern_lower":         {"color": "#ef6c00", "dash": "4,3", "width": 1.6},
-    "pattern_breakout":      {"color": "#7b1fa2", "dash": "6,4", "width": 2.0},
-    "fibonacci_retracement": {"color": "#00838f", "dash": "3,3", "width": 1.2},
-    "fibonacci_extension":   {"color": "#00695c", "dash": "3,3", "width": 1.2},
+    "neckline":              {"color": "#7b1fa2", "dash": "6,4", "width": 3.6},
+    "pivot_low":             {"color": "#0d47a1", "dash": "0",   "width": 2.6},
+    "pivot_high":            {"color": "#0d47a1", "dash": "0",   "width": 2.6},
+    "shoulder":              {"color": "#0d47a1", "dash": "0",   "width": 2.6},
+    "head":                  {"color": "#0d47a1", "dash": "0",   "width": 3.0},
+    "pattern_invalidation":  {"color": "#c62828", "dash": "5,3", "width": 3.6},
+    "pattern_target":        {"color": "#2e7d32", "dash": "5,3", "width": 3.6},
+    "pattern_upper":         {"color": "#ef6c00", "dash": "4,3", "width": 3.0},
+    "pattern_lower":         {"color": "#ef6c00", "dash": "4,3", "width": 3.0},
+    "pattern_breakout":      {"color": "#7b1fa2", "dash": "6,4", "width": 3.6},
+    "fibonacci_retracement": {"color": "#00838f", "dash": "3,3", "width": 2.2},
+    "fibonacci_extension":   {"color": "#00695c", "dash": "3,3", "width": 2.2},
 }
 
 
@@ -2452,7 +2455,7 @@ def _event_bands_svg_fragment(
             f"<line class='event-center event-{status.lower()}' "
             f"x1='{x_center:.1f}' x2='{x_center:.1f}' "
             f"y1='{margin_t:.1f}' y2='{margin_t + plot_h:.1f}' "
-            f"stroke='{stroke}' stroke-width='1.4' "
+            f"stroke='{stroke}' stroke-width='2.6' "
             f"stroke-dasharray='4,3' opacity='0.85' />"
         )
         # Label tag at top of chart. Always prefix with the literal
@@ -2467,7 +2470,7 @@ def _event_bands_svg_fragment(
         out.append(
             f"<text class='event-label event-{status.lower()}' "
             f"x='{x_center + 3:.1f}' y='{margin_t + 12:.1f}' "
-            f"fill='{stroke}' font-size='10' font-weight='bold'>"
+            f"fill='{stroke}' font-size='20' font-weight='bold'>"
             f"{_html_escape(label)}</text>"
         )
     out.append("</g>")
@@ -2524,7 +2527,7 @@ def _user_annotations_svg_fragment(
             out.append(
                 f"<text class='user-line-label' "
                 f"x='{margin_l + 4:.1f}' y='{y - 2:.1f}' "
-                f"fill='#d84315' font-size='10'>"
+                f"fill='#d84315' font-size='20'>"
                 f"{_html_escape(str(label)[:32])}</text>"
             )
     out.append("</g>")
@@ -2634,22 +2637,25 @@ def _wave_derived_lines_svg_fragment(
                 )
         # Render each visible label as a stacked badge along the right
         # edge so labels don't overlap when WNL+ENTRY share a line.
+        # Sizes are inflated for mobile-scaled SVG: at 390 px viewport
+        # the SVG is ~0.33× scale, so 22 px viewBox text → ~7 px on
+        # screen. Matching label-rect dimensions keep the badges legible.
         for n, label in enumerate(labels):
-            label_w = max(38, 10 * len(label) + 8)
-            label_x = margin_l + 4 + n * (label_w + 4)
+            label_w = max(58, 14 * len(label) + 14)
+            label_x = margin_l + 4 + n * (label_w + 6)
             out.append(
                 f"<rect class='wave-derived-line-label-bg' "
                 f"data-line-id='{_html_escape(line_id)}' "
-                f"x='{label_x:.1f}' y='{y - 9:.1f}' "
-                f"width='{label_w}' height='18' fill='white' "
-                f"stroke='{style['color']}' stroke-width='1.2' rx='3'/>"
+                f"x='{label_x:.1f}' y='{y - 14:.1f}' "
+                f"width='{label_w}' height='28' fill='white' "
+                f"stroke='{style['color']}' stroke-width='2.0' rx='4'/>"
             )
             out.append(
                 f"<text class='wave-derived-line-label' "
                 f"data-line-id='{_html_escape(line_id)}' "
-                f"x='{label_x + label_w / 2:.1f}' y='{y + 4:.1f}' "
+                f"x='{label_x + label_w / 2:.1f}' y='{y + 7:.1f}' "
                 f"text-anchor='middle' fill='{style['color']}' "
-                f"font-weight='bold' font-size='11'>"
+                f"font-weight='bold' font-size='22'>"
                 f"{_html_escape(label)}</text>"
             )
     out.append("</g>")
@@ -2715,7 +2721,7 @@ def _wave_overlay_svg_fragment(
     poly_pts = " ".join(f"{x:.1f},{y:.1f}" for x, y, _ in points_xy)
     out.append(
         f"<polyline class='wave-skeleton-line' points='{poly_pts}' "
-        f"fill='none' stroke='#0d47a1' stroke-width='3.0' "
+        f"fill='none' stroke='#0d47a1' stroke-width='4.5' "
         f"stroke-linecap='round' stroke-linejoin='round' opacity='0.85'/>"
     )
 
@@ -2736,12 +2742,12 @@ def _wave_overlay_svg_fragment(
             f"data-price='{piv_price:.6f}' data-idx='{piv_idx}' "
             f"data-pivot-kind='{_html_escape(kind_marker)}' "
             f"cx='{x:.1f}' cy='{y:.1f}' "
-            f"r='4' fill='#0d47a1' stroke='white' stroke-width='1.2'/>"
+            f"r='7' fill='#0d47a1' stroke='white' stroke-width='2.0'/>"
         )
         if kind_marker:
             out.append(
                 f"<text class='wave-pivot-kind' x='{x + 6:.1f}' "
-                f"y='{y - 6:.1f}' fill='#0d47a1' font-size='10' "
+                f"y='{y - 6:.1f}' fill='#0d47a1' font-size='20' "
                 f"font-weight='bold'>{_html_escape(kind_marker)}</text>"
             )
 
@@ -2778,11 +2784,13 @@ def _wave_overlay_svg_fragment(
             # Skip unmapped parts (do not emit ugly fallbacks like "lowe").
             continue
         # Background rect + text so labels stay readable over candles.
-        text_w = max(20, 10 * len(short_label) + 8)
-        text_h = 18
+        # Mobile-scaled sizing — at 390 px the rect is ~0.33× so the
+        # 28-px viewBox height shows as ~9 px on screen.
+        text_w = max(34, 14 * len(short_label) + 14)
+        text_h = 28
         # Place above the pivot for high pivots, below for lows.
         is_high = p.get("kind") == "H"
-        ty = (y - 18) if is_high else (y + 6)
+        ty = (y - 30) if is_high else (y + 8)
         try:
             piv_price_for_label = float(p.get("price"))
         except (TypeError, ValueError):
@@ -2793,16 +2801,16 @@ def _wave_overlay_svg_fragment(
             f"data-price='{piv_price_for_label:.6f}' "
             f"x='{x - text_w / 2:.1f}' "
             f"y='{ty:.1f}' width='{text_w}' height='{text_h}' "
-            f"fill='white' stroke='#0d47a1' stroke-width='1.2' "
-            f"rx='3' ry='3'/>"
+            f"fill='white' stroke='#0d47a1' stroke-width='2.0' "
+            f"rx='4' ry='4'/>"
         )
         out.append(
             f"<text class='wave-part-label' "
             f"data-part='{_html_escape(short_label)}' "
             f"data-price='{piv_price_for_label:.6f}' "
             f"x='{x:.1f}' "
-            f"y='{ty + text_h - 5:.1f}' text-anchor='middle' "
-            f"fill='#0d47a1' font-weight='bold' font-size='11'>"
+            f"y='{ty + text_h - 8:.1f}' text-anchor='middle' "
+            f"fill='#0d47a1' font-weight='bold' font-size='22'>"
             f"{_html_escape(short_label)}</text>"
         )
         if "neckline" in part_name and neckline_price is None:
@@ -2818,13 +2826,13 @@ def _wave_overlay_svg_fragment(
         out.append(
             f"<line class='wave-neckline' x1='{margin_l:.1f}' "
             f"y1='{ny:.1f}' x2='{margin_l + plot_w:.1f}' y2='{ny:.1f}' "
-            f"stroke='#7b1fa2' stroke-width='2.0' stroke-dasharray='6,4' "
+            f"stroke='#7b1fa2' stroke-width='3.6' stroke-dasharray='6,4' "
             f"opacity='0.85'/>"
         )
         out.append(
             f"<text class='wave-neckline-label' x='{margin_l + 6:.1f}' "
             f"y='{ny - 4:.1f}' fill='#7b1fa2' font-weight='bold' "
-            f"font-size='11'>"
+            f"font-size='22'>"
             f"{_html_escape(neckline_label)} ネックライン</text>"
         )
 
@@ -2834,14 +2842,14 @@ def _wave_overlay_svg_fragment(
     if family:
         out.append(
             f"<rect class='wave-family-marker-bg' "
-            f"x='{margin_l + 8:.1f}' y='{margin_t + 6:.1f}' "
-            f"width='{18 + 8 * len(human_label)}' height='22' "
-            f"fill='#0d47a1' opacity='0.9' rx='3'/>"
+            f"x='{margin_l + 8:.1f}' y='{margin_t + 4:.1f}' "
+            f"width='{28 + 14 * len(human_label)}' height='32' "
+            f"fill='#0d47a1' opacity='0.9' rx='4'/>"
         )
         out.append(
             f"<text class='wave-family-marker' "
-            f"x='{margin_l + 16:.1f}' y='{margin_t + 22:.1f}' "
-            f"fill='white' font-weight='bold' font-size='11'>"
+            f"x='{margin_l + 18:.1f}' y='{margin_t + 26:.1f}' "
+            f"fill='white' font-weight='bold' font-size='22'>"
             f"{_html_escape(family)} {_html_escape(human_label)}</text>"
         )
 
