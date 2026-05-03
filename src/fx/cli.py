@@ -1212,6 +1212,30 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
         if runtime_kwargs else args.max_holding_bars
     )
 
+    # v2 lower-TF fetch (opt-in via --lower-tf). Failure is non-fatal —
+    # engine treats unavailable lower-TF as `not_attached` and emits
+    # the unavailable_reason in trace.
+    df_lower_tf_for_v2 = None
+    lower_tf_interval_for_v2 = getattr(args, "lower_tf", None)
+    if lower_tf_interval_for_v2 and len(df) > 0:
+        try:
+            df_lower_tf_for_v2 = fetch_ohlcv(
+                args.symbol,
+                interval=lower_tf_interval_for_v2,
+                period=None,
+                start=df.index.min().strftime("%Y-%m-%d"),
+                end=(df.index.max() + pd.Timedelta(days=1)).strftime(
+                    "%Y-%m-%d"
+                ),
+            )
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[warn] lower-TF fetch failed: {e} — v2 lower_tf_trigger "
+                "will report unavailable_reason",
+                file=sys.stderr,
+            )
+            df_lower_tf_for_v2 = None
+
     result = run_engine_backtest(
         df,
         symbol=args.symbol,
@@ -1240,6 +1264,12 @@ def cmd_backtest_engine(args, cfg: Config, storage: Storage) -> int:
         bb_period=runtime_kwargs.get("bb_period"),
         bb_std=runtime_kwargs.get("bb_std"),
         atr_period=runtime_kwargs.get("atr_period"),
+        decision_profile=getattr(args, "decision_profile", "current_runtime"),
+        royal_road_mode=getattr(args, "royal_road_mode", "balanced"),
+        integrated_mode=getattr(args, "integrated_mode", "integrated_balanced"),
+        df_lower_tf=df_lower_tf_for_v2,
+        lower_tf_interval=lower_tf_interval_for_v2,
+        stop_mode=getattr(args, "stop_mode", "atr"),
     )
     metrics = result.metrics()
     start_date = str(df.index[0])
@@ -2320,6 +2350,99 @@ def build_parser() -> argparse.ArgumentParser:
                          "stop_atr_mult (1.5 vs 2.0); other "
                          "indicator periods / thresholds already "
                          "match current defaults.")
+    be.add_argument(
+        "--decision-profile",
+        default="current_runtime",
+        choices=(
+            "current_runtime",
+            "royal_road_decision_v1",
+            "royal_road_decision_v2",
+            "royal_road_decision_v2_integrated",
+        ),
+        help=(
+            "Which decision profile drives BUY/SELL/HOLD. Default "
+            "`current_runtime` is byte-identical to PR #21 main. "
+            "`royal_road_decision_v1` (opt-in) reads "
+            "technical_confluence_v1 and applies royal-road rules "
+            "with strictness selected by --royal-road-mode. "
+            "`royal_road_decision_v2_integrated` (opt-in) elevates "
+            "wave / W-lines / fib / candlestick / dow / MA / RSI / "
+            "BB / MACD / invalidation / RR into first-class evidence "
+            "the action is built from; mode selected by "
+            "--integrated-mode. "
+            "Backtest-only — live cmd_trade does not call "
+            "run_engine_backtest, so this flag cannot affect live "
+            "trading. The trace gains a `royal_road_decision` slice "
+            "with comparison metadata when the profile is non-default."
+        ),
+    )
+    be.add_argument(
+        "--integrated-mode",
+        default="integrated_balanced",
+        choices=("integrated_balanced", "integrated_strict"),
+        help=(
+            "Strictness mode for `royal_road_decision_v2_integrated`. "
+            "`integrated_balanced` (default): required-data missing "
+            "(macro / daily_roadmap / symbol_macro_briefing) → WARN. "
+            "`integrated_strict`: required-data missing → HOLD. RR / "
+            "stop / invalidation / WNL still HOLD if missing in both "
+            "modes. Only consulted when --decision-profile is "
+            "royal_road_decision_v2_integrated."
+        ),
+    )
+    from .royal_road_decision_modes import (
+        DEFAULT_ROYAL_ROAD_MODE as _DEFAULT_ROYAL_ROAD_MODE,
+        supported_royal_road_modes as _supported_royal_road_modes,
+    )
+    be.add_argument(
+        "--royal-road-mode",
+        default=_DEFAULT_ROYAL_ROAD_MODE,
+        choices=_supported_royal_road_modes(),
+        help=(
+            "Strictness mode for `royal_road_decision_v1`. Only "
+            "consulted when --decision-profile is "
+            "royal_road_decision_v1. `balanced` (default) is the "
+            "research candidate (STRONG enters with >=1 axis, WEAK "
+            "with >=2 axes; invalidation_clear / structure_stop "
+            "missing become cautions). `strict` is a diagnostic "
+            "baseline (STRONG only, WEAK -> HOLD, missing "
+            "invalidation/structure_stop -> block). `exploratory` "
+            "is for discovering adjacent rules (WEAK with >=1 axis) "
+            "and is NOT a candidate for adoption. All three modes "
+            "are heuristic and pending validation."
+        ),
+    )
+    be.add_argument(
+        "--lower-tf",
+        default=None,
+        choices=("15m", "5m"),
+        help=(
+            "Optional lower-timeframe interval to fetch alongside the "
+            "base interval. Used by royal_road_decision_v2 only "
+            "(`--decision-profile royal_road_decision_v2`). When "
+            "omitted, v2's lower_tf_trigger field reports "
+            "unavailable_reason=not_attached. Future-leak-safe: only "
+            "lower-TF bars with timestamp <= the base bar's close "
+            "timestamp are visible. Backtest-only — has no effect on "
+            "live cmd_trade."
+        ),
+    )
+    be.add_argument(
+        "--stop-mode",
+        default="atr",
+        choices=("atr", "structure", "hybrid"),
+        help=(
+            "Stop-placement mode. `atr` (default) = entry +/- "
+            "stop_atr_mult * ATR (byte-identical to PR #21 main). "
+            "`structure` = the v2 structure_stop_price (most recent "
+            "confirmed swing low for BUY, swing high for SELL); HOLD "
+            "if missing. `hybrid` = structure if 0.5..3.0 ATR away, "
+            "ATR fallback if too far, HOLD if too close. Only "
+            "consulted when --decision-profile is "
+            "royal_road_decision_v2; otherwise the choice is recorded "
+            "in metadata only. Backtest-only."
+        ),
+    )
     be.add_argument("--trace-out", default=None,
                     help="Directory to write run_metadata.json / "
                          "decision_traces.jsonl / summary.json. Skip the "

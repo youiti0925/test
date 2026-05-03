@@ -604,6 +604,362 @@ class MacroContextSlice:
 
 
 @dataclass(frozen=True)
+class TechnicalConfluenceSlice:
+    """Royal-road technical confluence observation (PR-C1).
+
+    Wraps the dict returned by `technical_confluence.build_technical_confluence`.
+    Stored on `BarDecisionTrace.technical_confluence` (Optional). All
+    fields are observation-only: they are NEVER read by `decide_action`,
+    `risk_gate`, or any RuleCheck. Adding/removing fields here MUST NOT
+    change `result.trades` or `BarDecisionTrace.decision.final_action`
+    — pinned by `tests/test_technical_confluence_trace_observation_only.py`.
+
+    Schema (each value is itself a JSON-serializable dict; see
+    `technical_confluence.py` for the canonical key list):
+      policy_version       — str, e.g. "technical_confluence_v1"
+      market_regime        — TREND_UP|TREND_DOWN|RANGE|VOLATILE|UNKNOWN
+      dow_structure        — last swing levels, structure_code, BOS flags
+      support_resistance   — nearest levels, distances, near/breakout flags
+      candlestick_signal   — pinbar / engulfing / harami / strong body
+      chart_pattern        — mirror of pattern.detected_pattern + neckline
+      indicator_context    — RSI regime / BB lifecycle / MACD momentum
+      risk_plan_obs        — ATR stop vs structure stop, RR observations
+      vote_breakdown       — indicator vote audit + per-source alignment
+      final_confluence     — STRONG_BUY_SETUP / WEAK_BUY_SETUP / NO_TRADE / ...
+    """
+
+    policy_version: str
+    market_regime: str
+    dow_structure: dict
+    support_resistance: dict
+    candlestick_signal: dict
+    chart_pattern: dict
+    indicator_context: dict
+    risk_plan_obs: dict
+    vote_breakdown: dict
+    final_confluence: dict
+
+    def to_dict(self) -> dict:
+        return {
+            "policy_version": self.policy_version,
+            "market_regime": self.market_regime,
+            "dow_structure": dict(self.dow_structure),
+            "support_resistance": dict(self.support_resistance),
+            "candlestick_signal": dict(self.candlestick_signal),
+            "chart_pattern": dict(self.chart_pattern),
+            "indicator_context": dict(self.indicator_context),
+            "risk_plan_obs": dict(self.risk_plan_obs),
+            "vote_breakdown": dict(self.vote_breakdown),
+            "final_confluence": dict(self.final_confluence),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TechnicalConfluenceSlice":
+        return cls(
+            policy_version=str(d.get("policy_version", "technical_confluence_v1")),
+            market_regime=str(d.get("market_regime", "UNKNOWN")),
+            dow_structure=dict(d.get("dow_structure", {})),
+            support_resistance=dict(d.get("support_resistance", {})),
+            candlestick_signal=dict(d.get("candlestick_signal", {})),
+            chart_pattern=dict(d.get("chart_pattern", {})),
+            indicator_context=dict(d.get("indicator_context", {})),
+            risk_plan_obs=dict(d.get("risk_plan_obs", {})),
+            vote_breakdown=dict(d.get("vote_breakdown", {})),
+            final_confluence=dict(d.get("final_confluence", {})),
+        )
+
+
+@dataclass(frozen=True)
+class RoyalRoadDecisionSlice:
+    """Royal-road profile decision audit (PR royal_road_decision_v1).
+
+    Emitted ONLY when `run_engine_backtest(decision_profile=
+    "royal_road_decision_v1")` is requested. The default profile
+    (`current_runtime`) leaves `BarDecisionTrace.royal_road_decision`
+    as None — preserving byte-identical trace output for legacy /
+    default callers.
+
+    The slice records the royal-road profile's BUY/SELL/HOLD output
+    AND a comparison block so post-hoc analyses can identify trades
+    where the two profiles disagreed.
+    """
+
+    profile: str
+    action: str
+    confidence: float
+    score: float
+    reasons: list
+    block_reasons: list
+    compared_to_current_runtime: dict
+    # royal_road_decision_v1 mode metadata (added when the profile is
+    # split into strict / balanced / exploratory). Defaults preserve
+    # backward compat for any caller that constructs the slice without
+    # them — e.g. live cmd_trade legacy export paths that never produce
+    # this slice anyway.
+    mode: str = "balanced"
+    mode_status: str = "heuristic_not_validated_default"
+    mode_needs_validation: bool = True
+    cautions: list = field(default_factory=list)
+    evidence_axes: dict = field(default_factory=dict)
+    evidence_axes_count: dict = field(default_factory=dict)
+    min_evidence_axes_required: int | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "profile": self.profile,
+            "action": self.action,
+            "confidence": float(self.confidence),
+            "score": float(self.score),
+            "reasons": list(self.reasons),
+            "block_reasons": list(self.block_reasons),
+            "compared_to_current_runtime": dict(
+                self.compared_to_current_runtime
+            ),
+            "mode": self.mode,
+            "mode_status": self.mode_status,
+            "mode_needs_validation": bool(self.mode_needs_validation),
+            "cautions": list(self.cautions),
+            "evidence_axes": dict(self.evidence_axes),
+            "evidence_axes_count": dict(self.evidence_axes_count),
+            "min_evidence_axes_required": self.min_evidence_axes_required,
+        }
+
+    @classmethod
+    def from_decision(
+        cls,
+        *,
+        royal_decision,
+        comparison: dict,
+    ) -> "RoyalRoadDecisionSlice":
+        adv = royal_decision.advisory or {}
+        return cls(
+            profile=str(adv.get("profile", "royal_road_decision_v1")),
+            action=royal_decision.action,
+            confidence=float(royal_decision.confidence),
+            score=float(adv.get("score", 0.0)),
+            reasons=list(adv.get("reasons") or []),
+            block_reasons=list(adv.get("block_reasons") or []),
+            compared_to_current_runtime=dict(comparison),
+            mode=str(adv.get("mode", "balanced")),
+            mode_status=str(
+                adv.get("mode_status", "heuristic_not_validated_default")
+            ),
+            mode_needs_validation=bool(
+                adv.get("mode_needs_validation", True)
+            ),
+            cautions=list(adv.get("cautions") or []),
+            evidence_axes=dict(adv.get("evidence_axes") or {}),
+            evidence_axes_count=dict(adv.get("evidence_axes_count") or {}),
+            min_evidence_axes_required=adv.get("min_evidence_axes_required"),
+        )
+
+
+@dataclass(frozen=True)
+class RoyalRoadDecisionV2Slice:
+    """Royal-road v2 decision audit (royal_road_decision_v2 profile).
+
+    Emitted ONLY when run_engine_backtest(decision_profile=
+    "royal_road_decision_v2") is requested. Default current_runtime
+    leaves this field None on every bar, preserving byte-identical
+    trace output for legacy callers.
+
+    Carries the full v2 audit:
+      profile / mode / mode_status / mode_needs_validation
+      action / confidence / score
+      reasons / block_reasons / cautions
+      evidence_axes / evidence_axes_count / min_evidence_axes_required
+      support_resistance_v2 / trendline_context / chart_pattern_v2
+      lower_tf_trigger / macro_alignment / structure_stop_plan
+      compared_to_current_runtime / compared_to_royal_road_v1
+    """
+
+    profile: str
+    mode: str
+    mode_status: str
+    mode_needs_validation: bool
+    action: str
+    confidence: float
+    score: float
+    reasons: list
+    block_reasons: list
+    cautions: list
+    evidence_axes: dict
+    evidence_axes_count: dict
+    min_evidence_axes_required: int | None
+    support_resistance_v2: dict
+    trendline_context: dict
+    chart_pattern_v2: dict
+    lower_tf_trigger: dict
+    macro_alignment: dict
+    structure_stop_plan: dict | None
+    compared_to_current_runtime: dict
+    compared_to_royal_road_v1: dict | None
+    # v2.2: extended trace fields. Defaults preserve backward compat.
+    setup_candidates: list = field(default_factory=list)
+    best_setup: dict | None = None
+    reconstruction_quality: dict = field(default_factory=dict)
+    multi_scale_chart: dict = field(default_factory=dict)
+    # Phase F + G: integrated profile carries these. Defaults None
+    # so legacy v2 / v1 / current_runtime traces keep their byte-
+    # identical shape.
+    integrated_decision: dict | None = None
+    pattern_levels: dict | None = None
+    entry_plan: dict | None = None
+    breakout_quality_gate: dict | None = None
+    fundamental_sidebar: dict | None = None
+    wave_shape_review: dict | None = None
+    wave_derived_lines: list = field(default_factory=list)
+    # Phase I-1/I-2: entry-candidate observation layer (integrated
+    # profile only). Empty defaults preserve byte-identical traces
+    # for legacy v2 / v1 / current_runtime callers.
+    entry_candidates: list = field(default_factory=list)
+    selected_entry_candidate: dict = field(default_factory=dict)
+    # Phase I follow-up: royal-road procedure checklist
+    # (integrated profile only). Empty default again preserves
+    # byte-identical legacy traces.
+    royal_road_procedure_checklist: dict = field(default_factory=dict)
+    # Phase I follow-up: structural lines snapshot (integrated
+    # profile only). Empty default preserves byte-identical traces
+    # for legacy v2 / v1 / current_runtime callers.
+    structural_lines: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "profile": self.profile,
+            "mode": self.mode,
+            "mode_status": self.mode_status,
+            "mode_needs_validation": bool(self.mode_needs_validation),
+            "action": self.action,
+            "confidence": float(self.confidence),
+            "score": float(self.score),
+            "reasons": list(self.reasons),
+            "block_reasons": list(self.block_reasons),
+            "cautions": list(self.cautions),
+            "evidence_axes": dict(self.evidence_axes),
+            "evidence_axes_count": dict(self.evidence_axes_count),
+            "min_evidence_axes_required": self.min_evidence_axes_required,
+            "support_resistance_v2": dict(self.support_resistance_v2),
+            "trendline_context": dict(self.trendline_context),
+            "chart_pattern_v2": dict(self.chart_pattern_v2),
+            "lower_tf_trigger": dict(self.lower_tf_trigger),
+            "macro_alignment": dict(self.macro_alignment),
+            "structure_stop_plan": (
+                dict(self.structure_stop_plan)
+                if self.structure_stop_plan is not None else None
+            ),
+            "compared_to_current_runtime": dict(
+                self.compared_to_current_runtime
+            ),
+            "compared_to_royal_road_v1": (
+                dict(self.compared_to_royal_road_v1)
+                if self.compared_to_royal_road_v1 is not None else None
+            ),
+            "setup_candidates": list(self.setup_candidates),
+            "best_setup": (
+                dict(self.best_setup) if self.best_setup is not None else None
+            ),
+            "reconstruction_quality": dict(self.reconstruction_quality),
+            "multi_scale_chart": dict(self.multi_scale_chart),
+            # Phase F + G fields (integrated profile only)
+            "integrated_decision": (
+                dict(self.integrated_decision)
+                if self.integrated_decision is not None else None
+            ),
+            "pattern_levels": (
+                dict(self.pattern_levels)
+                if self.pattern_levels is not None else None
+            ),
+            "entry_plan": (
+                dict(self.entry_plan)
+                if self.entry_plan is not None else None
+            ),
+            "breakout_quality_gate": (
+                dict(self.breakout_quality_gate)
+                if self.breakout_quality_gate is not None else None
+            ),
+            "fundamental_sidebar": (
+                dict(self.fundamental_sidebar)
+                if self.fundamental_sidebar is not None else None
+            ),
+            "wave_shape_review": (
+                dict(self.wave_shape_review)
+                if self.wave_shape_review is not None else None
+            ),
+            "wave_derived_lines": list(self.wave_derived_lines),
+            # Phase I-1/I-2 entry-candidate observation layer.
+            "entry_candidates": list(self.entry_candidates),
+            "selected_entry_candidate": dict(self.selected_entry_candidate),
+            # Phase I follow-up royal-road procedure checklist.
+            "royal_road_procedure_checklist": dict(
+                self.royal_road_procedure_checklist
+            ),
+            # Phase I follow-up structural lines snapshot.
+            "structural_lines": dict(self.structural_lines),
+        }
+
+    @classmethod
+    def from_decision(
+        cls,
+        *,
+        v2_decision,
+        comparison_vs_current: dict,
+        comparison_vs_v1: dict | None,
+    ) -> "RoyalRoadDecisionV2Slice":
+        adv = v2_decision.advisory or {}
+        return cls(
+            profile=str(adv.get("profile", "royal_road_decision_v2")),
+            mode=str(adv.get("mode", "balanced")),
+            mode_status=str(
+                adv.get("mode_status", "heuristic_not_validated_default")
+            ),
+            mode_needs_validation=bool(adv.get("mode_needs_validation", True)),
+            action=v2_decision.action,
+            confidence=float(v2_decision.confidence),
+            score=float(adv.get("score", 0.0)),
+            reasons=list(adv.get("reasons") or []),
+            block_reasons=list(adv.get("block_reasons") or []),
+            cautions=list(adv.get("cautions") or []),
+            evidence_axes=dict(adv.get("evidence_axes") or {}),
+            evidence_axes_count=dict(adv.get("evidence_axes_count") or {}),
+            min_evidence_axes_required=adv.get("min_evidence_axes_required"),
+            support_resistance_v2=dict(adv.get("support_resistance_v2") or {}),
+            trendline_context=dict(adv.get("trendline_context") or {}),
+            chart_pattern_v2=dict(adv.get("chart_pattern_v2") or {}),
+            lower_tf_trigger=dict(adv.get("lower_tf_trigger") or {}),
+            macro_alignment=dict(adv.get("macro_alignment") or {}),
+            structure_stop_plan=adv.get("structure_stop_plan"),
+            compared_to_current_runtime=dict(comparison_vs_current),
+            compared_to_royal_road_v1=(
+                dict(comparison_vs_v1) if comparison_vs_v1 else None
+            ),
+            setup_candidates=list(adv.get("setup_candidates") or []),
+            best_setup=adv.get("best_setup"),
+            reconstruction_quality=dict(adv.get("reconstruction_quality") or {}),
+            multi_scale_chart=dict(adv.get("multi_scale_chart") or {}),
+            # Phase F + G — only the integrated profile populates these.
+            # Legacy v2 / v1 / current_runtime leave them None.
+            integrated_decision=adv.get("integrated_decision"),
+            pattern_levels=adv.get("pattern_levels"),
+            entry_plan=adv.get("entry_plan"),
+            breakout_quality_gate=adv.get("breakout_quality_gate"),
+            fundamental_sidebar=adv.get("fundamental_sidebar"),
+            wave_shape_review=adv.get("wave_shape_review"),
+            wave_derived_lines=list(adv.get("wave_derived_lines") or []),
+            # Phase I-1/I-2 entry-candidate observation layer.
+            entry_candidates=list(adv.get("entry_candidates") or []),
+            selected_entry_candidate=dict(
+                adv.get("selected_entry_candidate") or {}
+            ),
+            # Phase I follow-up royal-road procedure checklist.
+            royal_road_procedure_checklist=dict(
+                adv.get("royal_road_procedure_checklist") or {}
+            ),
+            # Phase I follow-up structural lines snapshot.
+            structural_lines=dict(adv.get("structural_lines") or {}),
+        )
+
+
+@dataclass(frozen=True)
 class FundamentalSlice:
     nearby_events: tuple[dict, ...]
     blocking_events: tuple[dict, ...]
@@ -819,6 +1175,25 @@ class BarDecisionTrace:
     # Populated when backtest_engine receives a MacroSnapshot. Optional
     # for backward compat and for runs where macro fetch failed.
     macro_context: MacroContextSlice | None = None
+    # Optional royal-road technical confluence observation (PR-C1).
+    # Populated unconditionally by decision_trace_build for every bar
+    # the trace is built (warmup bars get an `UNKNOWN`-shaped dict via
+    # `technical_confluence.empty_technical_confluence`). Default None
+    # preserves backward compatibility for older trace JSONL readers
+    # and for live cmd_trace export paths that have not been wired yet.
+    # OBSERVATION-ONLY — never read by decide_action / risk_gate.
+    technical_confluence: TechnicalConfluenceSlice | None = None
+    # Optional royal-road decision audit (royal_road_decision_v1
+    # profile). Emitted ONLY when `run_engine_backtest(decision_profile
+    # ="royal_road_decision_v1")` is requested. None when the default
+    # `current_runtime` profile is in effect, which preserves
+    # byte-identical trace output for legacy callers and the live
+    # cmd_trade export path.
+    royal_road_decision: RoyalRoadDecisionSlice | None = None
+    # royal_road_decision_v2 profile audit. Emitted ONLY when
+    # run_engine_backtest(decision_profile="royal_road_decision_v2").
+    # Default None preserves trace shape for current_runtime / v1.
+    royal_road_decision_v2: "RoyalRoadDecisionV2Slice | None" = None
 
     def to_dict(self) -> dict:
         return {
@@ -846,6 +1221,18 @@ class BarDecisionTrace:
             "decision": self.decision.to_dict(),
             "future_outcome": (
                 self.future_outcome.to_dict() if self.future_outcome else None
+            ),
+            "technical_confluence": (
+                self.technical_confluence.to_dict()
+                if self.technical_confluence else None
+            ),
+            "royal_road_decision": (
+                self.royal_road_decision.to_dict()
+                if self.royal_road_decision else None
+            ),
+            "royal_road_decision_v2": (
+                self.royal_road_decision_v2.to_dict()
+                if self.royal_road_decision_v2 else None
             ),
         }
 
@@ -917,6 +1304,9 @@ __all__ = [
     "HigherTimeframeSlice",
     "LongTermTrendSlice",
     "MacroContextSlice",
+    "TechnicalConfluenceSlice",
+    "RoyalRoadDecisionSlice",
+    "RoyalRoadDecisionV2Slice",
     "FundamentalSlice",
     "ExecutionAssumptionSlice",
     "ExecutionTraceSlice",

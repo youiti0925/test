@@ -1,0 +1,346 @@
+"""Lower-timeframe (15m / 5m) trigger detection for v2.
+
+Strict no-future-leak rule
+--------------------------
+For a 1h base bar whose CLOSE timestamp = T, only lower-TF bars with
+ts <= T are visible. The detector slices `df_lower_tf` accordingly
+before running any pattern logic. If no lower-TF data is supplied (or
+the slice is empty), it returns an UNKNOWN snapshot — never crashes.
+
+Detected micro-triggers:
+  - bullish_pinbar / bearish_pinbar
+  - bullish_engulfing / bearish_engulfing
+  - breakout       (close above N-bar high or below N-bar low)
+  - retest         (after breakout, return to broken level within bound)
+  - micro_double_bottom / micro_double_top  (swing-based mini patterns)
+
+This is v2-minimal. Heuristic constants only; pending validation.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Final
+
+import numpy as np
+import pandas as pd
+
+from .retest_detection import detect_retest
+from .technical_confluence import _candlestick_signal
+
+
+_MICRO_LOOKBACK_BARS: Final[int] = 8
+_MICRO_DOUBLE_TOL_PCT: Final[float] = 0.0005   # 0.05%
+_RETEST_TOL_ATR: Final[float] = 0.3   # shared helper convention
+_RETEST_CONTINUATION_ATR: Final[float] = 0.2
+_RETEST_MAX_BARS: Final[int] = 10
+
+
+@dataclass(frozen=True)
+class LowerTimeframeTrigger:
+    schema_version: str
+    interval: str | None
+    available: bool
+    bars_used: int
+    last_lower_tf_ts: str | None
+    bullish_pinbar: bool
+    bearish_pinbar: bool
+    bullish_engulfing: bool
+    bearish_engulfing: bool
+    breakout: bool
+    retest: bool
+    micro_double_bottom: bool
+    micro_double_top: bool
+    bullish_trigger: bool
+    bearish_trigger: bool
+    unavailable_reason: str | None
+    # v2.2 trigger metadata (defaults preserve backward compat).
+    parent_bar_ts: str | None = None
+    used_bars_start_ts: str | None = None
+    used_bars_end_ts: str | None = None
+    trigger_ts: str | None = None
+    trigger_price: float | None = None
+    trigger_type: str | None = None
+    trigger_strength: float | None = None
+    confidence: float = 0.0
+    reason: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "schema_version": self.schema_version,
+            "interval": self.interval,
+            "available": bool(self.available),
+            "bars_used": int(self.bars_used),
+            "last_lower_tf_ts": self.last_lower_tf_ts,
+            "bullish_pinbar": bool(self.bullish_pinbar),
+            "bearish_pinbar": bool(self.bearish_pinbar),
+            "bullish_engulfing": bool(self.bullish_engulfing),
+            "bearish_engulfing": bool(self.bearish_engulfing),
+            "breakout": bool(self.breakout),
+            "retest": bool(self.retest),
+            "micro_double_bottom": bool(self.micro_double_bottom),
+            "micro_double_top": bool(self.micro_double_top),
+            "bullish_trigger": bool(self.bullish_trigger),
+            "bearish_trigger": bool(self.bearish_trigger),
+            "unavailable_reason": self.unavailable_reason,
+            "parent_bar_ts": self.parent_bar_ts,
+            "used_bars_start_ts": self.used_bars_start_ts,
+            "used_bars_end_ts": self.used_bars_end_ts,
+            "trigger_ts": self.trigger_ts,
+            "trigger_price": (
+                float(self.trigger_price)
+                if self.trigger_price is not None else None
+            ),
+            "trigger_type": self.trigger_type,
+            "trigger_strength": (
+                float(self.trigger_strength)
+                if self.trigger_strength is not None else None
+            ),
+            "confidence": float(self.confidence),
+            "reason": self.reason,
+        }
+
+
+def empty_trigger(
+    interval: str | None,
+    reason: str,
+) -> LowerTimeframeTrigger:
+    return LowerTimeframeTrigger(
+        schema_version="lower_tf_trigger_v2",
+        interval=interval,
+        available=False,
+        bars_used=0,
+        last_lower_tf_ts=None,
+        bullish_pinbar=False,
+        bearish_pinbar=False,
+        bullish_engulfing=False,
+        bearish_engulfing=False,
+        breakout=False,
+        retest=False,
+        micro_double_bottom=False,
+        micro_double_top=False,
+        bullish_trigger=False,
+        bearish_trigger=False,
+        unavailable_reason=reason,
+    )
+
+
+def detect_lower_tf_trigger(
+    *,
+    df_lower_tf: pd.DataFrame | None,
+    lower_tf_interval: str | None,
+    base_bar_close_ts: pd.Timestamp,
+) -> LowerTimeframeTrigger:
+    """Compute the lower-TF trigger snapshot for the current 1h bar.
+
+    `df_lower_tf` may be None (no lower-TF data attached). In that case
+    a `unavailable_reason="not_attached"` snapshot is returned so the
+    rest of the pipeline isn't disturbed.
+
+    Future-leak guarantee: all lower-TF bars with timestamp > base_bar
+    are dropped before any computation.
+    """
+    if df_lower_tf is None or len(df_lower_tf) == 0:
+        return empty_trigger(lower_tf_interval, "not_attached")
+    # Strict-leq filter to enforce no future leak.
+    visible = df_lower_tf[df_lower_tf.index <= base_bar_close_ts]
+    if len(visible) < 3:
+        return empty_trigger(lower_tf_interval, "insufficient_visible_bars")
+
+    cs = _candlestick_signal(visible.tail(2))
+    bull_pin = bool(cs.get("bullish_pinbar"))
+    bear_pin = bool(cs.get("bearish_pinbar"))
+    bull_eng = bool(cs.get("bullish_engulfing"))
+    bear_eng = bool(cs.get("bearish_engulfing"))
+
+    closes = visible["close"].to_numpy()
+    highs = visible["high"].to_numpy()
+    lows = visible["low"].to_numpy()
+    last_close = float(closes[-1])
+    last_ts = visible.index[-1].isoformat() if len(visible) > 0 else None
+
+    n = min(_MICRO_LOOKBACK_BARS, len(closes) - 1)
+    breakout = False
+    retest = False
+    if n > 0:
+        prior_high = float(np.max(highs[-n - 1:-1]))
+        prior_low = float(np.min(lows[-n - 1:-1]))
+        # breakout = current close beyond prior N-bar high/low
+        # Use a per-window ATR proxy so the shared helper works on
+        # lower-TF data (no ATR(14) computed here).
+        atr_proxy = max(
+            float(np.std(closes[-_MICRO_LOOKBACK_BARS:])) * 1.5,
+            float(prior_high - prior_low) * 0.1,
+            1e-9,
+        )
+        ts_index = list(visible.index)
+        if last_close > prior_high:
+            breakout = True
+            res = detect_retest(
+                closes=closes, highs=highs, lows=lows,
+                timestamps=ts_index,
+                level=prior_high, side="BUY",
+                breakout_search_start=max(0, len(closes) - _MICRO_LOOKBACK_BARS),
+                atr_value=atr_proxy,
+                parent_bar_ts=base_bar_close_ts,
+                tolerance_atr=_RETEST_TOL_ATR,
+                continuation_atr=_RETEST_CONTINUATION_ATR,
+                max_retest_bars=_RETEST_MAX_BARS,
+                wick_allowed=True,           # lower-TF wick retests count
+                close_confirm_required=True,
+            )
+            retest = bool(res.retest_confirmed)
+        elif last_close < prior_low:
+            breakout = True
+            res = detect_retest(
+                closes=closes, highs=highs, lows=lows,
+                timestamps=ts_index,
+                level=prior_low, side="SELL",
+                breakout_search_start=max(0, len(closes) - _MICRO_LOOKBACK_BARS),
+                atr_value=atr_proxy,
+                parent_bar_ts=base_bar_close_ts,
+                tolerance_atr=_RETEST_TOL_ATR,
+                continuation_atr=_RETEST_CONTINUATION_ATR,
+                max_retest_bars=_RETEST_MAX_BARS,
+                wick_allowed=True,
+                close_confirm_required=True,
+            )
+            retest = bool(res.retest_confirmed)
+
+    # Micro double bottom: two recent lows close to each other with a
+    # peak between them, and current price has rebounded.
+    micro_dbottom = False
+    micro_dtop = False
+    if len(lows) >= 5:
+        lows_window = lows[-_MICRO_LOOKBACK_BARS:]
+        l_idx = np.argmin(lows_window)
+        # Find a second low not equal to the global min
+        rest = np.delete(lows_window, l_idx)
+        if len(rest) > 0:
+            second_min = float(np.min(rest))
+            global_min = float(lows_window[l_idx])
+            if (
+                global_min > 0
+                and abs(second_min - global_min) / global_min
+                <= _MICRO_DOUBLE_TOL_PCT
+                and last_close > second_min
+            ):
+                micro_dbottom = True
+        highs_window = highs[-_MICRO_LOOKBACK_BARS:]
+        h_idx = np.argmax(highs_window)
+        rest_h = np.delete(highs_window, h_idx)
+        if len(rest_h) > 0:
+            second_max = float(np.max(rest_h))
+            global_max = float(highs_window[h_idx])
+            if (
+                global_max > 0
+                and abs(second_max - global_max) / global_max
+                <= _MICRO_DOUBLE_TOL_PCT
+                and last_close < second_max
+            ):
+                micro_dtop = True
+
+    bullish_trigger = bool(
+        bull_pin or bull_eng or micro_dbottom
+        or (breakout and last_close > closes[-2])
+    )
+    bearish_trigger = bool(
+        bear_pin or bear_eng or micro_dtop
+        or (breakout and last_close < closes[-2])
+    )
+
+    # Trigger metadata: pin which lower-TF bar fired the trigger and
+    # what kind. The "trigger" is conceptually the most recent visible
+    # lower-TF bar (the one used for engulfing / pinbar / breakout
+    # detection). For breakout we also record the actual breakout bar
+    # being the LAST visible bar.
+    trigger_idx = len(visible) - 1
+    trigger_ts = last_ts
+    trigger_price = float(closes[-1])
+    trigger_type: str | None = None
+    if bull_eng:
+        trigger_type = "bullish_engulfing"
+    elif bear_eng:
+        trigger_type = "bearish_engulfing"
+    elif bull_pin:
+        trigger_type = "bullish_pinbar"
+    elif bear_pin:
+        trigger_type = "bearish_pinbar"
+    elif breakout and last_close > closes[-2]:
+        trigger_type = "breakout_up"
+    elif breakout and last_close < closes[-2]:
+        trigger_type = "breakout_down"
+    elif micro_dbottom:
+        trigger_type = "micro_double_bottom"
+    elif micro_dtop:
+        trigger_type = "micro_double_top"
+    else:
+        trigger_type = "no_trigger"
+    # Trigger strength: candle body / range proxy for engulfing & pinbar,
+    # else 0.5 default for breakout / micro_double, else 0.
+    body = abs(closes[-1] - float(visible["open"].iloc[-1]))
+    bar_range = (
+        float(visible["high"].iloc[-1]) - float(visible["low"].iloc[-1])
+    )
+    body_ratio = body / bar_range if bar_range > 0 else 0.0
+    if trigger_type in ("bullish_engulfing", "bearish_engulfing"):
+        trigger_strength = float(min(1.0, body_ratio + 0.2))
+    elif trigger_type in ("bullish_pinbar", "bearish_pinbar"):
+        trigger_strength = float(min(1.0, 1.0 - body_ratio))  # smaller body = stronger pinbar
+    elif trigger_type in ("breakout_up", "breakout_down"):
+        trigger_strength = 0.55 + (0.2 if retest else 0.0)
+    elif trigger_type in ("micro_double_bottom", "micro_double_top"):
+        trigger_strength = 0.5
+    else:
+        trigger_strength = 0.0
+    confidence = (
+        0.5 + 0.3 * trigger_strength + (0.1 if retest else 0.0)
+    )
+    confidence = float(max(0.0, min(0.95, confidence)))
+    reason = trigger_type or "no_trigger"
+
+    used_bars_start_ts = (
+        visible.index[0].isoformat() if len(visible) > 0 else None
+    )
+    used_bars_end_ts = (
+        visible.index[-1].isoformat() if len(visible) > 0 else None
+    )
+    parent_iso = (
+        base_bar_close_ts.isoformat()
+        if isinstance(base_bar_close_ts, pd.Timestamp)
+        else str(base_bar_close_ts)
+    )
+
+    return LowerTimeframeTrigger(
+        schema_version="lower_tf_trigger_v2",
+        interval=lower_tf_interval,
+        available=True,
+        bars_used=int(len(visible)),
+        last_lower_tf_ts=last_ts,
+        bullish_pinbar=bull_pin,
+        bearish_pinbar=bear_pin,
+        bullish_engulfing=bull_eng,
+        bearish_engulfing=bear_eng,
+        breakout=breakout,
+        retest=retest,
+        micro_double_bottom=micro_dbottom,
+        micro_double_top=micro_dtop,
+        bullish_trigger=bullish_trigger,
+        bearish_trigger=bearish_trigger,
+        unavailable_reason=None,
+        parent_bar_ts=parent_iso,
+        used_bars_start_ts=used_bars_start_ts,
+        used_bars_end_ts=used_bars_end_ts,
+        trigger_ts=trigger_ts,
+        trigger_price=trigger_price,
+        trigger_type=trigger_type,
+        trigger_strength=trigger_strength,
+        confidence=confidence,
+        reason=reason,
+    )
+
+
+__all__ = [
+    "LowerTimeframeTrigger",
+    "detect_lower_tf_trigger",
+    "empty_trigger",
+]
