@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>現在の王道判断プレビュー (Phase F/G)</title>
+  <style>
+    body {
+      font-family: -apple-system, sans-serif;
+      margin: 12px;
+      color: #222;
+      line-height: 1.6;
+    }
+    h1 { font-size: 20px; margin-bottom: 4px; }
+    h2 { font-size: 16px; margin-top: 22px; }
+    h3 { font-size: 14px; margin-top: 16px; }
+    ul, ol { padding-left: 22px; }
+    li { margin: 6px 0; }
+    a { color: #1565c0; text-decoration: none; font-weight: 600; }
+    a:hover, a:active { text-decoration: underline; }
+    .meta { color:#666; font-size:13px; margin-top:0; }
+    .what-to-check {
+      background: #e8f4ff;
+      border: 2px solid #1565c0;
+      padding: 10px 14px;
+      border-radius: 6px;
+      margin: 12px 0 16px;
+    }
+    .what-to-check h2 { margin-top: 0; color: #0d47a1; }
+    .demo-card {
+      border: 1px solid #ccc;
+      padding: 10px 14px;
+      border-radius: 6px;
+      margin: 10px 0;
+      background: #fafafa;
+    }
+    .demo-card.demo-fixture {
+      background: #fff8e1;
+      border-color: #f9a825;
+    }
+    .demo-card.demo-real {
+      background: #f5fff5;
+      border-color: #2e7d32;
+    }
+    .demo-card .label-fixture {
+      display: inline-block;
+      background: #f9a825;
+      color: white;
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 11px;
+      margin-left: 6px;
+      vertical-align: middle;
+    }
+    .demo-card .label-real {
+      display: inline-block;
+      background: #2e7d32;
+      color: white;
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 11px;
+      margin-left: 6px;
+      vertical-align: middle;
+    }
+    .check-points {
+      margin: 6px 0 0;
+      padding-left: 18px;
+      font-size: 13px;
+      color: #444;
+    }
+    .check-points li { margin: 2px 0; }
+    .legend-table {
+      width: 100%; border-collapse: collapse; font-size: 13px;
+      margin-top: 8px;
+    }
+    .legend-table th, .legend-table td {
+      border: 1px solid #ddd; padding: 4px 8px; text-align: left;
+      vertical-align: top;
+    }
+    .legend-table th {
+      background: #f0f0f0;
+    }
+    .footer {
+      color: #888;
+      font-size: 12px;
+      margin-top: 24px;
+      border-top: 1px solid #eee;
+      padding-top: 12px;
+    }
+    code { background: #eee; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+    .pill {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 11px;
+      font-weight: 600;
+      color: #fff;
+      vertical-align: middle;
+    }
+    .pill-ready { background: #2e7d32; }
+    .pill-wait  { background: #ef6c00; }
+    .pill-block { background: #c62828; }
+    .pill-hold  { background: #6a6a6a; }
+    @media (max-width: 800px) {
+      body { margin: 8px; }
+      h1 { font-size: 18px; }
+      h2 { font-size: 15px; }
+      h3 { font-size: 13px; }
+    }
+  </style>
+</head>
+<body>
+  <h1>現在の王道判断プレビュー (Phase F / G 完了状態)</h1>
+  <p class="meta">
+    ブランチ: <code>artifact/visual-audit-mobile-preview</code><br>
+    生成元 commit: <code>1938f3d</code> (<code>feat/royal-road-complete-v2</code>)<br>
+    プロファイル: <code>royal_road_decision_v2_integrated</code>
+  </p>
+
+  <div class="what-to-check">
+    <h2>このプレビューでユーザーに確認してほしいこと</h2>
+    <ol>
+      <li>ダブルボトム / ダブルトップで <b>ENTRY / STOP / TP</b> と
+        <b>WNL / WSL / WTP</b> がチャートに正しく描かれているか</li>
+      <li>右サイドの <b>6 行情報パネル</b> (現在の状態 / エントリープラン /
+        ファンダ・イベント / 王道根拠 / 未接続 / 手動線操作) が読めるか</li>
+      <li><b>entry_plan</b> が状況に応じて
+        <span class="pill pill-ready">READY</span>
+        <span class="pill pill-wait">WAIT_BREAKOUT</span>
+        <span class="pill pill-wait">WAIT_RETEST</span>
+        <span class="pill pill-wait">WAIT_EVENT_CLEAR</span>
+        <span class="pill pill-hold">HOLD</span>
+        と切り替わっているか</li>
+      <li>イベントリスク (FOMC など) が来ているとき、
+        チャート上に <b>赤い縦バンド</b> が描かれ、最終アクションが
+        <b>HOLD (WAIT_EVENT_CLEAR)</b> にダウングレードされているか</li>
+      <li>手動線 UI (追加 / エクスポート) が見えているか —
+        既定は <code>display_only</code> で、ユーザーが描いた線は
+        判断には使われないこと</li>
+      <li>本番系 (live / OANDA / paper) は触っていないこと
+        (このプレビューは観測専用 opt-in プロファイル)</li>
+    </ol>
+  </div>
+
+  <h2>サンプル一覧</h2>
+
+  <div class="demo-card demo-fixture">
+    <h3>1. ダブルボトム → BUY <span class="pill pill-ready">READY</span>
+      <span class="label-fixture">合成データ</span></h3>
+    <p>
+      <a href="double_bottom_integrated_buy_demo_mobile.html">
+        double_bottom_integrated_buy_demo_mobile.html を開く →
+      </a>
+    </p>
+    <ul class="check-points">
+      <li>波形に B1 / NL / B2 / BR が振られている</li>
+      <li>WNL / WSL / WTP の 3 線が引かれている</li>
+      <li>ENTRY / STOP / TP がパターンレベルから派生している</li>
+      <li>右パネル「2. エントリープラン」の状態が READY / BUY</li>
+      <li>「4. 王道根拠」に波形・ダウ・ローソクの根拠が並ぶ</li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-fixture">
+    <h3>2. ダブルトップ → SELL <span class="pill pill-ready">READY</span>
+      <span class="label-fixture">合成データ</span></h3>
+    <p>
+      <a href="double_top_integrated_sell_demo_mobile.html">
+        double_top_integrated_sell_demo_mobile.html を開く →
+      </a>
+    </p>
+    <ul class="check-points">
+      <li>波形に P1 / NL / P2 / BR が振られている (DT 仕様)</li>
+      <li>方向 (SELL) と STOP / TP の上下関係が逆転している</li>
+      <li>右パネル「2. エントリープラン」の状態が READY / SELL</li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-fixture">
+    <h3>3. パターン形成中 → <span class="pill pill-wait">WAIT_BREAKOUT</span>
+      <span class="label-fixture">合成データ</span></h3>
+    <p>
+      <a href="wait_breakout_demo_mobile.html">
+        wait_breakout_demo_mobile.html を開く →
+      </a>
+    </p>
+    <ul class="check-points">
+      <li>波形は B1 / NL / B2 まで認識されているが、まだ WNL を上抜けていない</li>
+      <li>右パネル「2. エントリープラン」が
+        <span class="pill pill-wait">WAIT_BREAKOUT</span>、最終アクションは HOLD</li>
+      <li>「ENTRY 待機: WNL を上抜けるまで動かない」旨が日本語で表示される</li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-fixture">
+    <h3>4. ブレイク済 / 戻り待ち →
+      <span class="pill pill-wait">WAIT_RETEST</span>
+      <span class="label-fixture">合成データ</span></h3>
+    <p>
+      <a href="wait_retest_demo_mobile.html">
+        wait_retest_demo_mobile.html を開く →
+      </a>
+    </p>
+    <ul class="check-points">
+      <li>WNL を一度抜けたが、戻り (リターンムーブ) と確定足を待っている</li>
+      <li>右パネル「2. エントリープラン」が
+        <span class="pill pill-wait">WAIT_RETEST</span>、最終アクションは HOLD</li>
+      <li>breakout_quality_gate (3 条件: ビルドアップ / HTF整合 / 損切り集積)
+        の所見が表示される</li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-fixture">
+    <h3>5. イベントリスク BLOCK →
+      <span class="pill pill-block">WAIT_EVENT_CLEAR</span>
+      <span class="label-fixture">合成データ</span></h3>
+    <p>
+      <a href="wait_event_clear_demo_mobile.html">
+        wait_event_clear_demo_mobile.html を開く →
+      </a>
+    </p>
+    <ul class="check-points">
+      <li>READY 条件は揃っているが、4 時間後に FOMC が控えている</li>
+      <li>チャートに <b>赤い縦バンド</b> + 中央の点線 + イベント名ラベル
+        (FOMC) が描かれる</li>
+      <li>右パネル「3. ファンダ・イベント」が
+        <span class="pill pill-block">BLOCK</span>、
+        「2. エントリープラン」が
+        <span class="pill pill-block">WAIT_EVENT_CLEAR</span>、
+        最終アクションは HOLD</li>
+      <li>HOLD 理由文に「FOMC」が含まれる</li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-real">
+    <h3>6. 通常レポート (integrated_balanced)
+      <span class="label-real">合成 OHLC を統合プロファイルで連続実行</span></h3>
+    <p>
+      <a href="normal_integrated_balanced_report_mobile.html">
+        normal_integrated_balanced_report_mobile.html を開く →
+      </a>
+    </p>
+    <ul class="check-points">
+      <li>合成ランダムウォーク 350 本 → 統合判断 (balanced) を流したケース集</li>
+      <li>READY / WAIT_BREAKOUT / WAIT_RETEST / HOLD が混じった現実的な分布</li>
+      <li>各ケースが
+        <code>1. 現在の状態</code> /
+        <code>2. エントリープラン</code> /
+        <code>3. ファンダ・イベント</code> /
+        <code>4. 王道根拠</code> /
+        <code>5. 未接続/注意</code> /
+        <code>6. 手動線操作</code>
+        の 6 行パネルで読み解けるか</li>
+      <li>balanced は欠損データ (例: macro_alignment) を許容するため
+        WARN は出るが HOLD にはしない</li>
+    </ul>
+  </div>
+
+  <div class="demo-card demo-real">
+    <h3>7. 厳格レポート (integrated_strict)
+      <span class="label-real">同データを strict モードで再評価</span></h3>
+    <p>
+      <a href="normal_integrated_strict_report_mobile.html">
+        normal_integrated_strict_report_mobile.html を開く →
+      </a>
+    </p>
+    <ul class="check-points">
+      <li>同じデータを <code>strict</code> モードで判断したもの</li>
+      <li>未接続データ (macro / fundamental など) があると HOLD に倒す</li>
+      <li>balanced と比較して、HOLD の割合が増えていることを確認</li>
+    </ul>
+  </div>
+
+  <h2>凡例</h2>
+  <table class="legend-table">
+    <tr><th>状態</th><th>意味</th></tr>
+    <tr><td><span class="pill pill-ready">READY</span></td>
+      <td>波形 + 直近サポレジ + 確定足が揃っており、
+        最小 RR (≥ 2) も満たしている。エントリーが推奨される状態。</td></tr>
+    <tr><td><span class="pill pill-wait">WAIT_BREAKOUT</span></td>
+      <td>波形は認識されたが、ネックライン (WNL) をまだ越えていない。
+        待機 (HOLD)。</td></tr>
+    <tr><td><span class="pill pill-wait">WAIT_RETEST</span></td>
+      <td>WNL を一度抜けたが、戻りと確定足がまだ来ていない。待機 (HOLD)。</td></tr>
+    <tr><td><span class="pill pill-block">WAIT_EVENT_CLEAR</span></td>
+      <td>READY だったがイベント (FOMC など) が窓内にあるため
+        ダウングレード。待機 (HOLD)。</td></tr>
+    <tr><td><span class="pill pill-hold">HOLD</span></td>
+      <td>波形未確認・RR 不足・root 拒否などで条件を満たしていない。</td></tr>
+  </table>
+
+  <h2>まだ未接続 / 未完成な項目</h2>
+  <ul>
+    <li><b>Daily 10k preset</b>: まだ着手していない (本プレビューの後段で別タスク)</li>
+    <li>合成 OHLC のため <b>マクロ系 (macro_alignment / vix etc.)</b>
+      は限定的な値で表示される</li>
+    <li>イベントカレンダーは合成イベント (FOMC) を 1 件注入している
+      — 実カレンダーへの接続は別途</li>
+    <li><b>手動線の永続化</b> は localStorage のみ
+      (サーバ送信なし、デバイス間共有なし)</li>
+  </ul>
+
+  <p class="footer">
+    本プレビューは観測専用の opt-in プロファイル
+    <code>royal_road_decision_v2_integrated</code> の出力です。
+    既存の本番系 (live / OANDA / paper / current_runtime CLI 既定) は
+    一切変更されていません。
+  </p>
+</body>
+</html>
