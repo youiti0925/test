@@ -122,9 +122,12 @@ def test_panel_inventory_table_row_has_score(built_htmls):
 
 
 def test_panel_renumbering_after_phase_i_followup(built_htmls):
-    """Phase I follow-up adds 7. 王道手順チェック; the order is now
-    7. 王道手順チェック / 8. エントリー候補 / 9. 手動線操作."""
+    """Phase I follow-up (structural lines) inserts 8. 構造ライン
+    between 王道手順チェック and エントリー候補, so the order is now
+    7. 王道手順チェック / 8. 構造ライン / 9. エントリー候補 /
+    10. 手動線操作."""
     html = built_htmls["double_bottom_integrated_buy_demo"]
     assert "7. 王道手順チェック" in html
-    assert "8. エントリー候補" in html
-    assert "9. 手動線操作" in html
+    assert "8. 構造ライン" in html
+    assert "9. エントリー候補" in html
+    assert "10. 手動線操作" in html

@@ -66,6 +66,7 @@ from .pattern_shape_review import build_pattern_shape_review
 from .patterns import PatternResult
 from .risk_gate import RiskState, evaluate as evaluate_gate
 from .royal_road_procedure import build_royal_road_procedure_checklist
+from .structural_lines import build_structural_lines
 from .stop_modes import DEFAULT_STOP_MODE, plan_stop
 from .support_resistance import detect_levels
 from .trendlines import detect_trendlines
@@ -1379,6 +1380,22 @@ def _build_panels_from_df(
     tl_dict = (
         trendline_ctx.to_dict() if trendline_ctx is not None else {}
     )
+
+    # ── Phase I follow-up: structural lines (royal-road wave context)
+    # Build BEFORE the procedure checklist so the checklist's
+    # trendline / wave_lines / SR steps can carry structural-line
+    # evidence. Observation-only; the existing numeric trendline_context
+    # / support_resistance_v2 are unchanged.
+    structural_lines_snapshot = build_structural_lines(
+        pattern_levels=pattern_levels,
+        wave_derived_lines=wave_derived or [],
+        multi_scale_chart=multi_scale_chart or {},
+        dow_structure_review=dow or {},
+        support_resistance_v2=sr_dict,
+        trendline_context=tl_dict,
+    )
+    structural_lines_dict = structural_lines_snapshot.to_dict()
+
     royal_road_checklist = build_royal_road_procedure_checklist(
         entry_plan=entry_plan,
         pattern_levels=pattern_levels,
@@ -1390,6 +1407,7 @@ def _build_panels_from_df(
         dow_structure_review=dow or {},
         candlestick_anatomy_review=candle or {},
         min_rr=MIN_RISK_REWARD,
+        structural_lines=structural_lines_dict,
     )
     royal_road_checklist_dict = royal_road_checklist.to_dict()
 
@@ -1430,9 +1448,14 @@ def _build_panels_from_df(
         entry_plan=entry_plan,
         ctx=entry_ctx,
     )
-    # Inject the royal-road procedure summary into each candidate's
-    # debug dict so the visual_audit candidate panel can show why a
-    # candidate is READY / WAIT / HOLD without re-running the rules.
+    # Inject the royal-road procedure summary + structural-line
+    # summary into each candidate's debug dict so the visual_audit
+    # candidate panel can show why a candidate is READY / WAIT /
+    # HOLD without re-running the rules, and so the user can see at
+    # a glance how many structural lines exist and how they align
+    # with the numeric layer.
+    _sl_lines = list(structural_lines_dict.get("lines") or [])
+    _sl_counts = dict(structural_lines_dict.get("counts") or {})
     entry_candidates = [
         replace(
             c,
@@ -1453,6 +1476,18 @@ def _build_panels_from_df(
                 "royal_road_block_reasons": list(
                     royal_road_checklist_dict.get("block_reasons") or []
                 ),
+                "structural_lines_count": _sl_counts.get("total", 0),
+                "structural_neckline_ids": [
+                    str(line.get("id"))
+                    for line in _sl_lines
+                    if line.get("kind") == "structural_neckline"
+                ],
+                "structural_trendline_ids": [
+                    str(line.get("id"))
+                    for line in _sl_lines
+                    if line.get("kind") == "structural_trendline"
+                ],
+                "numeric_structural_alignment": _sl_counts,
             },
         )
         for c in entry_candidates
@@ -1506,6 +1541,9 @@ def _build_panels_from_df(
         "selected_entry_candidate": selected_entry_candidate.to_dict(),
         # Phase I follow-up — royal-road procedure checklist.
         "royal_road_procedure_checklist": royal_road_checklist_dict,
+        # Phase I follow-up — structural lines (royal-road wave
+        # context lines, distinct from the numeric trendline_context).
+        "structural_lines": structural_lines_dict,
     }
 
 
@@ -1656,6 +1694,10 @@ def decide_royal_road_v2_integrated(
                 # Phase I follow-up — royal-road procedure checklist.
                 gate_advisory["royal_road_procedure_checklist"] = (
                     gate_panels.get("royal_road_procedure_checklist") or {}
+                )
+                # Phase I follow-up — structural lines.
+                gate_advisory["structural_lines"] = (
+                    gate_panels.get("structural_lines") or {}
                 )
         elif rs_events:
             # Non-event-driven block but events present — just surface
@@ -1917,6 +1959,9 @@ def decide_royal_road_v2_integrated(
         # Phase I follow-up — royal-road procedure checklist.
         "royal_road_procedure_checklist":
             panels.get("royal_road_procedure_checklist") or {},
+        # Phase I follow-up — structural lines (royal-road wave
+        # context, distinct from numeric trendline_context).
+        "structural_lines": panels.get("structural_lines") or {},
     }
 
     chain.extend([f"side_bias:{side_bias}", f"action:{action}"])

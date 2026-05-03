@@ -1489,6 +1489,7 @@ def _build_candle_svg_xml(
     user_annotations: list[dict] | None = None,
     entry_status: str | None = None,
     entry_plan: dict | None = None,
+    structural_lines: dict | None = None,
 ) -> str | None:
     """Build the SVG candle-chart as an XML string.
 
@@ -2049,6 +2050,120 @@ def _build_candle_svg_xml(
                 "fill='#1b5e20' font-weight='bold' font-size='22'>"
                 "CONFIRM</text></g>"
             )
+
+    # ── Phase I follow-up: structural lines overlay ───────────────
+    # Each structural line gets a thin coloured line + small id label
+    # so the user can see which lines came from the wave structure
+    # (SNL / SIL / STP / STL ...). The existing W lines + numeric
+    # T1/T2/T3 are already rendered separately; structural overlay is
+    # observation-only and explicitly tagged with data attributes.
+    sl_payload = structural_lines or {}
+    sl_lines = list(sl_payload.get("lines") or [])
+    if sl_lines:
+        parts.append("<g class='structural-lines'>")
+        for sl in sl_lines:
+            kind = str(sl.get("kind") or "")
+            cls_kind = (
+                "structural-neckline" if kind == "structural_neckline"
+                else "structural-invalidation-line"
+                if kind == "structural_invalidation"
+                else "structural-target-line"
+                if kind == "structural_target"
+                else "structural-trendline"
+                if kind == "structural_trendline"
+                else "structural-support-resistance"
+                if kind == "structural_support_resistance"
+                else "structural-channel"
+            )
+            stroke = (
+                "#7b1fa2" if kind == "structural_neckline"
+                else "#c62828" if kind == "structural_invalidation"
+                else "#2e7d32" if kind == "structural_target"
+                else "#00838f" if kind == "structural_trendline"
+                else "#5d4037"
+            )
+            sl_id = str(sl.get("id") or "")
+            source = str(sl.get("source") or "")
+            role = str(sl.get("role") or "")
+            align = str(sl.get("numeric_alignment") or "UNKNOWN").upper()
+            data_attrs = (
+                f"data-structural-line-id='{_html_escape(sl_id)}' "
+                f"data-source='{_html_escape(source)}' "
+                f"data-role='{_html_escape(role)}' "
+                f"data-numeric-alignment='{_html_escape(align)}'"
+            )
+            price_raw = sl.get("price")
+            slope_raw = sl.get("slope")
+            if price_raw is not None:
+                # Horizontal line at this price; render only when in
+                # the visible price band.
+                try:
+                    price = float(price_raw)
+                except (TypeError, ValueError):
+                    continue
+                if price < price_lo or price > price_hi:
+                    continue
+                yp = y_of(price)
+                parts.append(
+                    "<line "
+                    f"class='structural-line {cls_kind}' "
+                    + data_attrs
+                    + f" x1='{margin_l:.1f}' y1='{yp:.1f}' "
+                    f"x2='{margin_l + plot_w:.1f}' y2='{yp:.1f}' "
+                    f"stroke='{stroke}' stroke-width='1.6' "
+                    "stroke-dasharray='1,5' opacity='0.55'/>"
+                )
+                # Small id label near the right edge.
+                parts.append(
+                    "<text "
+                    f"class='structural-line-label {cls_kind}' "
+                    + data_attrs
+                    + f" x='{margin_l + plot_w - 8:.1f}' "
+                    f"y='{yp - 4:.1f}' text-anchor='end' "
+                    f"fill='{stroke}' font-weight='bold' "
+                    f"font-size='18'>{_html_escape(sl_id)}</text>"
+                )
+            elif slope_raw is not None:
+                # Diagonal line — anchor by (x1,y1)→(x2,y2) in bar
+                # index / price space, mapped through x_of/y_of.
+                try:
+                    x1_raw = sl.get("x1"); y1_raw = sl.get("y1")
+                    x2_raw = sl.get("x2"); y2_raw = sl.get("y2")
+                    if any(v is None for v in
+                           (x1_raw, y1_raw, x2_raw, y2_raw)):
+                        continue
+                    i1 = int(float(x1_raw)); i2 = int(float(x2_raw))
+                    p1 = float(y1_raw); p2 = float(y2_raw)
+                except (TypeError, ValueError):
+                    continue
+                if not (price_lo <= min(p1, p2) and
+                        max(p1, p2) <= price_hi):
+                    # clamp anchors
+                    p1 = max(price_lo, min(price_hi, p1))
+                    p2 = max(price_lo, min(price_hi, p2))
+                if i1 >= n or i2 >= n or i1 == i2:
+                    continue
+                xa = x_of(i1); xb = x_of(i2)
+                ya = y_of(p1); yb = y_of(p2)
+                parts.append(
+                    "<line "
+                    f"class='structural-line {cls_kind}' "
+                    + data_attrs
+                    + f" x1='{xa:.1f}' y1='{ya:.1f}' "
+                    f"x2='{xb:.1f}' y2='{yb:.1f}' "
+                    f"stroke='{stroke}' stroke-width='2.0' "
+                    "stroke-dasharray='4,4' opacity='0.7'/>"
+                )
+                parts.append(
+                    "<text "
+                    f"class='structural-line-label {cls_kind}' "
+                    + data_attrs
+                    + f" x='{xb - 4:.1f}' y='{yb - 6:.1f}' "
+                    "text-anchor='end' "
+                    f"fill='{stroke}' font-weight='bold' "
+                    f"font-size='18'>{_html_escape(sl_id)}</text>"
+                )
+        parts.append("</g>")
 
     # 0-line warnings — surface "no trendlines" / "no SR" inside the
     # chart so the user knows the system genuinely found 0, not that
@@ -3560,6 +3675,18 @@ img.thumb { width: 220px; height: auto; border: 1px solid #ddd; }
 .g5-info-panel .g5-anno-controls input[type='text'] { width: 120px; }
 .g5-info-panel .g5-anno-controls button { padding: 2px 6px;
   font-size: 11px; cursor: pointer; }
+/* Phase I follow-up — structural-lines panel (wave context) */
+.g5-structural-lines-panel { font-size: 12px; }
+.g5-structural-lines-panel .structural-lines-summary {
+  border-left: 4px solid #00838f; padding: 4px 8px; margin: 4px 0;
+  background: #f0f8fb; }
+.structural-lines-table { font-size: 11px; }
+.structural-line-detail td { color: #555; padding-left: 12px; }
+.structural-line-match    { color: #2e7d32; font-weight: bold; }
+.structural-line-near     { color: #f9a825; font-weight: bold; }
+.structural-line-conflict { color: #c62828; font-weight: bold; }
+.structural-line-none     { color: #6a6a6a; font-weight: bold; }
+.structural-line-unknown  { color: #6a6a6a; font-weight: bold; }
 /* Phase I follow-up — royal-road procedure checklist panel */
 .g5-royal-road-procedure-panel { font-size: 12px; }
 .g5-royal-road-procedure-panel .royal-road-procedure-summary {
@@ -6500,6 +6627,159 @@ _PROCEDURE_STATUS_CLASS: dict = {
 }
 
 
+_STRUCTURAL_ALIGNMENT_CLASS: dict = {
+    "MATCH":    "structural-line-match",
+    "NEAR":     "structural-line-near",
+    "CONFLICT": "structural-line-conflict",
+    "NONE":     "structural-line-none",
+    "UNKNOWN":  "structural-line-unknown",
+}
+
+
+_STRUCTURAL_KIND_CLASS: dict = {
+    "structural_neckline":           "structural-neckline",
+    "structural_invalidation":       "structural-invalidation-line",
+    "structural_target":             "structural-target-line",
+    "structural_trendline":          "structural-trendline",
+    "structural_channel":            "structural-channel",
+    "structural_support_resistance": "structural-support-resistance",
+}
+
+
+def _render_g5_structural_lines_html(snapshot: dict) -> str:
+    """Phase I follow-up — structural-lines panel.
+
+    Renders the wave-context structural lines (SNL / SIL / STP / STL ...)
+    distinct from the numeric trendline_context (T1 / T2 / T3). The
+    table shows id / kind / role / source / anchor_parts / price (or
+    slope) / numeric_alignment / reason_ja so the user can see
+    *why* each line was drawn and how it compares to the numeric
+    detector.
+    """
+    snap = snapshot or {}
+    lines = list(snap.get("lines") or [])
+    counts = dict(snap.get("counts") or {})
+    summary = snap.get("summary_ja") or "—"
+    cautions = list(snap.get("cautions") or [])
+
+    if not lines:
+        return (
+            "<div class='g5-row g5-structural-lines-panel' "
+            "data-structural-lines-schema='structural_lines_v1' "
+            "data-structural-lines-count='0'>"
+            "<h4>8. 構造ライン</h4>"
+            f"<p class='small'>{_html_escape(summary)}</p>"
+            "</div>"
+        )
+
+    def _f_price(v) -> str:
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):.5f}"
+        except Exception:  # noqa: BLE001
+            return str(v)
+
+    def _f_slope(v) -> str:
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):+.6f}"
+        except Exception:  # noqa: BLE001
+            return str(v)
+
+    counts_html = (
+        "<div class='structural-lines-summary'>"
+        f"<p>{_html_escape(summary)}</p>"
+        "<table class='g5-tbl'>"
+        f"<tr><th>total</th><td>{counts.get('total', 0)}</td>"
+        f"<th>SNL</th><td>{counts.get('structural_neckline', 0)}</td>"
+        f"<th>STL</th><td>{counts.get('structural_trendline', 0)}</td></tr>"
+        f"<tr><th>SIL</th><td>{counts.get('structural_invalidation', 0)}</td>"
+        f"<th>STP</th><td>{counts.get('structural_target', 0)}</td>"
+        f"<th>SR</th>"
+        f"<td>{counts.get('structural_support_resistance', 0)}</td></tr>"
+        f"<tr><th>numeric MATCH</th><td>{counts.get('numeric_match', 0)}</td>"
+        f"<th>NEAR</th><td>{counts.get('numeric_near', 0)}</td>"
+        f"<th>CONFLICT</th>"
+        f"<td>{counts.get('numeric_conflict', 0)}</td></tr>"
+        "</table></div>"
+    )
+
+    rows = ""
+    for line in lines:
+        kind = str(line.get("kind") or "")
+        kind_cls = _STRUCTURAL_KIND_CLASS.get(
+            kind, "structural-line-other"
+        )
+        align = str(line.get("numeric_alignment") or "UNKNOWN").upper()
+        align_cls = _STRUCTURAL_ALIGNMENT_CLASS.get(
+            align, "structural-line-unknown"
+        )
+        # price OR slope — prefer price for horizontal, slope for diag.
+        if line.get("price") is not None:
+            geom = _f_price(line.get("price"))
+        elif line.get("slope") is not None:
+            geom = _f_slope(line.get("slope"))
+        else:
+            geom = "—"
+        anchors = "/".join(
+            str(a) for a in (line.get("anchor_parts") or [])
+        ) or "—"
+        rows += (
+            "<tr class='structural-line-row "
+            + kind_cls + " " + align_cls + "' "
+            f"data-structural-line-id='{_html_escape(line.get('id') or '')}' "
+            f"data-structural-line-kind='{_html_escape(kind)}' "
+            f"data-structural-line-source="
+            f"'{_html_escape(line.get('source') or '')}' "
+            f"data-structural-line-alignment='{_html_escape(align)}'>"
+            f"<td>{_html_escape(line.get('id') or '—')}</td>"
+            f"<td>{_html_escape(kind.replace('structural_', ''))}</td>"
+            f"<td>{_html_escape(line.get('role') or '—')}</td>"
+            f"<td class='small'>"
+            f"{_html_escape(line.get('source') or '—')}</td>"
+            f"<td class='small'>{_html_escape(anchors)}</td>"
+            f"<td>{_html_escape(geom)}</td>"
+            f"<td><span class='{align_cls}'>"
+            f"{_html_escape(align)}</span></td>"
+            "</tr>"
+            "<tr class='structural-line-detail'>"
+            "<td></td><td colspan='6' class='small'>"
+            f"{_html_escape(line.get('reason_ja') or '')}</td>"
+            "</tr>"
+        )
+    table_html = (
+        "<table class='g5-tbl structural-lines-table'>"
+        "<tr><th>id</th><th>kind</th><th>role</th><th>source</th>"
+        "<th>anchor</th><th>price/slope</th><th>numeric</th></tr>"
+        + rows
+        + "</table>"
+    )
+
+    cautions_html = ""
+    if cautions:
+        cautions_html = (
+            "<p class='small' style='color:#bf360c;'>"
+            "<b>注意:</b> "
+            + _html_escape(", ".join(cautions))
+            + "</p>"
+        )
+
+    return (
+        "<div class='g5-row g5-structural-lines-panel' "
+        "data-structural-lines-schema='structural_lines_v1' "
+        f"data-structural-lines-count='{len(lines)}' "
+        f"data-structural-numeric-conflict="
+        f"'{counts.get('numeric_conflict', 0)}'>"
+        "<h4>8. 構造ライン</h4>"
+        + counts_html
+        + table_html
+        + cautions_html
+        + "</div>"
+    )
+
+
 def _render_g5_royal_road_procedure_html(
     checklist: dict,
 ) -> str:
@@ -6695,7 +6975,7 @@ def _render_g5_entry_candidates_html(
             "<div class='g5-row g5-entry-candidates-panel' "
             "data-entry-candidate-schema='entry_candidate_v1' "
             "data-entry-candidates-count='0'>"
-            "<h4>8. エントリー候補</h4>"
+            "<h4>9. エントリー候補</h4>"
             + p0_label
             + "<p class='small'>"
             "(entry_candidates / selected_entry_candidate なし — "
@@ -6806,7 +7086,7 @@ def _render_g5_entry_candidates_html(
         f"data-entry-candidates-count='{len(cands)}' "
         f"data-selected-entry-candidate-type='{_html_escape(sel_type)}' "
         f"data-royal-road-p0-pass='{p0_attr}'>"
-        "<h4>8. エントリー候補</h4>"
+        "<h4>9. エントリー候補</h4>"
         + p0_label
         + sel_html
         + list_html
@@ -6823,7 +7103,7 @@ def _render_g5_right_panel_html(
 ) -> str:
     """Phase G.5 — right info panel that sits beside the chart.
 
-    Nine rows per spec:
+    Ten rows per spec:
       1. 現在の状態 (entry_status / final action)
       2. エントリープラン (entry / stop / target / RR)
       3. ファンダ・イベント (next event + macro drivers + risk status)
@@ -6831,9 +7111,11 @@ def _render_g5_right_panel_html(
       5. 未接続 / 注意 (missing data + cautions)
       6. 自動線一覧 / 6b. 検出統計
       7. 王道手順チェック (Phase I follow-up procedure checklist)
-      8. エントリー候補 (Phase I-1/I-2 observation panel — carries
+      8. 構造ライン (Phase I follow-up: wave-context structural
+         lines, distinct from numeric trendline_context)
+      9. エントリー候補 (Phase I-1/I-2 observation panel — carries
          the 王道P0 verdict from row 7)
-      9. 手動線操作 (manual annotation controls — interactive)
+     10. 手動線操作 (manual annotation controls — interactive)
     """
     fs = payload.get("fundamental_sidebar") or {}
     integrated = v2.get("integrated_decision") or {}
@@ -7064,7 +7346,13 @@ def _render_g5_right_panel_html(
         royal_road_checklist
     )
 
-    # Row 8 — エントリー候補 (Phase I-1/I-2 observation panel) — now
+    # Row 8 — 構造ライン (Phase I follow-up: wave-context lines,
+    # distinct from numeric trendline_context).
+    structural_lines_html = _render_g5_structural_lines_html(
+        v2.get("structural_lines") or {}
+    )
+
+    # Row 9 — エントリー候補 (Phase I-1/I-2 observation panel) — now
     # carries the royal-road P0 verdict so users see "READY because
     # of what" without scrolling to row 7.
     entry_candidates_html = _render_g5_entry_candidates_html(
@@ -7079,12 +7367,12 @@ def _render_g5_right_panel_html(
         ),
     )
 
-    # Row 9 — 手動線操作 (interactive, static-HTML)
+    # Row 10 — 手動線操作 (interactive, static-HTML)
     sym = payload.get("symbol") or ""
     tf = (payload.get("interval") or payload.get("timeframe") or "1h")
     annotations_html = (
         "<div class='g5-row g5-anno-row'>"
-        "<h4>9. 手動線操作</h4>"
+        "<h4>10. 手動線操作</h4>"
         "<p class='small'>"
         "manual_line_policy = <b>display_only</b> (初期値、安全側)。"
         "ここで追加した線は表示のみ。BUY/SELL 判断には影響しません。"
@@ -7140,6 +7428,7 @@ def _render_g5_right_panel_html(
         + auto_line_list_html
         + detection_stats_html
         + royal_road_panel_html
+        + structural_lines_html
         + entry_candidates_html
         + annotations_html
         + "</aside>"
@@ -7603,6 +7892,9 @@ def render_visual_audit_mobile_single_file(
                     user_annotations=user_annotations_payload or None,
                     entry_status=_ep_for_status.get("entry_status"),
                     entry_plan=_ep_for_status,
+                    structural_lines=(
+                        _v2_for_status.get("structural_lines") or {}
+                    ),
                 )
             except Exception:  # noqa: BLE001
                 svg_xml = None

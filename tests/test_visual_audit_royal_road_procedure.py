@@ -64,10 +64,13 @@ def test_procedure_panel_section_heading_present(built_htmls):
     assert "royal_road_procedure_checklist_v1" in html
 
 
-def test_panel_renumbering_8_entry_candidates_9_manual(built_htmls):
+def test_panel_renumbering_with_structural_lines(built_htmls):
+    """After the structural-lines panel was added at row 8, the
+    candidate panel and manual-line panel both shift down by one."""
     html = built_htmls["double_top_integrated_sell_demo"]
-    assert "8. エントリー候補" in html
-    assert "9. 手動線操作" in html
+    assert "8. 構造ライン" in html
+    assert "9. エントリー候補" in html
+    assert "10. 手動線操作" in html
 
 
 def test_procedure_panel_lists_all_14_step_labels(built_htmls):

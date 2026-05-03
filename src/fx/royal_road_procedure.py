@@ -180,11 +180,17 @@ def build_royal_road_procedure_checklist(
     dow_structure_review: dict[str, Any] | None,
     candlestick_anatomy_review: dict[str, Any] | None,
     min_rr: float = 2.0,
+    structural_lines: dict[str, Any] | None = None,
 ) -> RoyalRoadProcedureChecklist:
     """Build the ordered royal-road procedure checklist.
 
     Observation-only — the checklist does not modify entry_plan or
     the final action.
+
+    `structural_lines` (Phase I follow-up) carries the wave-context
+    structural lines snapshot. The trendline / wave_lines / SR steps
+    use it as additional evidence so the panel distinguishes
+    "numeric trendline only" from "structural trendline present".
     """
     ep = entry_plan or {}
     pl = pattern_levels or {}
@@ -193,6 +199,20 @@ def build_royal_road_procedure_checklist(
     fs = fundamental_sidebar or {}
     sr = support_resistance_v2 or {}
     tl = trendline_context or {}
+    sl = structural_lines or {}
+    sl_lines = list(sl.get("lines") or [])
+    sl_counts = dict(sl.get("counts") or {})
+    sl_kinds = {str(line.get("kind") or "") for line in sl_lines}
+    sl_alignments = [
+        str(line.get("numeric_alignment") or "")
+        for line in sl_lines
+        if str(line.get("kind") or "") == "structural_trendline"
+    ]
+    has_structural_neckline = "structural_neckline" in sl_kinds
+    has_structural_invalidation = "structural_invalidation" in sl_kinds
+    has_structural_target = "structural_target" in sl_kinds
+    has_structural_trendline = "structural_trendline" in sl_kinds
+    has_alignment_conflict = "CONFLICT" in sl_alignments
     dow = dow_structure_review or {}
     candle = candlestick_anatomy_review or {}
 
@@ -288,21 +308,43 @@ def build_royal_road_procedure_checklist(
         or []
     )
     sr_rejected = list(sr.get("rejected_level_zones") or [])
+    structural_horizontal_count = sum(
+        1 for k in (
+            "structural_neckline",
+            "structural_invalidation",
+            "structural_target",
+            "structural_support_resistance",
+        ) if k in sl_kinds
+    )
     if len(sr_selected) >= 1:
         sr_status: ProcedureStatus = "PASS"
         sr_result = f"重要水平線 {len(sr_selected)} 本を採用。"
         sr_cautions = []
+    elif structural_horizontal_count >= 1:
+        # Numeric SR detector found nothing, but structural lines
+        # exist (SNL / SIL / STP) — keep this WARN so the user sees
+        # both signals, but the result clarifies what we have.
+        sr_status = "WARN"
+        sr_result = (
+            f"サポレジ検出: 0本 (numeric)。"
+            f"構造ライン {structural_horizontal_count} 本で代替。"
+        )
+        sr_cautions = ["sr_zero_selected_numeric"]
     else:
         sr_status = "WARN"
         sr_result = "サポレジ検出: 0本 — 線引き根拠が弱い。"
         sr_cautions = ["sr_zero_selected"]
     steps.append(_step(
         "support_resistance", "重要水平線", sr_status, "P1",
-        condition_ja="サポート/レジスタンスが認識されていること。",
+        condition_ja=(
+            "サポート/レジスタンスが認識されていること。"
+            "構造ライン (SNL / SIL / STP) も評価対象。"
+        ),
         result_ja=sr_result,
         evidence={
             "selected_count": len(sr_selected),
             "rejected_count": len(sr_rejected),
+            "structural_horizontal_count": structural_horizontal_count,
         },
         cautions=sr_cautions,
     ))
@@ -314,23 +356,58 @@ def build_royal_road_procedure_checklist(
         or []
     )
     tl_rejected = list(tl.get("rejected_trendlines") or [])
-    if len(tl_selected) >= 1:
-        tl_status: ProcedureStatus = "PASS"
-        tl_result = f"トレンドライン {len(tl_selected)} 本を採用。"
-        tl_cautions = []
+    structural_trendline_count = sl_counts.get("structural_trendline", 0)
+    numeric_conflict_count = sl_counts.get("numeric_conflict", 0)
+    tl_cautions: list[str] = []
+    # Phase I follow-up: distinguish numeric-only from structural.
+    if has_structural_trendline and len(tl_selected) >= 1:
+        if has_alignment_conflict:
+            tl_status: ProcedureStatus = "WARN"
+            tl_result = (
+                f"トレンドライン {len(tl_selected)} 本 (numeric) + "
+                f"構造ライン {structural_trendline_count} 本。"
+                "数値検出ラインと構造ラインが CONFLICT — 線引き根拠を再確認。"
+            )
+            tl_cautions = ["structural_numeric_conflict"]
+        else:
+            tl_status = "PASS"
+            tl_result = (
+                f"トレンドライン {len(tl_selected)} 本 (numeric) + "
+                f"構造ライン {structural_trendline_count} 本。"
+            )
+    elif has_structural_trendline:
+        tl_status = "PASS"
+        tl_result = (
+            f"構造トレンドライン {structural_trendline_count} 本 "
+            "(numeric は 0)。"
+        )
+        tl_cautions = ["numeric_trendlines_absent"]
+    elif len(tl_selected) >= 1:
+        tl_status = "WARN"
+        tl_result = (
+            f"トレンドライン {len(tl_selected)} 本 (numeric) のみ — "
+            "波形構造に対応する構造ラインがありません。"
+        )
+        tl_cautions = ["structural_trendlines_absent"]
     else:
         tl_status = "WARN"
-        tl_result = "トレンドライン検出: 0本 — 線引き根拠が弱い。"
+        tl_result = (
+            "トレンドライン検出: 0本 (numeric / structural ともに) — "
+            "線引き根拠が弱い。"
+        )
         tl_cautions = ["trendline_zero_selected"]
     steps.append(_step(
         "trendline_context", "トレンドライン", tl_status, "P1",
         condition_ja=(
             "トレンドライン / チャネルが認識されていること。"
+            "数値検出 (T1/T2/T3) と王道構造線 (STL...) を区別して評価。"
         ),
         result_ja=tl_result,
         evidence={
-            "selected_count": len(tl_selected),
-            "rejected_count": len(tl_rejected),
+            "numeric_selected_count": len(tl_selected),
+            "numeric_rejected_count": len(tl_rejected),
+            "structural_trendline_count": structural_trendline_count,
+            "numeric_conflict_count": numeric_conflict_count,
         },
         cautions=tl_cautions,
     ))
@@ -374,7 +451,21 @@ def build_royal_road_procedure_checklist(
         missing_w.append("WTP")
     if not missing_w:
         wl_status: ProcedureStatus = "PASS"
-        wl_result = "WNL / WSL / WTP 全て揃っています。"
+        # Surface structural-line corroboration in the result.
+        sl_bits: list[str] = []
+        if has_structural_neckline:
+            sl_bits.append("SNL")
+        if has_structural_invalidation:
+            sl_bits.append("SIL")
+        if has_structural_target:
+            sl_bits.append("STP")
+        if sl_bits:
+            wl_result = (
+                "WNL / WSL / WTP 全て揃っています。"
+                f" 構造ライン: {' / '.join(sl_bits)}."
+            )
+        else:
+            wl_result = "WNL / WSL / WTP 全て揃っています。"
         wl_blocks: list[str] = []
     else:
         wl_status = "BLOCK"
@@ -389,6 +480,9 @@ def build_royal_road_procedure_checklist(
         result_ja=wl_result,
         evidence={
             "has_wnl": has_wnl, "has_wsl": has_wsl, "has_wtp": has_wtp,
+            "has_structural_neckline": has_structural_neckline,
+            "has_structural_invalidation": has_structural_invalidation,
+            "has_structural_target": has_structural_target,
         },
         block_reasons=wl_blocks,
     ))

@@ -818,6 +818,10 @@ class RoyalRoadDecisionV2Slice:
     # (integrated profile only). Empty default again preserves
     # byte-identical legacy traces.
     royal_road_procedure_checklist: dict = field(default_factory=dict)
+    # Phase I follow-up: structural lines snapshot (integrated
+    # profile only). Empty default preserves byte-identical traces
+    # for legacy v2 / v1 / current_runtime callers.
+    structural_lines: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -889,6 +893,8 @@ class RoyalRoadDecisionV2Slice:
             "royal_road_procedure_checklist": dict(
                 self.royal_road_procedure_checklist
             ),
+            # Phase I follow-up structural lines snapshot.
+            "structural_lines": dict(self.structural_lines),
         }
 
     @classmethod
@@ -948,6 +954,8 @@ class RoyalRoadDecisionV2Slice:
             royal_road_procedure_checklist=dict(
                 adv.get("royal_road_procedure_checklist") or {}
             ),
+            # Phase I follow-up structural lines snapshot.
+            structural_lines=dict(adv.get("structural_lines") or {}),
         )
 
 
