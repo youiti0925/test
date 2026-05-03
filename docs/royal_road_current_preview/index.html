@@ -121,12 +121,36 @@
   <h1>現在の王道判断プレビュー (Phase F / G + 波形可視化復旧版)</h1>
   <p class="meta">
     ブランチ: <code>artifact/visual-audit-mobile-preview</code><br>
-    生成元 commit: <code>d46e47e</code> (<code>feat/royal-road-complete-v2</code>)<br>
+    生成元 commit: <code>b1f4024</code> (<code>feat/royal-road-complete-v2</code>)<br>
     プロファイル: <code>royal_road_decision_v2_integrated</code>
   </p>
 
   <div class="changelog">
-    <h2>今回の改修ポイント (波形可視化復旧)</h2>
+    <h2>今回の追加修正 (スマホ視認性強化)</h2>
+    <p>SVG が <code>viewBox=1200x600</code> で <code>@media (max-width:800px)</code> により
+    幅 100% に縮小されるため、390 px 幅の端末では実効スケールが約 0.32×。
+    そのままでは <code>font-size='11'</code> の文字が約 3.6 px、
+    <code>stroke-width='0.6'</code> の線が 0.2 px 以下になり、
+    グラフ要素が事実上見えませんでした。今回:</p>
+    <ul>
+      <li>SVG ルートと全テキストの <code>font-size</code> を約 2 倍
+        (9→18, 10→20, 11→22, 12→24, 13→26)</li>
+      <li>波形 skeleton / トレンドライン / WNL/WSL/WTP / ENTRY/STOP/TP /
+        SR-zone 枠 / pivot dot の <code>stroke-width</code> と半径を
+        読める太さに引き上げ</li>
+      <li>WNL+ENTRY などの 2 バッジを 1 本のラインに横並びで表示し、
+        重なりを回避</li>
+      <li>ラベル背景 <code>&lt;rect&gt;</code> を拡大したテキストに合わせて拡大、
+        SR-zone <code>opacity 0.18 → 0.24</code></li>
+    </ul>
+    <p>クラス名・<code>data-*</code> 属性・必須トークン
+    (DB1/DT1/B1/B2/P1/P2/NL/BR/WNL/WSL/WTP/ENTRY/STOP/TP/
+    T1/S1/R1/EVENT/WAIT BREAKOUT/WAIT RETEST/WAIT EVENT) はそのまま、
+    geometry-aware test 14/14 + wave-shape test 12/12 PASS を維持。</p>
+  </div>
+
+  <div class="changelog">
+    <h2>前回の改修ポイント (波形可視化復旧)</h2>
     <p>前回プレビューでメインチャートから消えていた波形構造を復旧しました。</p>
     <ol>
       <li><b>メインチャート SVG</b> に <code>data-testid="main-candle-chart"</code> を付与。
