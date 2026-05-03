@@ -121,12 +121,40 @@
   <h1>現在の王道判断プレビュー (Phase F / G / I + 王道手順チェック)</h1>
   <p class="meta">
     ブランチ: <code>artifact/visual-audit-mobile-preview</code><br>
-    生成元 commit: <code>2225004</code> (<code>feat/royal-road-complete-v2</code>)<br>
+    生成元 commit: <code>11335d7</code> (<code>feat/royal-road-complete-v2</code>)<br>
     プロファイル: <code>royal_road_decision_v2_integrated</code>
   </p>
 
   <div class="changelog">
-    <h2>今回の追加 (Phase I 続き — 王道手順チェックを接続)</h2>
+    <h2>今回の小修正 (確認足を P0必須 へ)</h2>
+    <p>王道手順チェックリストの <code>confirmation_candle</code>
+    (ローソク足確認) ステップを <b>P1 → P0</b> に修正しました。
+    既存 <code>entry_plan_v1</code> の READY 契約
+    (<i>trigger broken + retest confirmed + confirmation candle +
+    stop / target + RR ≥ 2.0</i>) では確認足は必須条件であり、
+    P1 (補助) ではなく P0 (必須) として扱われます。</p>
+    <ul>
+      <li>本ページの 8 サンプルでは、
+        確認足が出ていない <code>WAIT_BREAKOUT</code> /
+        <code>WAIT_RETEST</code> ページの
+        「8. エントリー候補」パネルに
+        <b>「王道P0: NOT PASS / 不足: confirmation_candle」</b>
+        が出るようになりました。</li>
+      <li><code>READY</code> ページではこれまで通り
+        「王道P0: PASS」、確認足は <code>PASS</code> のままです。</li>
+    </ul>
+    <p>テスト: <code>tests/test_royal_road_procedure_checklist.py</code>
+    18/18 PASS、<code>tests/test_visual_audit_royal_road_procedure.py</code>
+    13/13 PASS、<code>tests/test_entry_candidates.py</code> 26/26 PASS、
+    <code>tests/test_visual_audit_entry_candidates.py</code> 7/7 PASS、
+    geometry 14/14 PASS、decision_trace + v2 + integrated 65/65 PASS。
+    既存 <code>entry_plan</code> READY 条件・最終 <code>action</code>・
+    <code>current_runtime</code>・<code>live</code>/<code>OANDA</code>/
+    <code>paper</code> は触っていません。</p>
+  </div>
+
+  <div class="changelog">
+    <h2>前回の追加 (Phase I 続き — 王道手順チェックを接続)</h2>
     <p>「READY と表示されても、何が揃ったから READY なのか分からない」
     というユーザー指摘に対応するため、<b>王道手順チェックリスト</b>
     を <code>EntryCandidate</code> と接続しました。観測・表示専用で、
